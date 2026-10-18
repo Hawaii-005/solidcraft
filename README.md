@@ -1,3 +1,24 @@
+> **This is an Android fork.** Upstream is
+> [tangency-labs/solidcraft](https://github.com/tangency-labs/solidcraft); this fork adds a native
+> Android build for tablets (arm64, no browser/WebView) and the touch and pen input a tablet needs.
+> The `android-latest` branch tracks upstream `main`.
+>
+> Added here:
+> - `apps/solidcraft-android` — a `cargo-apk2` cdylib host: `NativeActivity` subclass for SAF and the
+>   on-screen keyboard, wgpu render state wired into the viewport, wgpu/Vulkan on the device.
+> - **Touch navigation** — one finger orbits, two fingers pan, a pinch zooms around the fingers.
+> - **Pen** — a stylus hovering above the glass moves the pointer (preview before touching), and a
+>   palm resting on the screen is ignored while the pen is down.
+> - **Files** — open and save `.solidcraft` designs through the Android document picker.
+> - Optional loopback control server (`ui.inspect`, `engine.execute`, `ui.screenshot`, …) for
+>   scripted testing on the device.
+>
+> Build (macOS or Linux with the NDK, JDK 21 and `cargo-apk2`):
+> `cd apps/solidcraft-android && cargo apk2 build --release --target aarch64-linux-android`
+>
+> **Signing keys are not in this repository** — create your own `keys/*.jks` and add
+> `[package.metadata.android.signing.release]` to the app's `Cargo.toml`.
+
 <p align="center">
   <img src="assets/icons/app/linux/exports/hicolor/256x256/apps/ai.storyteller.solidcraft.png" width="96" height="96" alt="SolidCraft" />
 </p>
