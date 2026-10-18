@@ -7,3 +7,8 @@
 /.claude/worktrees/
 /target-snapshot
 __pycache__/
+
+# Android port: signing material never leaves this machine
+/keys/
+*.jks
+*.keystore
