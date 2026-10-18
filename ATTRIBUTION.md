@@ -487,6 +487,19 @@ Editable drawing code, native projects and shipped exports are collected under `
 
 | docs/book/src/og.png | SolidCraft contributors | copy of assets/branding/web/source/og.png staged by cargo xtask book (gitignored) | MIT OR Apache-2.0 |
 | docs/sponsors/blacksmith-ci-powered.png | Blacksmith (blacksmith.sh) | "CI powered by Blacksmith" sponsor banner supplied by Blacksmith for the sponsorship credit; used only to credit the sponsor, not part of the application | © Blacksmith, used with permission |
+| apps/solidcraft-android/res/mipmap-mdpi/ic_launcher.png | SolidCraft contributors | original SolidCraft application mark, 48 px export used as the Android launcher icon | MIT OR Apache-2.0 |
+| apps/solidcraft-android/res/mipmap-hdpi/ic_launcher.png | SolidCraft contributors | original SolidCraft application mark, 64 px export used as the Android launcher icon | MIT OR Apache-2.0 |
+| apps/solidcraft-android/res/mipmap-xhdpi/ic_launcher.png | SolidCraft contributors | original SolidCraft application mark, 128 px export used as the Android launcher icon | MIT OR Apache-2.0 |
+| apps/solidcraft-android/res/mipmap-xxhdpi/ic_launcher.png | SolidCraft contributors | original SolidCraft application mark, 256 px export used as the Android launcher icon | MIT OR Apache-2.0 |
+| apps/solidcraft-android/res/mipmap-xxxhdpi/ic_launcher.png | SolidCraft contributors | original SolidCraft application mark, 512 px export used as the Android launcher icon | MIT OR Apache-2.0 |
+| vendor/winit/docs/res/keyboard_left_shift_key.svg | winit contributors | unmodified file of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
+| vendor/winit/docs/res/keyboard_right_shift_key.svg | winit contributors | unmodified file of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
+| vendor/winit/docs/res/keyboard_standard_1_key.svg | winit contributors | unmodified file of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
+| vendor/winit/docs/res/keyboard_numpad_1_key.svg | winit contributors | unmodified file of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
+| vendor/winit/examples/data/icon.png | winit contributors | unmodified example asset of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
+| vendor/winit/examples/data/cross.png | winit contributors | unmodified example asset of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
+| vendor/winit/examples/data/cross2.png | winit contributors | unmodified example asset of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
+| vendor/winit/examples/data/gradient.png | winit contributors | unmodified example asset of the winit 0.30.13 release vendored as the Android patch base (https://github.com/rust-windowing/winit); not used by SolidCraft | Apache-2.0 |
 
 ## Code adapted from sibling projects
 
@@ -551,6 +564,8 @@ copied into SolidCraft.
 | vendor/truck-shapeops | truck-shapeops 0.4.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | robust meshing and nearest-parameter fallback in booleans; degenerate intersection-curve rejection; face and edge history of booleans; trace macro; corner choice at vertices several intersection curves end on; reuse of an operand's meshes (vendor/README.md) |
 | vendor/truck-geometry | truck-geometry 0.5.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | intersection curves divided from their neighbours' surface parameters; surface second derivatives (vendor/README.md) |
 | vendor/matext4cgmath | matext4cgmath 0.1.0, https://github.com/ricosjp/matext4cgmath (RICOS Co. Ltd.) | Apache-2.0 | root refinement stops after 100 Newton steps (vendor/README.md) |
+| vendor/winit | winit 0.30.13, https://github.com/rust-windowing/winit | Apache-2.0 | Android backend: pen hover arrives as a pointer move, and finger input is ignored while the stylus is down (palm rejection) (vendor/README.md) |
+| vendor/android-activity | android-activity 0.6.1, https://github.com/rust-mobile/android-activity | MIT OR Apache-2.0 | non-blocking lifecycle callbacks (`set_nonblocking_callbacks`) so a blocking SAF pick cannot park `android_main`, which returned the app to an ANR (vendor/README.md) |
 
 ## Vendored renderer compatibility fix
 
