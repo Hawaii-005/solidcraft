@@ -35,6 +35,18 @@ tools/android/sync-upstream.sh all       # update and build
 `crates/ui-egui/src/navigation.rs` or `viewport.rs` means upstream touched the same code as the touch
 navigation: keep this fork's touch blocks, take upstream's surrounding changes.
 
+The SAF, IME and system-font bridges come from
+[MostafaXS1/artcraft-android](https://github.com/MostafaXS1/artcraft-android) (MIT), which keeps fixing
+them. They are pinned in `apps/solidcraft-android/.artcraft-templates-commit`:
+
+```sh
+tools/android/sync-artcraft-templates.sh check   # diff against the pinned commit
+tools/android/sync-artcraft-templates.sh apply   # take the new templates (regenerates the activity)
+```
+
+`apply` rewrites `SafActivity.java` with this app's package, class and log tag, then the APK needs a
+rebuild.
+
 
 <p align="center">
   <img src="assets/icons/app/linux/exports/hicolor/256x256/apps/ai.storyteller.solidcraft.png" width="96" height="96" alt="SolidCraft" />

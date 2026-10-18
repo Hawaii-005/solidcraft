@@ -401,7 +401,9 @@ fn font_face_count(bytes: &[u8]) -> u32 {
 /// system font folder in under those names — and writing a minimal `fonts.conf` for the fontconfig
 /// readers — is enough for the existing scanners, without editing any app.
 pub fn install_font_env(app: &android_activity::AndroidApp) {
-    let Some(base) = app.internal_data_path() else { return };
+    // Prefer the app-specific external directory (`.../Android/data/<pkg>/files`) so the fontconfig
+    // cache and any generated font data stay reachable over USB, and fall back to internal storage.
+    let Some(base) = app.external_data_path().or_else(|| app.internal_data_path()) else { return };
     let home = base.join("home");
     let _ = std::fs::create_dir_all(home.join(".local/share"));
 
