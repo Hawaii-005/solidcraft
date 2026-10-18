@@ -19,6 +19,23 @@
 > **Signing keys are not in this repository** — create your own `keys/*.jks` and add
 > `[package.metadata.android.signing.release]` to the app's `Cargo.toml`.
 
+### Keeping up with upstream
+
+Upstream ships often. This fork merges upstream into the Android branch instead of rebasing, so the
+public branch only ever moves forward:
+
+```sh
+tools/android/sync-upstream.sh check     # what is new upstream (read-only)
+tools/android/sync-upstream.sh update    # fetch + merge upstream main
+tools/android/sync-upstream.sh build     # release APK
+tools/android/sync-upstream.sh all       # update and build
+```
+
+`Cargo.lock` conflicts resolve themselves (upstream's copy wins, cargo regenerates it). A conflict in
+`crates/ui-egui/src/navigation.rs` or `viewport.rs` means upstream touched the same code as the touch
+navigation: keep this fork's touch blocks, take upstream's surrounding changes.
+
+
 <p align="center">
   <img src="assets/icons/app/linux/exports/hicolor/256x256/apps/ai.storyteller.solidcraft.png" width="96" height="96" alt="SolidCraft" />
 </p>
