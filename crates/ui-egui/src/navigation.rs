@@ -316,15 +316,37 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
         }
     }
     let two_fingers = app.viewport.touch.len() >= 2;
-    // Pinch: egui's own multi-touch state, which tracks the fingers' spread per frame.
-    if let Some(m) = ui.input(|i| i.multi_touch()) {
-        let z = f64::from(m.zoom_delta);
-        if (z - 1.0).abs() > 1e-3 {
-            app.cancel_view_animation();
-            let anchor = crate::prefs::pivot_under(app, &projection(app, rect), m.center_pos);
-            app.cam.zoom_at(1.0 / z, Some(anchor));
-            log::debug!("touch: {} fingers, zoom {z:.3}", m.num_touches);
+    // Pinch: egui's multi-touch state when it has one, otherwise the fingers' spread directly.
+    let (zoom, anchor_at, fingers) = match ui.input(|i| i.multi_touch()) {
+        Some(m) => (f64::from(m.zoom_delta), Some(m.center_pos), m.num_touches),
+        None => {
+            let span = if two_fingers {
+                let (a, b) = (app.viewport.touch[0].1, app.viewport.touch[1].1);
+                (b - a).length().max(1.0)
+            } else {
+                0.0
+            };
+            let zoom = match (app.viewport.touch_span, two_fingers) {
+                (Some(was), true) => f64::from(was) / f64::from(span),
+                _ => 1.0,
+            };
+            app.viewport.touch_span = two_fingers.then_some(span);
+            (zoom, None, app.viewport.touch.len())
         }
+    };
+    if !app.viewport.touch.is_empty() {
+        log::debug!("touch: fingers={fingers} list={} zoom={zoom:.3}", app.viewport.touch.len());
+    }
+    if (zoom - 1.0).abs() > 1e-3 {
+        app.cancel_view_animation();
+        let anchor = match anchor_at {
+            Some(at) => crate::prefs::pivot_under(app, &projection(app, rect), at),
+            None => app.cam.target,
+        };
+        // egui reports the fingers' spread frame by frame, which on a tablet is a few tenths of a
+        // percent per frame — amplify it, or a pinch reads as no zoom at all.
+        let step = (1.0 / zoom).powf(PINCH_GAIN).clamp(0.5, 2.0);
+        app.cam.zoom_at(step, Some(anchor));
     }
     // Body-free wheel/drag navigation is meaningless under two fingers: the fingers own the view.
     let touch_nav = if two_fingers {
@@ -730,6 +752,9 @@ pub(crate) fn middle_double_click(app: &mut SolveApp, ui: &egui::Ui, inside: boo
 /// cursor pivot are kept still on screen; a cursor drag that begins over empty space turns around
 /// the centre of the visible geometry instead, so the model never swings around a far-off point.
 /// The cursor pivot is chosen once, when the drag begins.
+/// How much a pinch's per-frame spread is amplified into camera distance.
+const PINCH_GAIN: f64 = 3.0;
+
 pub fn orbit(app: &mut SolveApp, rect: egui::Rect, dx: f64, dy: f64, press: Option<Pos2>) {
     let pivot = match app.preferences.orbit_around {
         OrbitAround::ViewCentre => None,
