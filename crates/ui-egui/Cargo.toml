@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 solidcraft-engine = { workspace = true }
+# The agent chat's tools: `solidcraft-cli mcp` as a child process on desktop, the same server
+# run in this process where there are no child processes to start (Android).
+solidcraft-mcp = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
 solidcraft-gpu = { workspace = true }

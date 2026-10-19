@@ -17,6 +17,10 @@ log = { workspace = true }
 serde_json = { workspace = true }
 jni = "0.22"
 getrandom = "0.3"
+# The agent chat's API agents: HTTPS to an OpenAI-compatible endpoint (ring: the crypto provider
+# that builds for arm64 Android; the certificates are compiled in, see src/agent.rs).
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 eframe = { workspace = true, features = [
     "default_fonts",
     "wgpu",

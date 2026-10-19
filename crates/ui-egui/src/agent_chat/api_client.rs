@@ -60,20 +60,35 @@ impl ApiBackend {
         if cfg.key.is_some() && !super::agents::key_safe_for(&cfg.base_url) {
             return Err(crate::i18n::tr("ui.ai_key_needs_https").to_string());
         }
-        // The same MCP server an ACP agent would get.
-        let mcp = match &ctx.bridge {
-            Some(b) => {
+        // The same MCP server an ACP agent would get. Where there is no CLI to start (Android:
+        // an app cannot exec anything), the server runs in this process and its tool calls go to
+        // the chat's gate through `ctx.tools`, exactly as the child's lines would.
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(ctx.wake);
+        let mcp = match (&ctx.bridge, ctx.tools) {
+            (Some(b), _) => {
                 let argv = vec![b.cli.to_string_lossy().into_owned(), "mcp".into(), "--connect".into(), format!("127.0.0.1:{}", b.port)];
                 Some(AgentProcess::spawn(&argv, &ctx.cwd, &["SOLIDCRAFT_CONTROL_TOKEN"], || {})?)
             }
-            None => None,
+            (None, Some(tx)) => {
+                let repaint = wake.clone();
+                Some(AgentProcess::in_process(
+                    move |input: &mut dyn std::io::BufRead, output: &mut dyn std::io::Write| {
+                        let scope = solidcraft_mcp::agent_scope(Vec::new());
+                        let mut server = solidcraft_mcp::Server::new(Box::new(AppTools { tx })).with_path_scope(Some(scope));
+                        if let Err(e) = server.serve(input, output) {
+                            log::warn!("agent chat: the in-process tool server stopped: {e}");
+                        }
+                    },
+                    move || repaint(),
+                )?)
+            }
+            (None, None) => None,
         };
         let handle = mcp.as_ref().map(AgentProcess::handle);
         let (cmd_tx, cmd_rx) = channel::<Cmd>();
         let (ev_tx, events) = channel::<Event>();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
-        let wake: Arc<dyn Fn() + Send + Sync> = Arc::from(ctx.wake);
         std::thread::spawn(move || {
             let mut w = Worker { cfg, mcp, next: 0, tools: Vec::new(), history: Vec::new(), events: ev_tx, wake, cancel: stop };
             w.run(cmd_rx);
@@ -124,6 +139,32 @@ impl ChatBackend for ApiBackend {
 impl Drop for ApiBackend {
     fn drop(&mut self) {
         self.shutdown(false);
+    }
+}
+
+/// The in-process tool server's link to the window: one `ControlRequest`, and its answer. The
+/// request goes through the chat's gate exactly like one an outside agent sends through the loopback
+/// endpoint, so permissions, the per-message limit and undo are the same.
+struct AppTools {
+    tx: Sender<crate::ControlRequest>,
+}
+
+impl solidcraft_mcp::Backend for AppTools {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let (request, answer) = crate::ControlRequest::new(method, params);
+        self.tx.send(request).map_err(|_| "the window is not taking tool calls".to_string())?;
+        let answer = answer.recv_timeout(TOOL_TIMEOUT).map_err(|_| "the window did not answer the tool call".to_string())?;
+        if answer.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(answer.get("result").cloned().unwrap_or(Value::Null))
+        } else {
+            Err(answer.get("error").and_then(Value::as_str).unwrap_or("the tool call failed").to_string())
+        }
+    }
+    fn has_ui(&self) -> bool {
+        true
+    }
+    fn describe(&self) -> String {
+        "in this window's own process".to_string()
     }
 }
 

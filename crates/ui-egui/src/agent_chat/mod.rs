@@ -499,9 +499,12 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
         }
     }
     let cli = find_cli();
-    if chat.tools_port.is_none() {
+    // Tools that need no CLI: the server runs in the window's own process (Android, which cannot
+    // start another program at all).
+    let local_tools = chat.tools_tx.is_some();
+    if chat.tools_port.is_none() && !local_tools {
         chat.notice(tr("ui.agent_chat_no_control"), true);
-    } else if cli.is_none() {
+    } else if cli.is_none() && !local_tools {
         chat.notice(tr("ui.agent_chat_no_cli"), true);
     }
     let bridge = cli.zip(chat.tools_port).map(|(cli, port)| acp::McpBridge { cli, port });

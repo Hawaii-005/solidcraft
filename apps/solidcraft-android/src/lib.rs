@@ -4,10 +4,13 @@
 //! Android services a desktop app cannot have on its own:
 //! - the soft keyboard (`ime_bridge` + the hidden `EditText` in `SolidCraftActivity`), so numeric
 //!   fields, the command bar and dialogs can be typed into;
-//! - file open/save through the Storage Access Framework (`saf_bridge` + the same Activity).
+//! - file open/save through the Storage Access Framework (`saf_bridge` + the same Activity);
+//! - the agent chat's API agents (`agent`): their keys kept on the device, HTTPS to the model
+//!   endpoint, and the tools run in this process (Android cannot start a `solidcraft-cli`).
 //!
-//! Desktop-only host services (native dialogs, keychain, updater, SpaceMouse) stay absent.
+//! Desktop-only host services (native dialogs, updater, SpaceMouse) stay absent.
 
+mod agent;
 mod ime_bridge;
 mod saf_bridge;
 
@@ -23,7 +26,7 @@ use solidcraft_ui_egui::{Services, SolveApp};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const ANDROID_SHELL_MARKER: &str = "SOLIDCRAFT_ANDROID_SHELL_V3_VIEWPORT";
+const ANDROID_SHELL_MARKER: &str = "SOLIDCRAFT_ANDROID_SHELL_V5_VIEWPORT_AI_PREFS";
 
 /// Depth/stencil the egui pass allocates; the viewport callback is built for the same formats.
 const DEPTH_BITS: u8 = 24;
@@ -83,12 +86,12 @@ fn saf_poll(bridge: &saf::Bridge, state: &SafState) {
     state.mirror.sync(bridge);
 }
 
-fn services(bridge: saf::Bridge, state: Arc<SafState>) -> Services {
+fn services(bridge: saf::Bridge, state: Arc<SafState>, files: Option<std::path::PathBuf>) -> Services {
     let open_bridge = bridge.clone_ref();
     let open_state = Arc::clone(&state);
     let save_bridge = bridge.clone_ref();
     let save_state = Arc::clone(&state);
-    Services {
+    let mut services = Services {
         pick_open: Some(Box::new(move |_exts: &[&str]| {
             let paths = saf_open_paths(&open_bridge, &open_state);
             Box::pin(async move { paths.into_iter().next() })
@@ -98,7 +101,13 @@ fn services(bridge: saf::Bridge, state: Arc<SafState>) -> Services {
             Box::pin(async move { path })
         })),
         ..Services::default()
+    };
+    // The AI panel's API agents: HTTPS to the endpoint, the key kept on this device.
+    services.agent_http = Some(agent::http());
+    if let Some(dir) = files {
+        services.secrets = Some(agent::FileSecrets::new(&dir));
     }
+    services
 }
 
 // ---------------------------------------------------------------- Android IME visibility
@@ -203,6 +212,16 @@ fn apply_android_modifiers(state: &mut egui::Modifiers, raw: &mut egui::RawInput
 /// The app's own data dir is not writable from `adb push` (a release build is not debuggable), so
 /// its external files dir is read too.
 fn apply_env_overrides(dir: &std::path::Path) {
+    // Android's own temp is /data/local/tmp, which an app cannot write: screenshots and the MCP
+    // server's scratch folder need one of the app's own instead.
+    if std::env::var_os("TMPDIR").is_none() {
+        let tmp = dir.join("tmp");
+        if std::fs::create_dir_all(&tmp).is_ok() {
+            // SAFETY: called before any thread is spawned, before eframe reads the environment.
+            unsafe { std::env::set_var("TMPDIR", &tmp) };
+            log::info!("env override: TMPDIR={}", tmp.display());
+        }
+    }
     let external = std::path::Path::new("/sdcard/Android/data/ai.storyteller.solidcraft/files");
     let text = std::fs::read_to_string(dir.join("env.txt"))
         .or_else(|_| std::fs::read_to_string(external.join("env.txt")))
@@ -284,8 +303,9 @@ fn android_main(app: AndroidApp) {
     log::info!("{ANDROID_SHELL_MARKER}");
     system_fonts::install_font_env(&app);
     let bridge = saf::Bridge::new(&app);
-    if let Ok(dir) = bridge.files_dir() {
-        apply_env_overrides(&dir);
+    let files = bridge.files_dir().ok();
+    if let Some(dir) = files.as_deref() {
+        apply_env_overrides(dir);
     }
     let state: Arc<SafState> = Arc::new(SafState::default());
     let ime = ime_bridge::ime::ImeBridge::new(&app);
@@ -293,12 +313,17 @@ fn android_main(app: AndroidApp) {
     let app_finish = app.clone();
     let shell_bridge = bridge.clone_ref();
     let shell_state = Arc::clone(&state);
+    let shell_files = files.clone();
     solidcraft_engine::crash::phase("window");
     let options = eframe::NativeOptions {
         depth_buffer: DEPTH_BITS,
         stencil_buffer: STENCIL_BITS,
         multisampling: MSAA,
         android_app: Some(app),
+        // eframe finds no storage folder on Android (it gives up on the OS), so the preferences
+        // were never kept: the AI agents the user adds, the units, the permissions mode all went
+        // away with the process. A file of the app's own fixes that.
+        persistence_path: files.as_ref().map(|d| d.join("app.ron")),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -307,8 +332,21 @@ fn android_main(app: AndroidApp) {
         Box::new(move |cc| {
             solidcraft_engine::crash::phase("app setup");
             solidcraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
-            let mut app_ui =
-                SolveApp::new(Session::default(), services(shell_bridge.clone_ref(), Arc::clone(&shell_state)));
+            let mut app_ui = SolveApp::new(
+                Session::default(),
+                services(shell_bridge.clone_ref(), Arc::clone(&shell_state), shell_files.clone()),
+            );
+            // The preferences the last run saved (agents, units, permissions…): without this the
+            // app started from the defaults every time, since eframe only hands the file over.
+            if let Some(p) = cc.storage.and_then(|s| solidcraft_ui_egui::prefs::stored(|k| s.get_string(k))) {
+                app_ui.load_prefs(&p);
+            }
+            // The chat's own loopback endpoint: the agent's tool calls land in the gate there, and
+            // its channel is what lets the tools run in this process (there is no CLI to start).
+            {
+                let ctx = cc.egui_ctx.clone();
+                app_ui.agent_chat.control_starter = Some(Box::new(move |tx| control_server::listen_agent(tx, ctx.clone())));
+            }
             app_ui.apply_off_thread = Some(solidcraft_ui_egui::dialogs::APPLY_AT_ONCE);
             // The viewport draws through an egui_wgpu paint callback, so the app needs the render
             // state: without this the UI works but the 3D scene (grid, origin planes, bodies) is

@@ -210,6 +210,54 @@ impl AgentProcess {
         Ok(AgentProcess { child: ProcessHandle(std::sync::Arc::new(std::sync::Mutex::new(Some(child)))), to_agent: Some(to_agent), from_agent })
     }
 
+    /// Run a tool server **in this process**: `serve` reads requests from its input and writes
+    /// its answers to its output, returning when the input closes. Nothing is started, so this
+    /// works where a child process cannot be had (Android: an app may not exec anything) and the
+    /// panel talks to it exactly as it would to `solidcraft-cli mcp`. `wake` is called whenever a
+    /// line arrives.
+    pub fn in_process(
+        serve: impl FnOnce(&mut dyn BufRead, &mut dyn Write) + Send + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<AgentProcess, String> {
+        let (input, input_w) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
+        let (output_r, output_w) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
+        let (to_agent, rx) = channel::<String>();
+        std::thread::spawn(move || {
+            let mut input_w = input_w;
+            for line in rx {
+                if input_w.write_all(line.as_bytes()).and_then(|()| input_w.write_all(b"\n")).and_then(|()| input_w.flush()).is_err() {
+                    break;
+                }
+            }
+            // The sender is gone: the writer closes here, the server sees its input end and stops.
+        });
+        std::thread::spawn(move || {
+            let mut input = BufReader::new(input);
+            let mut output = output_w;
+            serve(&mut input, &mut output);
+        });
+        let (tx, from_agent) = channel::<FromAgent>();
+        let wake = std::sync::Arc::new(wake);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(output_r);
+            loop {
+                let mut buf = Vec::new();
+                match (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(FromAgent::Line(String::from_utf8_lossy(&buf).into_owned())).is_err() {
+                            return;
+                        }
+                        wake();
+                    }
+                }
+            }
+            let _ = tx.send(FromAgent::Exited(Vec::new()));
+            wake();
+        });
+        Ok(AgentProcess { child: ProcessHandle(std::sync::Arc::new(std::sync::Mutex::new(None))), to_agent: Some(to_agent), from_agent })
+    }
+
     pub fn send(&self, msg: &serde_json::Value) {
         if let Some(t) = &self.to_agent {
             let _ = t.send(msg.to_string());
