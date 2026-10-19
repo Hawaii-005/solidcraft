@@ -4170,7 +4170,7 @@ version = "0.16.2"
 
 [[package]]
 name = "solidcraft-android"
-version = "0.15.0"
+version = "0.16.2"
 dependencies = [
  "android-activity",
  "android_logger",

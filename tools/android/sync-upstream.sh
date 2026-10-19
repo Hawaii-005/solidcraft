@@ -32,7 +32,7 @@ check() {
   behind=$(git rev-list --count "HEAD..$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
   echo "Branch $BRANCH is $behind commit(s) behind $UPSTREAM_REMOTE/$UPSTREAM_BRANCH."
   if [ "$behind" -gt 0 ]; then
-    git log --oneline "HEAD..$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" | head -20
+    git log --oneline "HEAD..$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" | head -20 || true
     echo
     echo "Run: $0 rebase    (Cargo.lock conflicts are resolved automatically)"
   fi
