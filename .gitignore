@@ -12,3 +12,6 @@ __pycache__/
 /keys/
 *.jks
 *.keystore
+
+# cargo-mutants output (docs/mutation-testing.md)
+mutants.out*/

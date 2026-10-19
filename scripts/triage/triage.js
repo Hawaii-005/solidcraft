@@ -66,13 +66,13 @@ function repoArgs(context) {
   return { owner: context.repo.owner, repo: context.repo.repo };
 }
 
-// The text under a `## <name>` heading, up to the next heading.
+// The text under a `## <name>` heading (`###` in issue forms), up to the next heading.
 function section(body, name) {
   const lines = body.split('\n');
-  const start = lines.findIndex((l) => new RegExp(`^##\\s*${name}\\s*$`, 'i').test(l.trim()));
+  const start = lines.findIndex((l) => new RegExp(`^#{2,3}\\s*${name}\\s*$`, 'i').test(l.trim()));
   if (start < 0) return '';
   const rest = lines.slice(start + 1);
-  const end = rest.findIndex((l) => /^##\s/.test(l));
+  const end = rest.findIndex((l) => /^#{2,3}\s/.test(l));
   return (end < 0 ? rest : rest.slice(0, end)).join('\n');
 }
 
@@ -129,18 +129,13 @@ function classifyPaths(paths) {
   return [...labels].sort();
 }
 
-async function ensureNeedsTriage(github, context) {
+async function ensureLabel(github, context, name, color, description) {
   try {
-    await github.rest.issues.getLabel({ ...repoArgs(context), name: NEEDS_TRIAGE });
+    await github.rest.issues.getLabel({ ...repoArgs(context), name });
   } catch (e) {
     if (e.status !== 404) throw e;
     try {
-      await github.rest.issues.createLabel({
-        ...repoArgs(context),
-        name: NEEDS_TRIAGE,
-        color: NEEDS_TRIAGE_COLOR,
-        description: NEEDS_TRIAGE_DESCRIPTION,
-      });
+      await github.rest.issues.createLabel({ ...repoArgs(context), name, color, description });
     } catch (e2) {
       if (e2.status !== 422) throw e2; // created meanwhile
     }
@@ -171,7 +166,9 @@ async function proposal(github, context, item) {
 
 async function apply(github, context, number, labels) {
   if (!labels.length) return;
-  if (labels.includes(NEEDS_TRIAGE)) await ensureNeedsTriage(github, context);
+  if (labels.includes(NEEDS_TRIAGE)) {
+    await ensureLabel(github, context, NEEDS_TRIAGE, NEEDS_TRIAGE_COLOR, NEEDS_TRIAGE_DESCRIPTION);
+  }
   await github.rest.issues.addLabels({ ...repoArgs(context), issue_number: number, labels });
 }
 
@@ -296,6 +293,10 @@ module.exports = {
   NEEDS_TRIAGE,
   classifyIssue,
   classifyPaths,
+  ensureLabel,
+  isMaintainer,
+  labelNames,
+  section,
   parseTriage,
   handleOpened,
   handleLabeled,
