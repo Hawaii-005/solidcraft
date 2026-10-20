@@ -261,7 +261,11 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     let picking = caps.pick;
     let (hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, primary_released, delta) = ui.input(|i| {
         (
-            i.pointer.hover_pos(),
+            // A finger lifting ends the pointer in the same frame (egui-winit sends
+            // `PointerGone`), so a tap's click has no hover: it happened where the finger was.
+            i.pointer
+                .hover_pos()
+                .or_else(|| i.pointer.any_released().then(|| i.pointer.interact_pos()).flatten()),
             i.smooth_scroll_delta.y,
             i.modifiers,
             i.pointer.middle_down(),
@@ -280,7 +284,14 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     // hit test also counts the model as under the pointer a few points past its own edge and
     // inside a window's or a list's edge (#678), so the pointer must be in the viewport too,
     // with no window or menu above it.
-    let inside = resp.contains_pointer() && ui.rect_contains_pointer(rect) && hover.is_some_and(|p| !axes.contains(p));
+    // A lifted finger is no longer over anything; the view had it when it took the click.
+    let lifted = ui.input(|i| i.pointer.hover_pos().is_none());
+    let over = if lifted {
+        resp.clicked() || resp.drag_stopped()
+    } else {
+        resp.contains_pointer() && ui.rect_contains_pointer(rect)
+    };
+    let inside = over && hover.is_some_and(|p| rect.contains(p) && !axes.contains(p));
     app.viewport.mouse = hover.filter(|_| inside);
     // Ctrl or Alt held: drawing and dragging don't snap.
     crate::drag_snap::set_suppressed(mods.ctrl || mods.alt || mods.command);

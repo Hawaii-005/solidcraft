@@ -15,6 +15,7 @@ import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.text.Editable;
 import android.text.InputType;
 import android.util.Log;
 import android.view.Gravity;
@@ -205,53 +206,90 @@ public final class SolidCraftActivity extends NativeActivity {
                         return null;
                     }
                     return new InputConnectionWrapper(base, true) {
+                        /** Queue the whole IME buffer after a change, tagged `r`.
+                         *
+                         * One event per change, carrying the complete text, is what lets the Rust
+                         * side work out the delta. Sending the IME's composing text as a pre-edit
+                         * instead loses backspaces: egui's `TextEdit` deletes a pre-edit by the
+                         * range it remembers and drops a `DeleteSurrounding` while a composition is
+                         * open, so ⌫ in a field that only holds the composition did nothing.
+                         */
+                        private void report() {
+                            try {
+                                EditText view = imeView;
+                                if (view == null) {
+                                    return;
+                                }
+                                CharSequence text = view.getText();
+                                imeEvents.offer("r" + (text == null ? "" : text.toString()));
+                            } catch (Throwable error) {
+                                Log.w(TAG, "Could not read the keyboard buffer", error);
+                            }
+                        }
+
                         @Override
                         public boolean commitText(CharSequence text, int newCursorPosition) {
-                            if (text != null && text.length() > 0) {
-                                imeEvents.offer("c" + text);
-                            }
-                            return super.commitText(text, newCursorPosition);
+                            boolean handled = super.commitText(text, newCursorPosition);
+                            report();
+                            return handled;
                         }
 
                         @Override
                         public boolean setComposingText(CharSequence text, int newCursorPosition) {
-                            imeEvents.offer("p" + (text == null ? "" : text.toString()));
-                            return super.setComposingText(text, newCursorPosition);
+                            boolean handled = super.setComposingText(text, newCursorPosition);
+                            report();
+                            return handled;
                         }
 
                         @Override
                         public boolean finishComposingText() {
-                            imeEvents.offer("f");
-                            return super.finishComposingText();
+                            boolean handled = super.finishComposingText();
+                            report();
+                            return handled;
                         }
 
                         @Override
                         public boolean deleteSurroundingText(int beforeLength, int afterLength) {
-                            if (beforeLength > 0 || afterLength > 0) {
-                                imeEvents.offer("d" + beforeLength + "," + afterLength);
+                            boolean handled = super.deleteSurroundingText(beforeLength, afterLength);
+                            report();
+                            return handled;
+                        }
+
+                        @Override
+                        public boolean sendKeyEvent(KeyEvent event) {
+                            int code = event.getKeyCode();
+                            if (code == KeyEvent.KEYCODE_DEL || code == KeyEvent.KEYCODE_FORWARD_DEL) {
+                                // Some keyboards delete with a key event instead of
+                                // `deleteSurroundingText`; the view's own `onKeyDown` is `false` so
+                                // the character would never leave the buffer. Delete it here, then
+                                // let `report()` hand the new text over.
+                                EditText view = imeView;
+                                if (view != null && event.getAction() == KeyEvent.ACTION_DOWN) {
+                                    try {
+                                        Editable editable = view.getText();
+                                        int start = Math.min(view.getSelectionStart(), view.getSelectionEnd());
+                                        int end = Math.max(view.getSelectionStart(), view.getSelectionEnd());
+                                        int from = code == KeyEvent.KEYCODE_DEL ? start - 1 : end;
+                                        int to = code == KeyEvent.KEYCODE_DEL ? end : end + 1;
+                                        if (from >= 0 && to <= editable.length() && from < to) {
+                                            editable.delete(from, to);
+                                        }
+                                    } catch (Throwable error) {
+                                        Log.w(TAG, "Could not delete from the keyboard buffer", error);
+                                    }
+                                }
+                                report();
+                                return true;
                             }
-                            return super.deleteSurroundingText(beforeLength, afterLength);
+                            boolean handled = super.sendKeyEvent(event);
+                            report();
+                            return handled;
                         }
 
                         @Override
                         public boolean performEditorAction(int actionCode) {
                             imeEvents.offer("a" + actionCode);
                             return super.performEditorAction(actionCode);
-                        }
-
-                        @Override
-                        public boolean sendKeyEvent(KeyEvent event) {
-                            if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                                int code = event.getKeyCode();
-                                if (code == KeyEvent.KEYCODE_DEL) {
-                                    imeEvents.offer("d1,0");
-                                } else if (code == KeyEvent.KEYCODE_FORWARD_DEL) {
-                                    imeEvents.offer("d0,1");
-                                } else if (code == KeyEvent.KEYCODE_ENTER) {
-                                    imeEvents.offer("a6");
-                                }
-                            }
-                            return super.sendKeyEvent(event);
                         }
                     };
                 }

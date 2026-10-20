@@ -26,7 +26,7 @@ use solidcraft_ui_egui::{Services, SolveApp};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const ANDROID_SHELL_MARKER: &str = "SOLIDCRAFT_ANDROID_SHELL_V5_VIEWPORT_AI_PREFS";
+const ANDROID_SHELL_MARKER: &str = "SOLIDCRAFT_ANDROID_SHELL_V6_IME_SNAPSHOT";
 
 /// Depth/stencil the egui pass allocates; the viewport callback is built for the same formats.
 const DEPTH_BITS: u8 = 24;
@@ -253,6 +253,9 @@ struct Shell {
     ime: ime_bridge::ime::ImeBridge,
     modifiers: Modifiers,
     keyboard_wanted: bool,
+    /// The widget that had the keyboard last frame. Moving to another field starts the IME's buffer
+    /// from scratch, so the bridge must forget what the old field already received.
+    keyboard_owner: Option<egui::Id>,
 }
 
 impl eframe::App for Shell {
@@ -261,10 +264,15 @@ impl eframe::App for Shell {
         saf_poll(&self.bridge, &self.state);
         // The soft keyboard follows egui's focus: any focused TextEdit wants it.
         let wanted = ctx.egui_wants_keyboard_input();
+        let owner = if wanted { ctx.memory(|m| m.focused()) } else { None };
         if wanted != self.keyboard_wanted {
             self.keyboard_wanted = wanted;
             ime_visibility(&self.app, wanted);
+            self.ime.reset();
+        } else if owner != self.keyboard_owner {
+            self.ime.reset();
         }
+        self.keyboard_owner = owner;
         if self.solve.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -380,6 +388,7 @@ fn android_main(app: AndroidApp) {
                 ime,
                 modifiers: Modifiers::default(),
                 keyboard_wanted: false,
+                keyboard_owner: None,
             }))
         }),
     );
