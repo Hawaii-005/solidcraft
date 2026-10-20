@@ -271,7 +271,8 @@ pub fn sync(t: &mut Tool) {
         }
         t.dims = boxes_for(t.cmd, t.pts.len());
         t.dims_stage = t.pts.len();
-        t.dims_focus = !t.dims.is_empty();
+        // A finger picks the next point; it does not want the keyboard over the drawing area.
+        t.dims_focus = !t.dims.is_empty() && !crate::touch::touch_ui();
     }
 }
 

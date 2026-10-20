@@ -50,6 +50,7 @@ pub mod frame_rate;
 pub mod gizmo;
 pub mod gpu;
 pub mod help;
+pub mod touch;
 #[cfg(test)]
 mod hole_direction_ui_tests;
 #[cfg(test)]

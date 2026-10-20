@@ -538,7 +538,7 @@ fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, selec
                 ui.label(egui::RichText::new(crate::i18n::tr_label(label)).color(t.text_dim).size(11.5));
                 let r = ui.add(egui::TextEdit::singleline(value).id(id).desired_width(72.0));
                 crate::params_dialog::complete(ui, &r, value);
-                if select_all {
+                if select_all && !crate::touch::touch_ui() {
                     r.request_focus();
                     let n = value.chars().count();
                     let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
