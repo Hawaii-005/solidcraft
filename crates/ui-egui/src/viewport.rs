@@ -88,6 +88,14 @@ pub struct ViewportState {
     /// The two-finger gesture's centre and finger spread last frame, for pan and pinch.
     pub(crate) touch_centroid: Option<Pos2>,
     pub(crate) touch_span: Option<f32>,
+    /// Where the lone finger of this gesture landed. One finger only orbits once it has moved past
+    /// a small dead zone, so a pinch's second finger can land before the first one turns the view.
+    pub(crate) touch_landing: Option<Pos2>,
+    /// This gesture has had two fingers: its release is not a click — a pinch must not pick.
+    pub(crate) touch_multi: bool,
+    /// When a touch event last arrived (`egui` time). A gesture that goes quiet for longer than
+    /// [`TOUCH_STALE`] is over: its end was dropped (a palm ignored under the pen, a cancel).
+    pub(crate) touch_seen_at: f64,
     /// Button-free gesture and its last owned pointer position, kept through pauses.
     pub(crate) modifier_nav: Option<(NavMode, Pos2)>,
     /// What a click would pick now (after the active command's filter).

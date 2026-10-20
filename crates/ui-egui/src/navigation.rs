@@ -286,7 +286,10 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     // with no window or menu above it.
     // A lifted finger is no longer over anything; the view had it when it took the click.
     let lifted = ui.input(|i| i.pointer.hover_pos().is_none());
-    let over = if lifted {
+    let over = if app.viewport.touch_multi {
+        // A pinch or a two-finger pan: releasing one of the fingers is not a pick.
+        false
+    } else if lifted {
         resp.clicked() || resp.drag_stopped()
     } else {
         resp.contains_pointer() && ui.rect_contains_pointer(rect)
@@ -318,16 +321,76 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
             })
             .collect()
     });
+    let seen_touch = !touches.is_empty();
     for (id, phase, pos) in touches {
         match phase {
-            egui::TouchPhase::Start | egui::TouchPhase::Move => match app.viewport.touch.iter_mut().find(|(t, _)| *t == id) {
-                Some(slot) => slot.1 = pos,
-                None => app.viewport.touch.push((id, pos)),
-            },
+            egui::TouchPhase::Start => {
+                // A palm or a finger landing on the toolbars is not a gesture on the model: tracking
+                // it puts a phantom finger in the list that later turns a pinch into a pan.
+                if !rect.contains(pos) {
+                    log::debug!("touch ignored outside viewport: pos=({:.1},{:.1})", pos.x, pos.y);
+                    continue;
+                }
+                if app.viewport.touch.is_empty() {
+                    app.viewport.touch_landing = Some(pos);
+                    app.viewport.touch_multi = false;
+                }
+                // The shell reports every pointer on a start, so a finger already tracked is a
+                // repeat of the same touch, not a new one.
+                match app.viewport.touch.iter_mut().find(|(t, _)| *t == id) {
+                    Some(slot) => slot.1 = pos,
+                    None => app.viewport.touch.push((id, pos)),
+                }
+            }
+            // Only a touch whose start was taken in is tracked: a move from a finger that began on
+            // the toolbar must not slip into the list halfway through the gesture.
+            egui::TouchPhase::Move => {
+                if let Some(slot) = app.viewport.touch.iter_mut().find(|(t, _)| *t == id) {
+                    slot.1 = pos;
+                }
+            }
             egui::TouchPhase::End | egui::TouchPhase::Cancel => app.viewport.touch.retain(|(t, _)| *t != id),
         }
     }
+    if app.viewport.touch.len() >= 2 {
+        app.viewport.touch_multi = true;
+    }
+    if app.viewport.touch.is_empty() {
+        app.viewport.touch_landing = None;
+        app.viewport.touch_span = None;
+    }
+    // Self-healing: a pen's palm rejection drops the finger events it ignores, so a finger can be
+    // left in the list with nothing down and the view would keep panning under the pen.
+    let now = ui.input(|i| i.time);
+    if seen_touch {
+        app.viewport.touch_seen_at = now;
+    }
+    if !app.viewport.touch.is_empty()
+        && (now - app.viewport.touch_seen_at > TOUCH_STALE || (!seen_touch && !ui.input(|i| i.pointer.any_down())))
+    {
+        app.viewport.touch.clear();
+        app.viewport.touch_landing = None;
+        app.viewport.touch_span = None;
+    }
+    // One finger orbits only after a short dead zone: landing two fingers for a pinch must not spin
+    // the model on the way in (the first finger always lands first).
+    let armed = match (app.viewport.touch.len(), app.viewport.touch_landing) {
+        (1, Some(land)) => (app.viewport.touch[0].1 - land).length() > TOUCH_ARM,
+        _ => true,
+    };
+    let delta = if armed { delta } else { egui::Vec2::ZERO };
     let two_fingers = app.viewport.touch.len() >= 2;
+    for (id, phase, pos) in ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Touch { id, phase, pos, .. } => Some((*id, *phase, *pos)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    }) {
+        log::debug!("touch event id={id:?} phase={phase:?} pos=({:.1},{:.1})", pos.x, pos.y);
+    }
     // Pinch: egui's multi-touch state when it has one, otherwise the fingers' spread directly.
     let (zoom, anchor_at, fingers) = match ui.input(|i| i.multi_touch()) {
         Some(m) => (f64::from(m.zoom_delta), Some(m.center_pos), m.num_touches),
@@ -347,7 +410,16 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
         }
     };
     if !app.viewport.touch.is_empty() {
-        log::debug!("touch: fingers={fingers} list={} zoom={zoom:.3}", app.viewport.touch.len());
+        let span = if app.viewport.touch.len() >= 2 {
+            (app.viewport.touch[1].1 - app.viewport.touch[0].1).length()
+        } else {
+            0.0
+        };
+        log::debug!(
+            "touch: fingers={fingers} list={} zoom={zoom:.3} span={span:.0} stored={:.0}",
+            app.viewport.touch.len(),
+            app.viewport.touch_span.unwrap_or(0.0)
+        );
     }
     if (zoom - 1.0).abs() > 1e-3 {
         app.cancel_view_animation();
@@ -359,6 +431,12 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
         // percent per frame — amplify it, or a pinch reads as no zoom at all.
         let step = (1.0 / zoom).powf(PINCH_GAIN).clamp(0.5, 2.0);
         app.cam.zoom_at(step, Some(anchor));
+        log::debug!(
+            "pinch applied: zoom={zoom:.4} step={step:.4} dist={:.2} yaw={:.3} pitch={:.3}",
+            app.cam.distance,
+            app.cam.yaw,
+            app.cam.pitch
+        );
     }
     // Body-free wheel/drag navigation is meaningless under two fingers: the fingers own the view.
     let touch_nav = if two_fingers {
@@ -537,6 +615,15 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
                 None => app.viewport.nav.is_some(),
             };
         orbit_drag(app, rect, f64::from(delta.x), f64::from(delta.y), press, snap, true);
+        if app.viewport.touch.len() > 0 {
+            log::debug!(
+                "orbit by touch: delta=({:.1},{:.1}) yaw={:.3} pitch={:.3}",
+                delta.x,
+                delta.y,
+                app.cam.yaw,
+                app.cam.pitch
+            );
+        }
     } else {
         if matches!(mode, Some(NavMode::Pan | NavMode::Zoom)) {
             app.viewport.orbit_snap = None;
@@ -591,6 +678,11 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     step_orbit_snap(app, rect, ui.input(|i| f64::from(i.stable_dt)));
     if app.viewport.orbit_snap.is_some() {
         ui.ctx().request_repaint();
+    }
+    // The gesture is over once nothing is down and the release frame has passed: from the next
+    // gesture on, its release can be a pick again.
+    if app.viewport.touch.is_empty() && !ui.input(|i| i.pointer.any_released()) {
+        app.viewport.touch_multi = false;
     }
     CameraInput { hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, delta, inside, axes, pinch, pan, primary_nav, mode }
 }
@@ -763,6 +855,14 @@ pub(crate) fn middle_double_click(app: &mut SolveApp, ui: &egui::Ui, inside: boo
 /// The cursor pivot is chosen once, when the drag begins.
 /// How much a pinch's per-frame spread is amplified into camera distance.
 const PINCH_GAIN: f64 = 3.0;
+
+/// How far (points) a lone finger must travel before it starts orbiting the view. Below it the
+/// gesture is still a tap, or the first finger of a pinch waiting for the second to land.
+const TOUCH_ARM: f32 = 12.0;
+
+/// How long (seconds) a touch gesture can go without a single event before it is taken as over:
+/// a finger's end that the palm rejection dropped would otherwise keep panning the view.
+const TOUCH_STALE: f64 = 1.5;
 
 pub fn orbit(app: &mut SolveApp, rect: egui::Rect, dx: f64, dy: f64, press: Option<Pos2>) {
     let pivot = match app.preferences.orbit_around {

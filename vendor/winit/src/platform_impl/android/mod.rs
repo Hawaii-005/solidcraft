@@ -382,8 +382,13 @@ impl<T: 'static> EventLoop<T> {
 
                 // A stylus or mouse hovering above the glass (no button down): report it as a
                 // pointer move, so the viewport can show what a tap would pick before it lands.
+                // A stylus hovering or leaving is not drawing: never leave the flag set, or every
+                // finger afterwards is mistaken for a palm and dropped.
                 if matches!(motion_event.action(), MotionAction::HoverMove | MotionAction::HoverEnter) {
                     if let Some(pointer) = motion_event.pointers().next() {
+                        if pointer.tool_type() == ToolType::Stylus {
+                            STYLUS_DOWN.store(false, Ordering::Relaxed);
+                        }
                         let position = PhysicalPosition { x: pointer.x() as _, y: pointer.y() as _ };
                         callback(
                             event::Event::WindowEvent {
@@ -426,14 +431,16 @@ impl<T: 'static> EventLoop<T> {
                 if let Some(phase) = phase {
                     let pointers: Box<dyn Iterator<Item = android_activity::input::Pointer<'_>>> =
                         match phase {
-                            event::TouchPhase::Started | event::TouchPhase::Ended => {
-                                Box::new(std::iter::once(
-                                    motion_event.pointer_at_index(motion_event.pointer_index()),
-                                ))
-                            },
-                            event::TouchPhase::Moved | event::TouchPhase::Cancelled => {
+                            // Every pointer, not just the action's: a second finger landing arrives
+                            // as `PointerDown` and its index has been unreliable on some panels, so
+                            // report them all and let the app ignore an id it already tracks. A
+                            // lost second start is a pinch that never happens.
+                            event::TouchPhase::Started | event::TouchPhase::Moved | event::TouchPhase::Cancelled => {
                                 Box::new(motion_event.pointers())
-                            },
+                            }
+                            event::TouchPhase::Ended => Box::new(std::iter::once(
+                                motion_event.pointer_at_index(motion_event.pointer_index()),
+                            )),
                         };
 
                     for pointer in pointers {
