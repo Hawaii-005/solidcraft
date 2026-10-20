@@ -34,7 +34,7 @@ check() {
   if [ "$behind" -gt 0 ]; then
     git log --oneline "HEAD..$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" | head -20 || true
     echo
-    echo "Run: $0 rebase    (Cargo.lock conflicts are resolved automatically)"
+    echo "Run: $0 update    (merge upstream; Cargo.lock conflicts are resolved automatically)"
   fi
   git describe --tags --always "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" 2>/dev/null | sed 's/^/upstream: /'
 }
