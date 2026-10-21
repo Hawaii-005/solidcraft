@@ -1,6 +1,7 @@
 //! Original, code-drawn navigation cube. Flat faces share invisible picking regions.
 use super::*;
 use crate::icons::navigation::{Facet, arrow, curved_arrow, paint_cube};
+use solidcraft_engine::geom::Ring;
 
 pub(super) const SIZE: f32 = 112.0;
 // Paint and picking use the same original coordinate space, scaled as a group.
@@ -49,10 +50,9 @@ fn facets(cam: &Camera, c: Pos2, half: f64) -> Vec<Facet> {
             let b = project(cam, *b - centre, half);
             a.y.atan2(a.x).total_cmp(&b.y.atan2(b.x))
         });
+        let vertices = Ring::new(vertices);
         let outer_edges = vertices
-            .iter()
-            .zip(vertices.iter().cycle().skip(1))
-            .take(vertices.len())
+            .edges()
             .map(|(a, b)| [(a.x, b.x), (a.y, b.y), (a.z, b.z)].into_iter().filter(|(a, b)| a.abs() == 1.0 && a == b).count() >= 2)
             .collect();
         let points = vertices.into_iter().map(|v| c + project(cam, v, half)).collect();
@@ -92,12 +92,12 @@ fn facets(cam: &Camera, c: Pos2, half: f64) -> Vec<Facet> {
     out
 }
 
-fn contains(points: &[Pos2], p: Pos2) -> bool {
+fn contains(points: &Ring<Pos2>, p: Pos2) -> bool {
     if !p.is_finite() || points.len() < 3 {
         return false;
     }
     let mut sign = 0.0_f32;
-    for (a, b) in points.iter().zip(points.iter().cycle().skip(1)).take(points.len()) {
+    for (a, b) in points.edges() {
         let edge = *b - *a;
         let offset = p - *a;
         let cross = edge.x * offset.y - edge.y * offset.x;
@@ -155,7 +155,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
     let t = Tokens::get().navigation_cube(active);
     crate::scenario::publish_count("navigation_cube:active", f64::from(u8::from(active)));
     let faces = facets(&app.cam, c, HALF * f64::from(scale));
-    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| ui.rect_contains_pointer(rect));
+    let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| ui.is_enabled() && ui.rect_contains_pointer(rect) && !crate::shell::covered(app, *p));
     let hovered = if orbiting { None } else { hover.and_then(|p| hit(&faces, p)) };
     let painter = ui.painter_at(outer);
     paint_cube(&painter, &faces, hovered, t, true, scale);
@@ -214,8 +214,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
     let home = Rect::from_center_size(c + vec2(-65.0, -65.0) * scale, vec2(26.0, 26.0) * scale);
-    crate::scenario::publish_rect("axis_view:home", home);
-    crate::scenario::publish_handle("axis_view:home", home.center());
+    crate::scenario::publish_target("axis_view:home", home);
     let home_hover = control(app, ui, home, "home", "Home: isometric view and fit model");
     if active {
         icons::paint(&painter, home.shrink(4.0 * scale), "home", if home_hover { t.accent } else { t.cube_face }, t.cube_face, t.accent);
@@ -231,7 +230,7 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
         let (r, u, _) = app.cam.basis();
         let tip = origin + vec2((d.dot(r) * 17.0) as f32, -(d.dot(u) * 17.0) as f32) * scale;
         painter.line_segment([origin, tip], Stroke::new(1.5, color));
-        painter.text(tip, Align2::CENTER_CENTER, label, FontId::proportional(8.0), color);
+        painter.text(tip, Align2::CENTER_CENTER, label, FontId::proportional(crate::theme::Tokens::get().font_triad), color);
     }
 }
 
@@ -272,7 +271,7 @@ mod tests {
     fn former_edge_strips_click_the_face_and_hover_without_internal_seams() {
         let mut h = crate::scenario::Harness::new();
         h.call("ui.prefs", json!({"navigator_style":"cube"}));
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         h.app.preferences.look_at_anim = false;
         for up in ["z", "y"] {
             h.call("ui.prefs", json!({"up_axis":up}));
@@ -337,7 +336,7 @@ mod tests {
 
     #[test]
     fn hovered_face_and_corner_have_a_pale_blue_opaque_fill_in_both_themes() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         let faces = facets(&Camera::default(), pos2(100.0, 100.0), HALF);
         for t in [Tokens::light(), Tokens::dark()] {
             assert_ne!(t.navigation_cube(false).cube_face, t.cube_face);
@@ -363,7 +362,7 @@ mod tests {
 
     #[test]
     fn idle_principal_views_have_square_faces_without_visible_picking_seams() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         for up in [UpAxis::Z, UpAxis::Y] {
             for view in [StandardView::Front, StandardView::Back, StandardView::Top, StandardView::Bottom, StandardView::Left, StandardView::Right] {
                 let mut cam = Camera { up, ..Default::default() };
@@ -427,11 +426,11 @@ mod tests {
 
     #[test]
     fn face_labels_use_normalized_font_atlas_coordinates() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         let output = paint_frame(&ctx, |ui| {
             let faces = facets(&Camera::default(), pos2(100.0, 100.0), HALF);
             for face in &faces {
-                face_text(ui.painter(), face, Tokens::light().cube_text, 14.0);
+                face_text(ui.painter(), face, Tokens::light().cube_text, Tokens::get().font_heading);
             }
         });
         let meshes: Vec<_> = output.shapes.iter().filter_map(|shape| if let Shape::Mesh(mesh) = &shape.shape { Some(mesh) } else { None }).collect();
@@ -444,7 +443,7 @@ mod tests {
 
     #[test]
     fn label_uvs_follow_font_atlas_growth_later_in_the_same_frame() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         let mut pixel_uv = Pos2::ZERO;
         let mut glyph_vertex = 0;
         let mut early_size = [0; 2];
@@ -457,7 +456,7 @@ mod tests {
             let (index, vertex) = galley.rows.first().unwrap().visuals.mesh.vertices.iter().enumerate().find(|(_, v)| v.uv.y > 1.0).unwrap();
             glyph_vertex = index;
             pixel_uv = vertex.uv;
-            face_text(ui.painter(), face, Tokens::light().cube_text, 14.0);
+            face_text(ui.painter(), face, Tokens::light().cube_text, Tokens::get().font_heading);
             early_size = ctx.fonts(|f| f.font_image_size());
             // Other widgets can allocate new glyphs after the cube has been drawn.
             let text: String = (32_u8..127).map(char::from).collect();
@@ -473,7 +472,7 @@ mod tests {
 
     #[test]
     fn rotating_cube_facets_stay_opaque_and_inside_the_projected_geometry() {
-        let ctx = egui::Context::default();
+        let ctx = crate::fonts::test_context();
         for up in [UpAxis::Z, UpAxis::Y] {
             for view in [StandardView::Top, StandardView::Bottom, StandardView::Front, StandardView::Back, StandardView::Left, StandardView::Right] {
                 let from = Camera { up, ..Default::default() };

@@ -1,6 +1,6 @@
 # UI localization
 
-SolidCraft embeds its translations and works offline. English, Czech, German, Spanish, French, Galician, Italian,
+SolidCraft embeds its translations and works offline. English, Czech, Danish, German, English (UK), Spanish, French, Galician, Italian,
 Japanese, Korean, Malay, Polish, Brazilian Portuguese, Russian, Turkish, Ukrainian and Chinese are currently registered in `crates/ui-egui/src/i18n.rs`. Adding a language requires an
 embedded catalog and one registration there; the preferences selector and validation use the same
 registry.
@@ -31,6 +31,12 @@ entry has a note for translators: what the term must not be confused with. Its "
 than one meaning" table lists the English words that need a separate catalogue entry for each
 meaning (Construction, Flat, Round, Normal, Gap, Clearance).
 
+## English (UK)
+
+`en-GB.json` holds only the English messages whose spelling differs in UK English (Centre,
+Customise, Organisation, Licence, colours, …); every other message falls back to English. When an
+English message with a US spelling is added, add its UK spelling there too.
+
 ## Coverage
 
 A message a locale never received falls back to English silently, so a gap shows up only as a row
@@ -38,7 +44,7 @@ that looks untranslated. Two guards catch that in the build:
 
 - `every_complete_catalog_carries_every_english_message` — adding a key to `en.json`
   without giving it to a complete catalog fails the tests. English is the source catalog,
-  Japanese and Chinese are delivered complete; German, Spanish, Galician, Italian, Korean, Malay, Polish, Brazilian Portuguese, Russian, French, Ukrainian and
+  Japanese and Chinese are delivered complete; Danish, German, Spanish, Galician, Italian, Korean, Malay, Polish, Brazilian Portuguese, Russian, French, Ukrainian and
   Turkish are partial — their gaps fall back to English and are reported by `cargo xtask i18n` without
   failing the build. A new label needs en, ja, zh, de and ko; Russian, French, Ukrainian and Malay may
   follow later.

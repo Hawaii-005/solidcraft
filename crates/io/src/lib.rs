@@ -12,10 +12,9 @@ mod design_metadata;
 mod dxf;
 mod dxf_out;
 pub use design::{
-    DesignCompression, DesignContainerReader, DesignGeometry, DesignPreview, THUMBNAIL_SIZE, is_design_container, read_design_file,
-    read_design_geometry, read_design_preview, read_design_thumbnail, read_design_thumbnail_file, write_design_container,
-    write_design_container_with_cache, write_design_container_with_compression, write_design_container_with_preview,
-    write_design_container_with_thumbnail,
+    DesignCompression, DesignContainerReader, DesignPreview, THUMBNAIL_SIZE, is_design_container, read_design_file, read_design_geometry,
+    read_design_preview, read_design_thumbnail, read_design_thumbnail_file, write_design_container, write_design_container_with_cache,
+    write_design_container_with_compression, write_design_container_with_preview, write_design_container_with_thumbnail,
 };
 mod legacy_dir;
 #[cfg(test)]
@@ -102,8 +101,10 @@ pub fn is_iges_path(path: &str) -> bool {
 /// nothing), so the caller chooses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StepNames {
-    /// The solid's own name in the file, else the name of the product that holds it.
+    /// Keep meaningful solid names; replace placeholders with the nearest named product.
     #[default]
+    Auto,
+    /// The solid's own name in the file, else the name of the product that holds it.
     Solid,
     /// The name of the product (part) that holds the body, else the solid's name.
     Product,
@@ -113,9 +114,10 @@ pub enum StepNames {
 }
 
 impl StepNames {
-    /// `solid`, `product` or `instance` (any case); `None` for anything else.
+    /// `auto`, `solid`, `product` or `instance` (any case); `None` for anything else.
     pub fn parse(s: &str) -> Option<StepNames> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(StepNames::Auto),
             "solid" => Some(StepNames::Solid),
             "product" => Some(StepNames::Product),
             "instance" => Some(StepNames::Instance),
@@ -127,7 +129,16 @@ impl StepNames {
 /// A name that says nothing about its body: empty, or the placeholder a file or the importer
 /// gives to something it has no name for.
 fn generic_name(n: &str) -> bool {
-    n.trim().is_empty() || n.starts_with('(') || n.eq_ignore_ascii_case("import") || n.eq_ignore_ascii_case("unnamed")
+    let n = n.trim();
+    n.is_empty()
+        || n.starts_with('(')
+        || n.eq_ignore_ascii_case("import")
+        || n.eq_ignore_ascii_case("unnamed")
+        || ["body", "solid", "shell"].iter().any(|prefix| {
+            n.get(..prefix.len()).is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+                && n.get(prefix.len()..)
+                    .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit() || c.is_ascii_whitespace() || matches!(c, '_' | '-' | '(' | ')')))
+        })
 }
 
 /// The name an imported body gets under the `names` choice; the solid's name when the chosen
@@ -135,6 +146,8 @@ fn generic_name(n: &str) -> bool {
 fn body_name(b: &solidcraft_kernel::ImportedBody, names: StepNames) -> String {
     let usable = |n: &&String| !generic_name(n);
     let chosen = match names {
+        StepNames::Auto if !generic_name(&b.name) => Some(&b.name),
+        StepNames::Auto => b.path.iter().rev().find(usable).or_else(|| b.instance.as_ref().filter(usable)),
         StepNames::Solid => None,
         StepNames::Product => b.path.last().filter(usable),
         StepNames::Instance => b.instance.as_ref().filter(usable).or(b.path.last().filter(usable)),
@@ -147,13 +160,41 @@ pub struct StepFeature {
     /// Timeline name: the root product's name, else the file name.
     pub name: String,
     pub kind: solidcraft_doc::FeatureKind,
-    /// Body names from the file, as [`StepNames`] chose them (by default the solid names, else
-    /// the product names).
+    /// Body names from the file, as [`StepNames`] chose them (automatic by default).
     pub body_names: Vec<String>,
     pub warnings: Vec<String>,
     /// The file as read. Hold it until the feature has been evaluated: the timeline then reuses
     /// it instead of reading the file again (it is freed with the last holder).
     pub import: std::sync::Arc<solidcraft_kernel::StepImport>,
+}
+
+/// Bytes the encoding detector sees at most: the lines with 8-bit bytes, which in a STEP or IGES
+/// file are the names and descriptions.
+const ENCODING_SAMPLE_BYTES: usize = 64 << 10;
+
+/// STEP or IGES bytes as text. UTF-8 stays as it is. Some exporters write names in the system's
+/// legacy encoding instead of Part 21 escapes (GBK from Chinese vendors, Shift_JIS from Japanese
+/// ones): that encoding is detected from the lines holding 8-bit bytes and the file decoded with
+/// it, so a name reads `圆角` rather than U+FFFD noise (#2344). The syntax itself is ASCII in every
+/// such encoding.
+fn step_text(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut detector = chardetng::EncodingDetector::new();
+    let mut fed = 0;
+    for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_ascii()) {
+        if fed >= ENCODING_SAMPLE_BYTES {
+            break;
+        }
+        let line = line.get(..line.len().min(ENCODING_SAMPLE_BYTES - fed)).unwrap_or_default();
+        detector.feed(line, false);
+        detector.feed(b"\n", false);
+        fed += line.len() + 1;
+    }
+    detector.feed(&[], true);
+    let encoding = detector.guess(None, false);
+    encoding.decode_without_bom_handling(bytes).0.into_owned()
 }
 
 /// Read STEP bytes (`file` is the source file name) into an Import base feature. The file is
@@ -172,9 +213,11 @@ pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> 
     let (text, iges_warnings) = if is_native_cad_path(file) {
         native_cad_to_step(bytes, file).map_err(IoError::Invalid)?
     } else {
-        let text = String::from_utf8_lossy(bytes).into_owned();
+        let text = step_text(bytes);
         if is_iges_path(file) { solidcraft_kernel::iges_to_step(&text).map_err(IoError::Invalid)? } else { (text, Vec::new()) }
     };
+    // The feature keeps this text and a save stores it: refuse now what could not be saved.
+    design::check_step_storable(&text)?;
     let imp = solidcraft_kernel::step_import_shared(&text)?;
     let stem = std::path::Path::new(file)
         .file_stem()
@@ -720,7 +763,7 @@ mod tests {
         let step = String::from_utf8(export_with_metadata(&m.state(), &[], Format::Step, "t", &meta).unwrap()).unwrap();
         assert!(step.contains("FILE_DESCRIPTION(('Vented Geh\\X2\\00E4\\X0\\use for a Pi'),'2;1');"), "{}", &step[..300]);
         assert!(step.contains("FILE_NAME('t.step','',('Jane O''Brien'),('ACME'),"), "{}", &step[..300]);
-        assert_eq!(step_import_feature(step.as_bytes(), "t.step").unwrap().body_names, ["Body1"], "still reads back");
+        assert_eq!(step_import_feature(step.as_bytes(), "t.step").unwrap().body_names, ["t"], "still reads back");
         let iges = String::from_utf8(export_with_metadata(&m.state(), &[], Format::Iges, "t", &meta).unwrap()).unwrap();
         assert!(iges.contains("12HJane O'Brien") && iges.contains("4HACME"));
         let model_xml = |bytes: Vec<u8>| {
@@ -750,6 +793,27 @@ mod tests {
     }
 
     #[test]
+    fn step_names_in_a_legacy_encoding() {
+        // Exporters that write names in the system encoding instead of Part 21 escapes (#2344).
+        let (_, m) = model();
+        let step = export(&m.state(), &[], Format::Step, "t").unwrap();
+        let at = step.windows(7).position(|w| w == b"'Body1'").unwrap();
+        for (encoding, name) in [(encoding_rs::GBK, "圆角20"), (encoding_rs::SHIFT_JIS, "ネジ穴の面取り"), (encoding_rs::WINDOWS_1252, "Gehäuse")]
+        {
+            let mut bytes = step[..at + 1].to_vec();
+            bytes.extend_from_slice(&encoding.encode(name).0);
+            bytes.extend_from_slice(&step[at + 6..]);
+            assert!(std::str::from_utf8(&bytes).is_err(), "{name}: the test file is not UTF-8");
+            assert_eq!(step_import_feature(&bytes, "t.step").unwrap().body_names, [name], "{}", encoding.name());
+        }
+        // UTF-8 names are read as they are.
+        let mut bytes = step[..at + 1].to_vec();
+        bytes.extend_from_slice("圆角".as_bytes());
+        bytes.extend_from_slice(&step[at + 6..]);
+        assert_eq!(step_import_feature(&bytes, "t.step").unwrap().body_names, ["圆角"]);
+    }
+
+    #[test]
     fn step_and_design() {
         let (doc, m) = model();
         let s = String::from_utf8(export(&m.state(), &[], Format::Step, "t").unwrap()).unwrap();
@@ -763,7 +827,7 @@ mod tests {
         let f = step_import_feature(s.as_bytes(), "/tmp/My Part.step").unwrap();
         // Named after the exported product (the export was called `t`).
         assert_eq!(f.name, "t");
-        assert_eq!(f.body_names, ["Body1"]);
+        assert_eq!(f.body_names, ["t"]);
         assert_eq!(f.body_names.len(), 1);
         assert!(matches!(&f.kind, FeatureKind::Import { file, .. } if file == "My Part.step"));
         let mut imported = Document::new("Imported STEP round trip");
@@ -813,9 +877,8 @@ mod tests {
         step_export_products(&products, 0, &StepHeader::default()).unwrap()
     }
 
-    /// The bodies of a STEP file are named after the solid (the default), the product that holds
-    /// them, or the assembly occurrence; a name the file leaves out or fills with a placeholder
-    /// falls back to the next one.
+    /// Automatic names keep meaningful solid labels and replace placeholders with part names.
+    /// Explicit choices still select the solid, product or occurrence.
     #[test]
     fn step_import_names_follow_the_choice() {
         let text = frame_step();
@@ -823,10 +886,15 @@ mod tests {
         assert_eq!(names(&text, StepNames::Solid), ["Cut-Extrude3", "Boss-Extrude1", "Boss-Extrude1"]);
         assert_eq!(names(&text, StepNames::Product), ["Plate", "Post", "Post"]);
         assert_eq!(names(&text, StepNames::Instance), ["Plate-1", "Post-1", "Post-2"]);
-        // Without a choice it is the solid's name, as before.
+        // Meaningful solid names survive automatic naming, including SolidCraft exports.
         assert_eq!(step_import_feature(text.as_bytes(), "frame.step").unwrap().body_names, names(&text, StepNames::Solid));
+        let generic = text.replace("'Cut-Extrude3'", "'Body1'").replace("'Boss-Extrude1'", "'Body 2 (3)'");
+        assert_eq!(step_import_feature(generic.as_bytes(), "frame.step").unwrap().body_names, ["Plate", "Post", "Post"]);
+        assert_eq!(names(&generic, StepNames::Solid), ["Body1", "Body 2 (3)", "Body 2 (3)"]);
+        let named = generic.replace("'Body1'", "'Body housing'");
+        assert_eq!(names(&named, StepNames::Auto), ["Body housing", "Post", "Post"]);
         // The timeline entry is the root product's name whatever the bodies are called.
-        for choice in [StepNames::Solid, StepNames::Product, StepNames::Instance] {
+        for choice in [StepNames::Auto, StepNames::Solid, StepNames::Product, StepNames::Instance] {
             assert_eq!(step_import_feature_named(text.as_bytes(), "frame.step", choice).unwrap().name, "Frame");
         }
         // A product the file leaves unnamed says nothing: its bodies keep the solid's name.
@@ -838,6 +906,8 @@ mod tests {
         assert_eq!(names(&part, StepNames::Solid), ["Body1"]);
         assert_eq!(names(&part, StepNames::Product), ["Bracket"]);
         assert_eq!(names(&part, StepNames::Instance), ["Bracket"]);
+        assert_eq!(names(&part, StepNames::Auto), ["Bracket"]);
+        assert_eq!(StepNames::parse(" AuTo "), Some(StepNames::Auto));
         assert_eq!(StepNames::parse(" Product "), Some(StepNames::Product));
         assert_eq!(StepNames::parse("INSTANCE"), Some(StepNames::Instance));
         assert_eq!(StepNames::parse("label"), None);

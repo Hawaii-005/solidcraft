@@ -540,6 +540,57 @@ fn replace_face_align_remove() {
     assert_eq!(measure(&mut s)["body_count"], 1);
 }
 
+/// The z range and the x minimum of body `name`.
+fn z_x(s: &mut Session, name: &str) -> (f64, f64, f64) {
+    let m = measure(s);
+    let b = m["bodies"].as_array().unwrap().iter().find(|b| b["name"] == name).unwrap().clone();
+    let g = |k: &str, i: usize| b["bbox"][k][i].as_f64().unwrap_or(f64::NAN);
+    (g("min", 2), g("max", 2), g("min", 0))
+}
+
+/// Align onto planes and the origin: a face goes flush onto an origin plane (turning to meet it),
+/// onto an offset plane, a vertex onto the origin point, and a plane the bodies are aligned to
+/// is followed when it moves.
+#[test]
+fn align_takes_planes_and_the_origin() {
+    let boxed = || {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [50, 0, 20], "body_name": "C"}));
+        s
+    };
+    // The bottom face onto XY: it already faces down, so it only drops; nothing slides across.
+    let mut s = boxed();
+    run(&mut s, "solid.align", json!({"bodies": ["C"], "from_face": [55, 5, 20], "to_plane": "XY"}));
+    let (lo, hi, x) = z_x(&mut s, "C");
+    assert!(lo.abs() < 1e-6 && (hi - 10.0).abs() < 1e-6 && (x - 50.0).abs() < 1e-6, "{lo} {hi} {x}");
+    // The top face onto XY: the body turns over (the face now faces down) and sits on the plane.
+    let mut s = boxed();
+    run(&mut s, "solid.align", json!({"bodies": ["C"], "from_face": [55, 5, 30], "to_plane": "XY"}));
+    let (lo, hi, _) = z_x(&mut s, "C");
+    assert!(lo.abs() < 1e-6 && (hi - 10.0).abs() < 1e-6, "{lo} {hi}");
+    assert!(measure(&mut s)["bodies"][0]["bbox"]["max"][2].as_f64().is_some());
+    // A vertex onto the origin point.
+    let mut s = boxed();
+    run(&mut s, "solid.align", json!({"bodies": ["C"], "from": {"snap": "vertex", "at": [50, 0, 20]}, "to": "origin"}));
+    let (lo, _, x) = z_x(&mut s, "C");
+    assert!(lo.abs() < 1e-6 && x.abs() < 1e-6, "{lo} {x}");
+    // Onto an offset plane, and the bodies follow it when its distance changes.
+    let mut s = boxed();
+    run(&mut s, "parameters.add", json!({"name": "lift", "expression": "30 mm"}));
+    run(&mut s, "construct.plane.offset", json!({"base": "XY", "offset": "lift", "name": "Shelf"}));
+    run(&mut s, "solid.align", json!({"bodies": ["C"], "from_face": [55, 5, 20], "to_plane": "Shelf"}));
+    assert!((z_x(&mut s, "C").0 - 30.0).abs() < 1e-6);
+    run(&mut s, "parameters.change", json!({"name": "lift", "expression": "45 mm"}));
+    assert!((z_x(&mut s, "C").0 - 45.0).abs() < 1e-6, "the bodies follow the plane");
+    // A plane as the source: the bodies move with it onto a point.
+    let mut s = boxed();
+    run(&mut s, "solid.align", json!({"bodies": ["C"], "from_plane": "XY", "to": [0, 0, 7]}));
+    assert!((z_x(&mut s, "C").0 - 27.0).abs() < 1e-6);
+    // One side is a plane or a point, not both; an unknown plane is refused.
+    assert!(s.execute("solid.align", &json!({"bodies": ["C"], "from_plane": "XY", "from": [0, 0, 0], "to": [0, 0, 7]})).is_err());
+    assert!(s.execute("solid.align", &json!({"bodies": ["C"], "from": [0, 0, 0], "to_plane": "Nowhere"})).is_err());
+}
+
 #[test]
 fn coil_and_loft_to_a_point() {
     use std::f64::consts::{PI, TAU};
@@ -1551,4 +1602,19 @@ fn text_cut_through_a_large_plate_is_one_exact_boolean() {
     // The letters right through the plate, their counters left as pieces of their own: the same
     // material in either plate (measured on meshes, which are coarser on the larger one).
     assert!(small > 10.0 && rel(large, small) < 5e-2, "{small} {large}");
+}
+
+/// A loft between two sections in one plane is refused (it used to build a flat body of zero
+/// volume and report success).
+#[test]
+fn loft_through_coplanar_sections_is_refused() {
+    let mut s = Session::default();
+    for name in ["A", "B"] {
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": name}));
+        run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}));
+        run(&mut s, "sketch.finish", json!({}));
+    }
+    let e = s.execute("solid.loft", &json!({"sections": [{"sketch": "A"}, {"sketch": "B"}]})).unwrap_err().to_string();
+    assert!(e.contains("same plane"), "{e}");
+    assert!(s.model.state().bodies.is_empty());
 }

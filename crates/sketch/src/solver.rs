@@ -19,7 +19,13 @@ use solidcraft_geom::{Seg2, Vec2};
 use crate::decompose::Budget;
 use crate::linalg::{Mat, determined_vars, solve as lin_solve};
 use crate::model::{ConstraintKind, CurveKind, Sketch};
+#[cfg(feature = "solver-profiling")]
+use crate::profiling::{self, Decision, Phase, StopReason};
 use crate::union_find::{find, union};
+
+#[path = "cursor.rs"]
+mod cursor;
+pub use cursor::{move_line_towards, move_point_towards};
 
 #[path = "redundancy.rs"]
 mod redundancy;
@@ -343,6 +349,14 @@ impl State<'_> {
         let sweep = ((self.p(b) - self.p(cp)).angle() - (self.p(a) - self.p(cp)).angle()).rem_euclid(std::f64::consts::TAU);
         if curve.reversed { -sweep } else { sweep }
     }
+    /// What a line-to-circle distance measures: the gap from line `l` to the edge of circle or
+    /// arc `c`, or (`inside`) how far the edge reaches past the line.
+    fn line_circle_gap(&self, l: usize, c: usize, inside: bool) -> f64 {
+        let (a, b) = self.line(l);
+        let (cc, r) = self.round(c);
+        let d = line_dist(cc, a, b).abs();
+        if inside { r - d } else { d - r }
+    }
     fn slot_length(&self, a: usize, b: usize) -> f64 {
         let (ca, ra) = self.round(a);
         let (cb, rb) = self.round(b);
@@ -543,6 +557,7 @@ fn residuals(s: &State, k: &ConstraintKind, out: &mut Vec<f64>) {
             let (a, b) = s.line(l);
             out.push(line_dist(s.p(p), a, b).abs() - value);
         }
+        LineCircleDistance { l, c, value, inside } => out.push(s.line_circle_gap(l, c, inside) - value),
         Length { l, value } => {
             let (a, b) = s.line(l);
             out.push(a.dist(b) - value);
@@ -605,6 +620,7 @@ fn measure(s: &State, k: &ConstraintKind) -> Option<f64> {
             let (a, b) = s.line(l);
             line_dist(s.p(p), a, b).abs()
         }
+        LineCircleDistance { l, c, inside, .. } => s.line_circle_gap(l, c, inside),
         Length { l, .. } => {
             let (a, b) = s.line(l);
             a.dist(b)
@@ -659,6 +675,8 @@ fn copy_block<'a>(b: &Block<'a>) -> Block<'a> {
 }
 
 fn block_residuals(s: &State, b: &Block, out: &mut Vec<f64>) {
+    #[cfg(feature = "solver-profiling")]
+    profiling::count(|c| c.residual_block_evaluations = c.residual_block_evaluations.saturating_add(1));
     match b {
         Block::Closure { a, b } => {
             let d = s.p(*a) - s.p(*b);
@@ -810,6 +828,7 @@ fn block_refs(sk: &Sketch, b: &Block) -> Vec<Ref> {
             | DistanceY { p, q, .. } => vec![P(p), P(q)],
             PointOnCurve { p, c } => vec![P(p), C(c)],
             Midpoint { p, l } | PointLineDistance { p, l, .. } | LinearDiameter { p, l, .. } => vec![P(p), L(l)],
+            LineCircleDistance { l, c, .. } => vec![L(l), R(c)],
             Horizontal { l } | Vertical { l } | Length { l, .. } | LineAngle { l, .. } => vec![L(l)],
             // Another kind reads a constant value, whatever its points: as good as any.
             ArcSweep { c, .. } | Radius { c, .. } | Diameter { c, .. } | ArcLength { c, .. } => vec![C(c)],
@@ -831,6 +850,15 @@ fn block_refs(sk: &Sketch, b: &Block) -> Vec<Ref> {
 
 /// Residual vector and Jacobian (rows × all n vars) for the given blocks.
 fn system(sk: &Sketch, lay: &Layout, blocks: &[(Block, Vec<usize>)], x: &mut [f64], with_j: bool) -> (Vec<f64>, Option<Mat>, Vec<usize>) {
+    #[cfg(feature = "solver-profiling")]
+    let _timer = profiling::timer(Phase::ResidualSystem);
+    #[cfg(feature = "solver-profiling")]
+    profiling::count(|c| {
+        c.residual_system_evaluations = c.residual_system_evaluations.saturating_add(1);
+        if with_j {
+            c.jacobian_evaluations = c.jacobian_evaluations.saturating_add(1);
+        }
+    });
     let mut r = Vec::new();
     let mut owner = Vec::new();
     for (bi, (b, _)) in blocks.iter().enumerate() {
@@ -841,6 +869,8 @@ fn system(sk: &Sketch, lay: &Layout, blocks: &[(Block, Vec<usize>)], x: &mut [f6
     if !with_j {
         return (r, None, owner);
     }
+    #[cfg(feature = "solver-profiling")]
+    let _jacobian_timer = profiling::timer(Phase::Jacobian);
     let mut j = Mat::zeros(r.len(), lay.n);
     let mut row = 0;
     let mut plus = Vec::new();
@@ -886,6 +916,10 @@ fn local_system(
     col: &[usize],
     ncols: usize,
 ) -> (Vec<f64>, Mat, Vec<usize>) {
+    #[cfg(feature = "solver-profiling")]
+    let _timer = profiling::timer(Phase::Jacobian);
+    #[cfg(feature = "solver-profiling")]
+    profiling::count(|c| c.jacobian_evaluations = c.jacobian_evaluations.saturating_add(1));
     let (r, _, owner) = system(sk, lay, blocks, x, false);
     let mut j = Mat::zeros(r.len(), ncols);
     let mut row = 0;
@@ -945,18 +979,55 @@ fn lm_capped(
     col: &[usize],
     max_iters: usize,
 ) -> (usize, f64) {
+    // Without a work budget the initial residual is always evaluated.
+    lm_capped_with_budget(sk, lay, blocks, vars, x, col, max_iters, None).unwrap_or((0, f64::INFINITY))
+}
+
+/// Deterministic work units, shared with the frame's decomposition budget. Estimates bound
+/// dense arithmetic; they are not a wall-clock deadline. None means no residual was evaluated.
+fn lm_capped_with_budget(
+    sk: &Sketch,
+    lay: &Layout,
+    blocks: &[(Block, Vec<usize>)],
+    vars: &[usize],
+    x: &mut Vec<f64>,
+    col: &[usize],
+    max_iters: usize,
+    mut budget: Option<&mut Budget>,
+) -> Option<(usize, f64)> {
+    #[cfg(feature = "solver-profiling")]
+    let _timer = profiling::timer(Phase::Lm);
+    let evaluation_work = if budget.is_some() { residual_work(lay, blocks) } else { 0 };
+    if !within_budget(&mut budget, evaluation_work) {
+        return None;
+    }
     let n = vars.len();
     #[cfg(test)]
     lm_vars::add(n);
     let mut lambda = 1e-3;
     let (mut r, _, _) = system(sk, lay, blocks, x, false);
     let mut f = norm2(&r);
+    #[cfg(feature = "solver-profiling")]
+    let run = profiling::start_run(n, r.len(), max_iters, f);
     for it in 0..max_iters {
         if max_abs(&r) < TOL {
-            return (it, max_abs(&r));
+            #[cfg(feature = "solver-profiling")]
+            profiling::finish_run(run, StopReason::ResidualTolerance, max_abs(&r));
+            return Some((it, max_abs(&r)));
         }
+        let normal_work =
+            n.saturating_mul(n).saturating_mul(r.len()).saturating_add(evaluation_work.saturating_mul(n.saturating_mul(2).saturating_add(1)));
+        if !within_budget(&mut budget, normal_work) {
+            #[cfg(feature = "solver-profiling")]
+            profiling::finish_run(run, StopReason::WorkBudget, max_abs(&r));
+            return Some((it, max_abs(&r)));
+        }
+        #[cfg(feature = "solver-profiling")]
+        profiling::count(|c| c.outer_iterations = c.outer_iterations.saturating_add(1));
         let (_, j, _) = local_system(sk, lay, blocks, x, col, n);
         // Normal equations of this component.
+        #[cfg(feature = "solver-profiling")]
+        let normal_timer = profiling::timer(Phase::NormalEquations);
         let mut a = Mat::zeros(n, n);
         let mut g = vec![0.0; n];
         for row in 0..j.rows {
@@ -971,6 +1042,8 @@ fn lm_capped(
                 }
             }
         }
+        #[cfg(feature = "solver-profiling")]
+        drop(normal_timer);
         let mut improved = false;
         // Damping by distance moved, not by JᵀJ's diagonal (Marquardt): of the steps that fit the
         // residuals equally well it takes the shortest, so what the constraints leave free moves
@@ -979,13 +1052,26 @@ fn lm_capped(
         // the point sliding along it.) A point held on a curve is cheaper still, so it slides
         // rather than the curve's ends moving.
         let weight: Vec<f64> = vars.iter().map(|&v| if lay.slide.get(v).copied().unwrap_or(false) { SLIDE_WEIGHT } else { 1.0 }).collect();
-        for _ in 0..30 {
+        for _attempt in 0..30 {
+            let linear_work = n.saturating_mul(n).saturating_mul(n).saturating_add(evaluation_work);
+            if !within_budget(&mut budget, linear_work) {
+                #[cfg(feature = "solver-profiling")]
+                profiling::finish_run(run, StopReason::WorkBudget, max_abs(&r));
+                return Some((it, max_abs(&r)));
+            }
             let mut m = a.clone();
             for (i, w) in weight.iter().enumerate() {
                 m.add(i, i, lambda * w + 1e-12);
             }
             let rhs: Vec<f64> = g.iter().map(|v| -v).collect();
-            let Some(step) = lin_solve(m, rhs) else {
+            #[cfg(feature = "solver-profiling")]
+            let linear_timer = profiling::timer(Phase::LinearSolve);
+            let step = lin_solve(m, rhs);
+            #[cfg(feature = "solver-profiling")]
+            drop(linear_timer);
+            let Some(step) = step else {
+                #[cfg(feature = "solver-profiling")]
+                profiling::record_trial(run, it, _attempt, lambda, f, None, &g, &j, None, Decision::LinearFailure);
                 lambda *= 10.0;
                 continue;
             };
@@ -997,6 +1083,19 @@ fn lm_capped(
             }
             let (rt, _, _) = system(sk, lay, blocks, &mut trial, false);
             let ft = norm2(&rt);
+            #[cfg(feature = "solver-profiling")]
+            profiling::record_trial(
+                run,
+                it,
+                _attempt,
+                lambda,
+                f,
+                Some(ft),
+                &g,
+                &j,
+                Some(&step),
+                if ft.is_finite() && ft < f { Decision::Accepted } else { Decision::Rejected },
+            );
             if ft.is_finite() && ft < f {
                 *x = trial;
                 r = rt;
@@ -1011,10 +1110,22 @@ fn lm_capped(
             }
         }
         if !improved {
-            return (it, max_abs(&r));
+            #[cfg(feature = "solver-profiling")]
+            profiling::finish_run(run, StopReason::NoImprovement, max_abs(&r));
+            return Some((it, max_abs(&r)));
         }
     }
-    (max_iters, max_abs(&r))
+    #[cfg(feature = "solver-profiling")]
+    profiling::finish_run(run, StopReason::IterationLimit, max_abs(&r));
+    Some((max_iters, max_abs(&r)))
+}
+
+fn within_budget(budget: &mut Option<&mut Budget>, work: usize) -> bool {
+    budget.as_deref_mut().is_none_or(|b| b.try_charge(work))
+}
+
+fn residual_work(lay: &Layout, blocks: &[(Block, Vec<usize>)]) -> usize {
+    blocks.iter().fold(lay.n.max(1), |work, (_, vars)| work.saturating_add(vars.len().max(1)))
 }
 
 /// The variables LM was given and its runs on this thread, for tests that count what the
@@ -1291,9 +1402,12 @@ pub fn solve_holding(sk: &mut Sketch, hold: &Hold) -> SolveReport {
 /// What a solve works out besides placing the geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Analysis {
-    /// Degrees of freedom and which geometry the constraints determine: a rank analysis of the
-    /// Jacobian, the costly part of solving an already solved sketch.
+    /// Freedom analysis plus redundant constraint IDs. This is the complete diagnostic report
+    /// used by the public solve helpers and final sketch evaluation.
     Full,
+    /// Degrees of freedom and which geometry the constraints determine, with the same rank
+    /// analysis as `Full`, but no redundant constraint search (`redundant` is empty).
+    Freedom,
     /// Only whether it solved: the report's `dof` is 0 and its determined flags are empty. For
     /// solves whose report is only checked with [`SolveReport::ok`] (the frames of a drag).
     StatusOnly,
@@ -1337,8 +1451,14 @@ pub fn solve_after_value_edit(sk: &mut Sketch, old: &DrivingValues) -> SolveRepo
 /// before an interactive move. Read where the links are now, a point dimensioned from a
 /// projected line is on the far side of it as soon as the source moves the line past the point.
 pub fn solve_after_edit(sk: &mut Sketch, old: &DrivingValues, stored: Option<&[Vec2]>) -> SolveReport {
+    solve_after_edit_with_analysis(sk, old, stored, Analysis::Full)
+}
+
+/// [`solve_after_edit`] with only the requested diagnostics. Continuation, branch checks and
+/// geometry restoration are identical at every analysis level.
+pub fn solve_after_edit_with_analysis(sk: &mut Sketch, old: &DrivingValues, stored: Option<&[Vec2]>, analysis: Analysis) -> SolveReport {
     let old_values: Vec<Option<f64>> = sk.constraints.iter().map(|c| old.get(&c.id).copied()).collect();
-    solve_from(sk, &Hold::default(), stored, Analysis::Full, Some(&old_values), &mut Budget::full())
+    solve_from(sk, &Hold::default(), stored, analysis, Some(&old_values), &mut Budget::full())
 }
 
 impl Sketch {
@@ -1538,7 +1658,8 @@ enum Orient {
     SideX(usize, usize, f64),
     /// The same along y (`DistanceY`).
     SideY(usize, usize, f64),
-    /// Which side of line `l` the point `p` is on (`PointLineDistance`, `LinearDiameter`).
+    /// Which side of line `l` the point `p` is on (`PointLineDistance`, `LinearDiameter`, a
+    /// circle's centre for `LineCircleDistance`).
     OfLine(usize, usize, f64),
 }
 
@@ -1707,6 +1828,12 @@ fn orients(s: &State, sub: &[(Block, Vec<usize>)]) -> Vec<(Orient, Vec<usize>)> 
             ConstraintKind::DistanceY { p, q, value } if free(p) || free(q) => out.push((Orient::SideY(p, q, value), vec![*ci])),
             ConstraintKind::PointLineDistance { p, l, value } => out.push((Orient::OfLine(p, l, value), vec![*ci])),
             ConstraintKind::LinearDiameter { p, l, value } => out.push((Orient::OfLine(p, l, value / 2.0), vec![*ci])),
+            // The circle stays on its side of the line: the distance is unsigned.
+            ConstraintKind::LineCircleDistance { l, c, value, .. } => {
+                if let Some(CurveKind::Circle { c: centre, .. } | CurveKind::Arc { c: centre, .. }) = s.sk.curves.get(c).map(|x| &x.kind) {
+                    out.push((Orient::OfLine(*centre, l, value + s.round(c).1), vec![*ci]));
+                }
+            }
             _ => {}
         }
     }
@@ -1777,6 +1904,8 @@ fn continue_values(
     x: &mut [f64],
     edit: &ValueEdit,
 ) -> (usize, bool) {
+    #[cfg(feature = "solver-profiling")]
+    profiling::count(|c| c.continuation_runs = c.continuation_runs.saturating_add(1));
     // Every sub-step lands on a sixty-fourth: the changed constraints at each, built once.
     let arena: Vec<Vec<ConstraintKind>> = (0..=SUBSTEPS).map(|j| edit.kinds_at(j)).collect();
     let mut blocks: Vec<(Block, Vec<usize>)> = sub.iter().map(|(b, v)| (copy_block(b), v.clone())).collect();
@@ -1811,6 +1940,10 @@ fn solve_inner(
     old_values: Option<&[Option<f64>]>,
     budget: &mut Budget,
 ) -> SolveReport {
+    #[cfg(feature = "solver-profiling")]
+    let _timer = profiling::timer(Phase::Solve);
+    #[cfg(feature = "solver-profiling")]
+    profiling::count(|c| c.solve_calls = c.solve_calls.saturating_add(1));
     sk.prune_patterns();
     sk.refresh_pattern_shapes();
     let mut orientation_before = Vec::new();
@@ -1846,7 +1979,11 @@ fn solve_inner(
         // applies edits: also the one after linked geometry moved, whose reference is the
         // stored state.
         let edits = reference.is_none() || old_values.is_some();
+        #[cfg(feature = "solver-profiling")]
+        let seed_timer = profiling::timer(Phase::Seed);
         let seeded = crate::construct::seed(sk, &given, reference, edits, &on_curve, budget);
+        #[cfg(feature = "solver-profiling")]
+        drop(seed_timer);
         for (i, (at, how)) in seeded.pos.iter().zip(&seeded.placed_by).enumerate() {
             if let (Some(at), Some(how), Some(v)) = (at, how, lay.pvar.get(i).copied().flatten())
                 && how.anchors()
@@ -1931,6 +2068,12 @@ fn solve_inner(
     let mut folded: Vec<String> = Vec::new();
     let all_blocks = blocks;
     let oversized = |vars: &[usize]| vars.len() > MAX_COMPONENT_VARS;
+    #[cfg(feature = "solver-profiling")]
+    profiling::count(|c| {
+        c.components = c.components.saturating_add(comps.len() as u64);
+        c.oversized_components = c.oversized_components.saturating_add(comps.iter().filter(|(_, v, b)| !b.is_empty() && oversized(v)).count() as u64);
+        c.constructed_variables = c.constructed_variables.saturating_add(constructed.iter().filter(|v| **v).count() as u64);
+    });
     let blocks_of = |bis: &mut dyn Iterator<Item = usize>| -> Vec<(Block, Vec<usize>)> {
         bis.filter_map(|bi| all_blocks.get(bi).map(|(b, v)| (copy_block(b), v.clone()))).collect()
     };
@@ -1977,7 +2120,7 @@ fn solve_inner(
             // start (the seeded one is where the pinned solve failed), or to its own start when
             // the seed did not move it.
             let reseeded = unseeded.as_ref().filter(|plain| vars.iter().any(|v| plain.get(*v).is_some_and(Option::is_some)));
-            if !solved && !(pinned_failed && reseeded.is_some()) {
+            if !(solved || pinned_failed && reseeded.is_some()) {
                 let (its, r) = lm(sk, &lay, &sub, vars, &mut x, &col);
                 iterations += its;
                 residual = r;
@@ -1985,6 +2128,8 @@ fn solve_inner(
             if !(residual < ACCEPT)
                 && let Some(plain) = reseeded
             {
+                #[cfg(feature = "solver-profiling")]
+                profiling::count(|c| c.plain_start_retries = c.plain_start_retries.saturating_add(1));
                 for (&v, s0) in vars.iter().zip(&start) {
                     if let Some(s) = x.get_mut(v) {
                         *s = plain.get(v).copied().flatten().unwrap_or(*s0);
@@ -2045,6 +2190,8 @@ fn solve_inner(
 
     // Final residuals and analysis, component by component (the Jacobian is block diagonal:
     // its rank is the sum of the components' ranks).
+    #[cfg(feature = "solver-profiling")]
+    let _analysis_timer = profiling::timer(Phase::Analysis);
     let mut max_residual = 0.0_f64;
     let mut failing: Vec<String> = Vec::new();
     let mut det = vec![false; lay.n];
@@ -2093,7 +2240,7 @@ fn solve_inner(
         let comp_rank = pin_flags.iter().filter(|p| **p).count() + rest_rank;
         rank += comp_rank;
         // More rows than rank: some constraint may be implied by the others.
-        if r.len() > comp_rank && vars.len() <= redundancy::MAX_REDUNDANCY_VARS {
+        if analysis == Analysis::Full && r.len() > comp_rank && vars.len() <= redundancy::MAX_REDUNDANCY_VARS {
             let (dependent, _) = redundancy::dependent_blocks(sk, &lay, &sub, vars, &mut x, None);
             for ((b, _), d) in sub.iter().zip(dependent) {
                 if d && let Some(c) = redundancy::block_constraint(b).and_then(|ci| sk.constraints.get(ci))
@@ -2222,19 +2369,9 @@ fn solve_inner(
         Some(v) => vdet(Some(v)) && vdet(Some(v + 1)),
         None => true,
     };
-    // Driven dimensions measure the solved geometry.
-    let fixed_lay = Layout { pvar: vec![None; sk.points.len()], rvar: vec![None; sk.curves.len()], n: 0, points: 0, slide: Vec::new() };
-    let measured: Vec<Option<f64>> =
-        sk.constraints.iter().map(|c| if c.driven { measure(&State { sk, lay: &fixed_lay, x: &[] }, &c.kind) } else { None }).collect();
-    for (c, m) in sk.constraints.iter_mut().zip(measured) {
-        if let Some(v) = m
-            && v.is_finite()
-        {
-            c.kind.set_value(v);
-        }
-    }
+    refresh_driven_dimensions(sk);
     let (dof, point_determined, curve_determined) = match analysis {
-        Analysis::Full => (
+        Analysis::Full | Analysis::Freedom => (
             lay.n.saturating_sub(rank),
             (0..sk.points.len()).map(pdet).collect(),
             sk.curves.iter().enumerate().map(|(i, c)| c.kind.point_ids().into_iter().all(pdet) && vdet(lay.rvar.get(i).copied().flatten())).collect(),
@@ -2252,6 +2389,21 @@ fn solve_inner(
         point_determined,
         curve_determined,
         redundant,
+    }
+}
+
+/// Geometry can also be finalized by feasible cursor motion, without another solve.
+/// Both paths must measure reference dimensions from the pose they publish.
+fn refresh_driven_dimensions(sk: &mut Sketch) {
+    let fixed_lay = Layout { pvar: vec![None; sk.points.len()], rvar: vec![None; sk.curves.len()], n: 0, points: 0, slide: Vec::new() };
+    let measured: Vec<Option<f64>> =
+        sk.constraints.iter().map(|c| if c.driven { measure(&State { sk, lay: &fixed_lay, x: &[] }, &c.kind) } else { None }).collect();
+    for (c, m) in sk.constraints.iter_mut().zip(measured) {
+        if let Some(v) = m
+            && v.is_finite()
+        {
+            c.kind.set_value(v);
+        }
     }
 }
 

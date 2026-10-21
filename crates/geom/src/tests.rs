@@ -150,6 +150,44 @@ fn tangent_chains_follow_smooth_edges() {
     assert_eq!(c, vec![0, 1]);
     assert_eq!(m.tangent_chain(2, 5f64.to_radians()), vec![2]);
     assert_eq!(m.face_edges(1), vec![1, 2]);
+    // A smooth seam where two faces share the same normal along the edge is not a corner to round,
+    // so tangent chaining stops at it.
+    let seam = Mesh {
+        positions: vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0), Vec3::new(15.0, 5.0, 0.0)],
+        normals: vec![Vec3::Z; 4],
+        triangles: vec![[0, 1, 3], [1, 2, 3], [1, 2, 3]],
+        tri_face: vec![0, 1, 2],
+        edges: vec![vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0)], vec![Vec3::new(10.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0)]],
+        edge_faces: vec![vec![0], vec![1, 2]],
+        ..Default::default()
+    };
+    assert_eq!(seam.tangent_chain(0, 5f64.to_radians()), vec![0]);
+}
+
+/// #3745: the tangent chain of a long helix (a thread's crest, in many edge pieces) is found
+/// without scanning every edge for every edge of it: hovering a threaded part's edge looked for
+/// its rim this way, and took seconds inside the frame. Every piece joins, in edge order, and
+/// a mesh of 3 000 pieces takes well under a frame.
+#[test]
+fn a_long_helical_tangent_chain_is_found_quickly() {
+    let pieces = 3_000usize;
+    let at = |t: f64| Vec3::new(4.0 * t.cos(), 4.0 * t.sin(), 0.2 * t);
+    let step = 0.05;
+    let mut m = Mesh::default();
+    for k in 0..pieces {
+        let t0 = k as f64 * step * 4.0;
+        m.edges.push((0..=4).map(|j| at(t0 + j as f64 * step)).collect());
+        m.edge_faces.push(vec![0]);
+    }
+    // The mesh's points (its size sets the join tolerance).
+    m.positions = m.edges.iter().flatten().copied().collect();
+    let began = std::time::Instant::now();
+    let chain = m.tangent_chain(pieces / 2, 2f64.to_radians());
+    let ms = began.elapsed().as_secs_f64() * 1000.0;
+    let mut sorted = chain.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..pieces).collect::<Vec<_>>(), "every piece of the helix is in the chain");
+    assert!(ms < 200.0, "{ms:.1} ms for {pieces} pieces");
 }
 
 #[test]
@@ -287,6 +325,8 @@ fn box_mesh(min: Vec3, max: Vec3, n: usize) -> Mesh {
                     let k = m.positions.len() as u32;
                     m.positions.extend([corner(i, j), corner(i + 1, j), corner(i + 1, j + 1), corner(i, j + 1)]);
                     m.triangles.extend(if side > 0.0 { [[k, k + 1, k + 2], [k, k + 2, k + 3]] } else { [[k, k + 2, k + 1], [k, k + 3, k + 2]] });
+                    // Faces: 2 * axis, plus one on the far side.
+                    m.tri_face.extend([(2 * axis) as u32 + side as u32; 2]);
                 }
             }
         }
@@ -318,6 +358,16 @@ fn meshes_cross_only_where_their_surfaces_pass_through_each_other() {
     // Passing through by less than the tolerance doesn't count.
     assert!(!a.crosses(&cube(9.995, 3.0, 1), 0.01));
     assert!(!a.crosses(&cube(9.85, 3.0, 1), f64::NAN));
+    // Crossings left out where the caller knows better: only those, by where they are.
+    let corner = cube(9.85, 9.85, 2);
+    assert!(!a.crosses_except(&corner, 0.01, |_, _, _| true));
+    assert!(!a.crosses_except(&corner, 0.01, |p, _, _| p.x > 9.8 && p.y > 9.8));
+    assert!(a.crosses_except(&corner, 0.01, |p, _, _| p.x < 9.8));
+    // And by the faces that cross: `a`'s side at x = 10 through the corner's at y = 9.85, and
+    // `a`'s at y = 10 through the corner's at x = 9.85.
+    assert!(!a.crosses_except(&corner, 0.01, |_, f, g| matches!((f, g), (1, 2) | (3, 0))));
+    assert!(a.crosses_except(&corner, 0.01, |_, f, g| (f, g) == (1, 2)));
+    assert!(a.crosses_except(&corner, 0.01, |_, f, g| (f, g) == (3, 0)));
 }
 
 /// A closed box mesh `[x0, x0+a] x [y0, y0+b] x [z0, z0+c]`, outward-facing.
@@ -717,4 +767,19 @@ mod blend {
         let d = flat.derivatives(0.0, 1).unwrap();
         assert_eq!(d[0], Vec2::ZERO);
     }
+}
+
+#[test]
+fn a_box_from_points_holds_them_and_grows() {
+    let b: Aabb3 = [Vec3::new(1.0, 2.0, 3.0), Vec3::new(-1.0, 0.0, 5.0), Vec3::new(f64::INFINITY, 0.0, 0.0)].into_iter().collect();
+    assert_eq!((b.min, b.max), (Vec3::new(-1.0, 0.0, 3.0), Vec3::new(1.0, 2.0, 5.0)), "the infinite point is skipped");
+    assert!(b.contains(Vec3::new(0.0, 1.0, 4.0)) && !b.contains(Vec3::new(0.0, 1.0, 6.0)));
+    assert!(!b.contains(Vec3::new(f64::NAN, 1.0, 4.0)));
+    assert!(b.inflated(1.0).contains(Vec3::new(0.0, 1.0, 6.0)));
+    assert!(Aabb3::EMPTY.inflated(1e9).is_empty() && !Aabb3::EMPTY.contains(Vec3::ZERO));
+    let far = Aabb3 { min: Vec3::new(2.0, 0.0, 3.0), max: Vec3::new(3.0, 1.0, 4.0) };
+    assert!(!b.meets(&far) && b.inflated(1.0).meets(&far) && !b.meets(&Aabb3::EMPTY));
+    let both = b.intersection(&b.inflated(1.0).intersection(&Aabb3 { min: Vec3::new(0.0, 1.0, 4.0), max: Vec3::new(9.0, 9.0, 9.0) }));
+    assert_eq!((both.min, both.max), (Vec3::new(0.0, 1.0, 4.0), Vec3::new(1.0, 2.0, 5.0)));
+    assert!(b.intersection(&far).is_empty());
 }

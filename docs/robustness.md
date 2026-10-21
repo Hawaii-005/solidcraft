@@ -63,6 +63,33 @@ ROBUSTNESS_GOLDENS_BLESS="why it changed" cargo test --profile ci -p solidcraft-
 
 The changed seeds and the reason are added to the file's `notes`; say why in the pull request too.
 
+The generator feeds the current geometry's bounds and face/edge picks back into later
+commands. The same RNG seed can therefore generate different command coordinates or picks
+on different math libraries. The original inputs are retained, including near-contact cases.
+Platform snapshots track repeatability; they do not certify cross-platform geometric
+equivalence or resolve the numerical differences tracked in #924.
+
+### Independent measurement checks
+
+The seeded snapshots also have checks against geometric references. Seed 34 starts with a
+quarter cylinder of radius 15 and height 12.5 (`x,y >= 0`, `-12.5 <= z <= 0`), cuts it with a
+radius-2.5 sphere centred at (10, 12.5, 0), then drills an independent radius-2, depth-5 blind
+hole from (0, 7.5, -6.25) along +X, with a 118-degree tip.
+Subtracting the sphere/cylinder intersection and the drill gives **2134.404133 mm³** and
+**1086.316691 mm²**. The drill has tip height `2 / tan(59 degrees)`; the spherical bite is
+integrated over the intersection of the radius-15 disk and the sphere's projected radius-2.5
+disk. Integrating the lower spherical hemisphere and the removed cylinder-wall patch gives
+the surface reference. The test compares the chordal measurement with these independent
+references at 5e-5 relative error.
+
+A fixed command replay recorded from seed 67 checks two disconnected shells kept in one
+body after a cut (#2247), with a combined analytic surface inventory of 22 planar, six
+cylindrical and one conical face after merging redundant subdivisions. The commands are
+fixed because the generator chooses later operations from the current body and edge layout;
+changes to body grouping can therefore change the generated design. This preserves the
+original geometric reference independently of those choices. These checks supplement the
+snapshots' stricter repeatability comparisons of raw topology and tessellated measurements.
+
 ## Successful Boolean retries
 
 When an accepted Boolean result needs a retry that can make it differ from the
@@ -72,6 +99,11 @@ tolerances and leaves the exact result, so it is recorded but not warned about.
 `timeline.inspect` and `doc.inspect` expose every retry in the feature's
 `boolean_diagnostics`, including the strategy and the applied translation,
 rotation, face offset and tessellation tolerance in millimetres/radians.
+Candidates those retries discarded before measuring them are listed in its
+`rejected`, with the reason: a candidate with an edge further outside the
+operands than 5% of their size cannot be their union, cut or intersection,
+and meshing one (a trim loop running metres along a cone's continuation)
+could take minutes or never finish (#3020).
 
 A common shift of both operands is reversed on the result. Coincident-face
 separation and bore offsets describe temporary working geometry; they are not

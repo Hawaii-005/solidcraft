@@ -15,6 +15,15 @@ Before choosing a task, check the [command inventory](docs/features.md) and
 
 Questions, ideas or want to say what you're working on? Join the [Discord](https://discord.gg/FtU4NQNVDH).
 
+## Kernel work is paused
+
+We're evaluating a new geometry kernel. Until that's decided, please don't open issues, pull
+requests or discussions about kernel work: booleans, fillets, chamfers, shell, offsets, sweeps and
+lofts, threads and holes, STEP/IGES import and export, tessellation, or anything else that changes
+`crates/kernel/`. The pinned issue on the tracker explains it. New ones get the `kernel-paused`
+label (`.github/workflows/kernel-paused.yml`) and a maintainer answers them. Crashes and data loss
+are still taken as issues, and everything outside the kernel carries on as normal.
+
 ## Get it running (about 10 minutes on a fast machine)
 
 You need stable Rust 1.95 or newer (required by egui/eframe 0.36). For the web
@@ -72,7 +81,7 @@ desktop integration and how to distinguish an old executable on `PATH`.
 
 ## How the code is laid out
 
-The [README](README.md#architecture) has the layer table. The short version:
+The [architecture page](docs/architecture.md) has the layer table. The short version:
 
 - `crates/geom`: vectors, planes, meshes, measures.
 - `crates/sketch`: our own constraint solver, plus profile finding.
@@ -183,10 +192,12 @@ depend on wall-clock timing.
 **Ready pull requests test what they touch.** CI maps changed files to workspace packages and
 runs Clippy, the test build and tests for those and their dependents. The
 [package selector](scripts/ci/affected.py) and [CI workflow](.github/workflows/ci.yml) define
-which changes require native checks; documentation, packaging and bot-script-only PRs can run
-repository checks only. Workspace-wide changes, merge-queue groups, nightly runs and Run
-workflow select the full workspace. A push to `main` reuses a successful merge-queue run for
-the same commit; otherwise it runs the full suite.
+which changes require native checks; documentation, packaging, other-workflow and bot-script-only
+changes run the repository checks only, on pull requests and on `main`. Workspace-wide changes,
+merge-queue groups, nightly runs and Run workflow select the full workspace. A push to `main`
+reuses a successful merge-queue run for the same commit, and runs only the repository checks
+when no code changed since the last push to `main` that passed; otherwise it runs the full
+suite. Doc tests, reference tests and the Windows jobs run on `main` and nightly only.
 
 **CI shards the tests.** One job builds them into a cargo-nextest archive; two shards run on
 pull requests and four during full validation. Every test runs in its own process: don't rely
@@ -197,7 +208,7 @@ Check that validation after merging. They are listed in
 `.config/nextest.toml` and the [testing page](docs/book/src/dev/testing.md):
 
 - `solidcraft-engine`: `tests::hostile_params_never_panic`, everything in `tests::robustness` and
-  the seeds of `tests::robustness_goldens` (`seed_00` … `seed_95`; pull requests matching the workflow's geometry paths run all but the slowest, `SLOW_SEEDS` in `ci.yml`),
+  the seeds of `tests::robustness_goldens` (`seed_00` … `seed_95`; pull requests that change the kernel, truck or the goldens run all but the slowest, `SLOW_SEEDS` in `ci.yml`),
   `pattern_suppress_tests::enclosure_arc_extinction_keeps_a_real_sharp_inner_lip_after_resize_and_reopen`,
   `pattern_suppress_tests::enclosure_datums_follow_wall_height_and_board_depth_with_material_proofs`,
   `cmd::plastic::tests::enclosure_snap_fit_follows_resized_front_wall`, the `atomic_commands` contract tests
@@ -287,8 +298,9 @@ and a fresh CI run:
    clippy (`-D warnings`), then the tests with the wasm build check alongside. A PR has to pass it.
    Heavy CI runs after review: a pull request gets the formatting and repository checks and a
    quick compile (`cargo check`) when you push. Once a maintainer has reviewed it they add the
-   `approved-for-ci` label, which runs the full CI (build, tests, goldens, Clippy); every push
-   after that runs the full set again.
+   `approved-for-ci` label when the PR is ready to merge, which runs the full CI (build, tests,
+   goldens, Clippy); every push after that runs the full set again. Maintainers merge approved
+   PRs in groups by area, so PRs that touch the same code meet a conflict at most once.
 4. Reference the issue (`Fixes #12`). In the PR, say what you tested and how. For geometry work, include the measured numbers (and
    the expected ones).
 
@@ -313,12 +325,15 @@ Changes with no useful observable behavior do not need screenshot or video evide
 small example without private designs or sensitive details; attach the media or link to an
 accessible recording rather than committing generated review artifacts.
 
-Keep checking upstream commits and the relevant PR's merge status throughout the work and
-before handoff. Integrate upstream merges, resolve conflicts without losing others' changes,
-and validate the integrated result. Before pushing, run `git pull --rebase origin main`, re-run
-CI if it brought changes, and push without force. Report the upstream/PR state you checked,
-any conflicts resolved and validation results. While a task remains active, follow an open
-PR through its status changes; at handoff, clearly identify anything still awaiting merge.
+Keep an eye on your PR's status, but don't push to it only to catch up with `main` (no merge of
+`main`, no Update branch button, no rebase for that alone): every push restarts the whole CI
+run for everyone waiting behind it, and `main`'s own run catches what lands in between. When you
+push a change anyway, or GitHub reports a conflict, rebase onto the latest `main` (push your
+branch with `--force-with-lease`) or merge `main` in once, and resolve conflicts without losing
+others' changes. Don't re-run CI on an unchanged commit either: a real failure fails again.
+Re-run only a job that runner trouble cancelled, with "Re-run failed jobs". While a task remains
+active, follow an open PR through its status changes; at handoff, clearly identify anything
+still awaiting merge.
 
 Much of SolidCraft so far was written by AI coding agents (Claude) working in parallel, each
 owning one area, with a human setting direction and reporting bugs. Their working notes are in
@@ -380,4 +395,4 @@ unchanged. The initial switch to sorted rows is a one-time larger diff.
 ## Licence
 
 By contributing you agree that your contribution is licensed as MIT OR Apache-2.0, like the rest
-of SolidCraft. SolidCraft isn't affiliated with Autodesk. Fusion is a trademark of Autodesk, Inc.
+of SolidCraft. SolidCraft isn't affiliated with any CAD vendor; product names are trademarks of their owners (see NOTICE).

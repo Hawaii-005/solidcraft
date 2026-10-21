@@ -330,8 +330,13 @@ fn lex_spans(s: &str) -> Result<Vec<(Tok, usize, usize)>, DocError> {
     while let Some(&(_, c)) = cs.get(i) {
         if c.is_whitespace() {
             i += 1;
-        } else if c.is_ascii_digit() || c == '.' {
+        } else if c.is_ascii_digit() || c == '.' || leading_decimal_comma(&cs, i, depth, out.last()) {
             let st = i;
+            // A leading decimal comma (`,5` for 0,5, #2966) starts the number as `.5` would.
+            let leading_comma = c == ',';
+            if leading_comma {
+                i += 1;
+            }
             while cs.get(i).is_some_and(|(_, c)| c.is_ascii_digit() || *c == '.') {
                 i += 1;
             }
@@ -340,7 +345,7 @@ fn lex_spans(s: &str) -> Result<Vec<(Tok, usize, usize)>, DocError> {
             // them a comma separates a function's arguments: `max(1,2)`).
             let digit = |k: usize| cs.get(k).is_some_and(|(_, c)| c.is_ascii_digit());
             let has_point = cs.get(st..i).is_some_and(|ds| ds.iter().any(|(_, c)| *c == '.'));
-            if depth == 0 && !has_point && digit(i.wrapping_sub(1)) && cs.get(i).is_some_and(|(_, c)| *c == ',') && digit(i + 1) {
+            if depth == 0 && !leading_comma && !has_point && digit(i.wrapping_sub(1)) && cs.get(i).is_some_and(|(_, c)| *c == ',') && digit(i + 1) {
                 i += 1;
                 while digit(i) {
                     i += 1;
@@ -411,6 +416,22 @@ fn lex_spans(s: &str) -> Result<Vec<(Tok, usize, usize)>, DocError> {
         }
     }
     Ok(out)
+}
+
+/// Whether the comma at `i` starts a number, as a leading decimal comma (`,5` for 0,5, #2966).
+/// It must be outside parentheses (inside them a comma separates arguments, as for any decimal
+/// comma), be followed by a digit, and stand where an operand is expected: at the start or right
+/// after `+ - * / ^`. A comma after a number, name, `)` or `%` keeps its meaning (`2 ,5` and
+/// `1,5,3` stay errors).
+fn leading_decimal_comma(cs: &[(usize, char)], i: usize, depth: usize, prev: Option<&(Tok, usize, usize)>) -> bool {
+    depth == 0
+        && cs.get(i).is_some_and(|(_, c)| *c == ',')
+        && cs.get(i + 1).is_some_and(|(_, c)| c.is_ascii_digit())
+        && match prev {
+            None => true,
+            Some((Tok::Op(op), _, _)) => "+-*/^".contains(*op),
+            Some(_) => false,
+        }
 }
 
 /// The proper fraction of a mixed number whose whole part ends at `i`: spaces, digits, `/`,
@@ -897,10 +918,6 @@ pub fn eval_params(params: &[ParamDef], doc_len: f64) -> (BTreeMap<String, Value
         if cx.stack.len() > 512 {
             return Err(DocError::Expr("parameters nested too deeply".into()));
         }
-        let Some((kind, _)) = unit_info(&p.unit).or(Some((Kind::Length, 1.0))) else {
-            return Err(DocError::Expr(format!("unknown unit `{}`", p.unit)));
-        };
-        let defaults = Defaults::for_unit(&p.unit, cx.doc_len);
         cx.stack.push(name.to_string());
         let mut vals: BTreeMap<String, Value> = BTreeMap::new();
         let mut err = None;
@@ -918,17 +935,7 @@ pub fn eval_params(params: &[ParamDef], doc_len: f64) -> (BTreeMap<String, Value
         cx.stack.pop();
         let r = match err {
             Some(e) => Err(e),
-            None => {
-                eval_with_defaults(&p.expr, &|n| vals.get(n).copied().ok_or_else(|| DocError::Expr(format!("unknown parameter `{n}`"))), defaults)
-                    .and_then(|v| {
-                        let x = v.to_kind_in(kind, defaults)?;
-                        Ok(match kind {
-                            Kind::Length => Value::length(x),
-                            Kind::Angle => Value::angle(x),
-                            Kind::Unitless => Value::num(x),
-                        })
-                    })
-            }
+            None => eval_def(p, &|n| vals.get(n).copied().ok_or_else(|| DocError::Expr(format!("unknown parameter `{n}`"))), cx.doc_len),
         };
         match &r {
             Ok(v) => {
@@ -947,6 +954,19 @@ pub fn eval_params(params: &[ParamDef], doc_len: f64) -> (BTreeMap<String, Value
         let _ = visit(&p.name, &mut cx);
     }
     (cx.done, cx.errors)
+}
+
+/// One parameter's value: its expression in its unit, with the values of the parameters it
+/// refers to from `lookup`.
+pub fn eval_def(p: &ParamDef, lookup: &dyn Fn(&str) -> Result<Value, DocError>, doc_len: f64) -> Result<Value, DocError> {
+    let (kind, _) = unit_info(&p.unit).unwrap_or((Kind::Length, 1.0));
+    let defaults = Defaults::for_unit(&p.unit, doc_len);
+    let x = eval_with_defaults(&p.expr, lookup, defaults)?.to_kind_in(kind, defaults)?;
+    Ok(match kind {
+        Kind::Length => Value::length(x),
+        Kind::Angle => Value::angle(x),
+        Kind::Unitless => Value::num(x),
+    })
 }
 
 /// Dependency edges between parameters: (parameter, parameter it references).
@@ -992,9 +1012,22 @@ mod tests {
         assert_eq!(ev("max(1 mm, 3, 2)", Kind::Length).unwrap(), 3.0);
         assert_eq!(ev("(2,5)", Kind::Unitless).ok(), None, "a comma inside parentheses is not a decimal comma");
         // Not between two digits, or a second comma: still an error.
-        for bad in ["2,", ",5", "2 ,5", "2, 5", "1,5,3", "1.5,3"] {
+        for bad in ["2,", "2 ,5", "2, 5", "1,5,3", "1.5,3", ",5,3", ",5.3", "width ,5", "(1) ,5"] {
             assert!(ev(bad, Kind::Unitless).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_leading_decimal_comma_is_a_number() {
+        // #2966: `,5` is 0,5 where `.5` would be a number: at the start or after an operator.
+        assert_eq!(ev(",5", Kind::Unitless).unwrap(), 0.5);
+        assert_eq!(ev(",5 mm", Kind::Length).unwrap(), 0.5);
+        assert_eq!(ev("-,5", Kind::Unitless).unwrap(), -0.5);
+        assert_eq!(ev("2*,5", Kind::Unitless).unwrap(), 1.0);
+        assert_eq!(ev("width - ,25", Kind::Length).unwrap(), 39.75);
+        // Function arguments are still separated by commas.
+        assert_eq!(ev("max(1,5)", Kind::Unitless).unwrap(), 5.0);
+        assert_eq!(ev("max(,5; 2)", Kind::Unitless).ok(), None, "inside parentheses a comma is a separator");
     }
 
     #[test]

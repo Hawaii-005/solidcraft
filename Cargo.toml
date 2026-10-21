@@ -5,7 +5,7 @@ members = ["crates/*", "apps/*", "xtask"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.16.2"
+version = "0.18.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -36,6 +36,9 @@ proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# command parameter and result schemas
+schemars = "1.2"
+serde_path_to_error = "0.1"
 log = "0.4"
 sha2 = "0.10"
 moxcms = { version = "0.8.1", default-features = false, features = ["extended_range"] }
@@ -55,6 +58,11 @@ rayon = "1.12"
 # packages (3MF)
 zip = { version = "9", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
+# STEP text in a legacy encoding (GBK, Shift_JIS, …) instead of Part 21 escapes (#2344): detect
+# and decode it. Both MIT OR Apache-2.0 (encoding_rs adds BSD-3-Clause data); encoding_rs is
+# already in the tree through cadmpeg-codec-step.
+chardetng = "0.1"
+encoding_rs = "0.8"
 # glTF 2.0 import (MIT OR Apache-2.0): the document model and GLB container only; buffers are
 # read by crates/io itself, so no image decoding or file access comes with it.
 gltf = { version = "1.4", default-features = false, features = ["names"] }

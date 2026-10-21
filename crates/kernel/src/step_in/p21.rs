@@ -125,11 +125,35 @@ pub struct Exchange {
     pub entities: HashMap<u64, Entity>,
     /// Ids defined more than once (the first definition is kept).
     pub duplicates: Vec<u64>,
+    /// [`Exchange::vertex_extent`], worked out on first use.
+    extent: std::sync::OnceLock<f64>,
 }
 
 impl Exchange {
     pub fn get(&self, id: u64) -> Option<&Entity> {
         self.entities.get(&id)
+    }
+
+    /// The size of the model in the file's own coordinates: the diagonal of the box around every
+    /// VERTEX_POINT (0 for a file without one). Non-finite coordinates are skipped.
+    pub fn vertex_extent(&self) -> f64 {
+        *self.extent.get_or_init(|| {
+            let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for e in self.entities.values().filter(|e| e.name() == "VERTEX_POINT") {
+                let Some(p) = e.params().get(1).and_then(Param::as_ref_id).and_then(|id| self.get(id)) else { continue };
+                let Some(xyz) = p.params().get(1).and_then(Param::as_list) else { continue };
+                let c: Vec<f64> = xyz.iter().take(3).filter_map(Param::as_f64).collect();
+                if c.len() != 3 || !c.iter().all(|x| x.is_finite()) {
+                    continue;
+                }
+                for ((l, h), x) in lo.iter_mut().zip(hi.iter_mut()).zip(c) {
+                    *l = l.min(x);
+                    *h = h.max(x);
+                }
+            }
+            let d = lo.iter().zip(&hi).map(|(l, h)| (h - l).powi(2)).sum::<f64>().sqrt();
+            if d.is_finite() { d } else { 0.0 }
+        })
     }
 }
 
@@ -348,6 +372,7 @@ fn decode_string(raw: &[u8]) -> String {
                 i += 5;
                 continue;
             }
+            let mut run = false;
             for (tag, width) in [(&b"\\X2\\"[..], 4usize), (&b"\\X4\\"[..], 8)] {
                 if rest.starts_with(tag)
                     && let Some(end) = rest.windows(4).position(|w| w == b"\\X0\\")
@@ -361,20 +386,23 @@ fn decode_string(raw: &[u8]) -> String {
                         out.extend(units.iter().map(|u| char::from_u32(*u).unwrap_or('?')));
                     }
                     i += end + 4;
+                    run = true;
                     break;
                 }
             }
-            if i < raw.len() && raw.get(i) == Some(&b'\\') {
-                if rest.starts_with(b"\\S\\")
-                    && let Some(&ch) = rest.get(3)
-                {
-                    out.push(char::from_u32(ch as u32 + 128).unwrap_or('?'));
-                    i += 4;
-                    continue;
-                }
-                out.push('\\');
-                i += 1;
+            // A run may be followed straight away by the backslash of the next escape (#2344).
+            if run {
+                continue;
             }
+            if rest.starts_with(b"\\S\\")
+                && let Some(&ch) = rest.get(3)
+            {
+                out.push(char::from_u32(ch as u32 + 128).unwrap_or('?'));
+                i += 4;
+                continue;
+            }
+            out.push('\\');
+            i += 1;
             continue;
         }
         // Plain bytes: keep UTF-8 runs intact.
@@ -556,5 +584,8 @@ mod tests {
         assert_eq!(decode_string(b"\\X\\E9"), "\u{e9}");
         assert_eq!(decode_string(b"a\\X2\\00E900E8\\X0\\b"), "a\u{e9}\u{e8}b");
         assert_eq!(decode_string(b"\\"), "\\");
+        // One run per character, as `step_out` writes them (#2344).
+        assert_eq!(decode_string(b"\\X2\\5706\\X0\\\\X2\\89D2\\X0\\20"), "\u{5706}\u{89d2}20");
+        assert_eq!(decode_string(b"\\X4\\0001F600\\X0\\\\X2\\00E9\\X0\\\\S\\a"), "\u{1f600}\u{e9}\u{e1}");
     }
 }

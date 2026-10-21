@@ -226,8 +226,9 @@ fn a_name_of_a_body_without_history_is_found_by_geometry_and_says_so_once_it_mov
     run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "len"}));
     run(&mut s, "sketch.finish", json!({}));
     run(&mut s, "solid.extrude", json!({"distance": 10, "name": "Block"}));
-    // Replacing the top by a plane: an operation that reports no history.
-    run(&mut s, "solid.replace_face", json!({"faces": [[20, 15, 10]], "target": {"origin": [0, 0, 12], "normal": [0, 0, 1]}, "name": "Lift"}));
+    // Lifting it 2 mm with Align: an operation that reports no history (Replace Face, used here
+    // before, keeps it now). The top ends at z = 12 as it did.
+    run(&mut s, "solid.align", json!({"bodies": ["Body1"], "from": [0, 0, 0], "to": [0, 0, 2], "name": "Lift"}));
     let state = s.model.state();
     let body = state.bodies.first().unwrap();
     assert!((0..solidcraft_doc::naming::face_names(body).len()).all(|i| !solidcraft_doc::naming::face_name_exact(body, i)));
@@ -240,6 +241,36 @@ fn a_name_of_a_body_without_history_is_found_by_geometry_and_says_so_once_it_mov
     let w = warning(&s, "Round").unwrap_or_default();
     assert!(w.contains("found by geometry, not exact history"), "{w}");
     assert!(!solid_at(&s, [49.9, 15.0, 11.9]));
+}
+
+/// Replace Face keeps the body's history, as Offset Face does: every face of the result is named
+/// exactly, and a sketch takes an attachment on the replaced face (before, no face could: "this
+/// face can't keep an attachment") and follows it when the target moves.
+#[test]
+fn a_sketch_on_a_replaced_face_follows_it() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "top", "expression": "15 mm"}));
+    block(&mut s);
+    run(&mut s, "solid.replace_face", json!({"faces": [[20, 15, 10]], "target": {"origin": [0, 0, "top"], "normal": [0, 0, 1]}, "name": "Lift"}));
+    assert!(names(&s, "Body1").iter().all(|(_, exact)| *exact), "{:?}", names(&s, "Body1"));
+    // A side the replacement only stretched takes an attachment too.
+    run(&mut s, "sketch.create", json!({"plane": {"face": [0, 15, 5]}, "name": "Side"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": {"face": [20, 15, 15]}, "name": "OnTop"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 3}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "OnTop", "distance": 5, "operation": "join", "name": "Boss"}));
+    // The boss stands on the replaced top wherever the circle's centre lands on it.
+    let (lo, hi) = {
+        let state = s.model.state();
+        let b = state.body("Body1").unwrap().mesh().bounds();
+        (b.min.z, b.max.z)
+    };
+    assert!((lo - 0.0).abs() < 1e-6 && (hi - 20.0).abs() < 1e-6, "{lo} {hi}");
+    change(&mut s, "top", "18 mm");
+    assert_eq!(error(&s, "Boss"), None);
+    let hi = s.model.state().body("Body1").unwrap().mesh().bounds().max.z;
+    assert!((hi - 23.0).abs() < 1e-6, "the boss follows the top to z = 18: {hi}");
 }
 
 #[test]
@@ -369,4 +400,62 @@ fn a_cut_through_one_of_two_bosses_names_only_its_own_walls() {
     let blends = filleted.iter().filter(|(n, _, _)| n.starts_with("F7:blend:")).count();
     assert_eq!(blends, 4, "{filleted:?}");
     assert_eq!(named_at(&filleted, [19.98, -4.24, 19.0]), boss);
+}
+
+/// #3902: a torus with a closed, twisted square sweep cut inside it splits the sweep's walls into
+/// pieces the kernel returns in a different order on each evaluation. The pieces are numbered by
+/// where they lie, so every fresh evaluation gives each piece the same name.
+#[test]
+fn split_pieces_keep_their_numbers_across_evaluations() {
+    let script: Value = serde_json::from_str(include_str!("../../../examples/regressions/closed_sweep_torus_cut.json")).unwrap();
+    let mut s = Session::default();
+    s.run_script(&script).unwrap();
+    let body = s.model.state().bodies.first().map(|b| b.name.clone()).expect("a body");
+    let named = |s: &mut Session| -> Vec<(String, [i64; 3])> {
+        let mut faces: Vec<(String, [i64; 3])> = listed(s, &body).into_iter().map(|(n, _, c)| (n, c.map(|x| x.round() as i64))).collect();
+        faces.sort();
+        faces
+    };
+    let first = named(&mut s);
+    assert!(first.iter().any(|(n, _)| n.contains('#')), "no split pieces: {first:?}");
+    for run in 0..10 {
+        let mut fresh = Session::new(solidcraft_doc::Document::clone(&s.doc));
+        fresh.refresh();
+        assert_eq!(named(&mut fresh), first, "evaluation {run}");
+    }
+}
+
+/// #3902: a design saved before the pieces of a face were numbered by place opens with the
+/// numbers it was saved with, so a reference to `…#1` stays on the piece it was made on. The
+/// block cut by the second block here has its side split in two, numbered the other way round
+/// by place.
+#[test]
+fn a_design_saved_before_pieces_were_numbered_by_place_keeps_their_numbers() {
+    let script: Value = serde_json::from_str(include_str!("../../../tests/action_matrix/designs/multi-body-join-cut.json")).unwrap();
+    let mut s = Session::default();
+    s.run_script(&script).unwrap();
+    let by_place = listed(&mut s, "Block");
+    // As a build before the change saved it: its features carry no mark, and the file does not
+    // list the change among those it has.
+    let mut file: Value = serde_json::from_str(&s.doc.to_json()).unwrap();
+    for f in file["features"].as_array_mut().unwrap() {
+        f.as_object_mut().unwrap().remove("kernel_piece_order");
+    }
+    if let Some(Value::Array(pending)) = file.get_mut("format_pending") {
+        pending.retain(|c| c != "face-pieces-by-place");
+    }
+    let old = solidcraft_doc::Document::from_json(&file.to_string()).unwrap();
+    assert!(old.features.iter().all(|f| f.kernel_piece_order), "the features of an older design keep the old numbering");
+    let mut reopened = Session::new(old);
+    reopened.refresh();
+    let kept = listed(&mut reopened, "Block");
+    let at = |faces: &[(String, bool, [f64; 3])], name: &str| faces.iter().find(|(n, _, _)| n == name).map(|(_, _, c)| *c);
+    // The pieces are numbered differently by place, and the older design keeps its own numbers.
+    let (old1, new1) = (at(&kept, "F2:side#1").unwrap(), at(&by_place, "F2:side#1").unwrap());
+    assert!((0..3).any(|k| (old1[k] - new1[k]).abs() > 1.0), "{kept:?} {by_place:?}");
+    let mut legacy = solidcraft_doc::Document::clone(&s.doc);
+    legacy.features.iter_mut().for_each(|f| f.kernel_piece_order = true);
+    let mut saved_with = Session::new(legacy);
+    saved_with.refresh();
+    assert_eq!(listed(&mut saved_with, "Block"), kept);
 }

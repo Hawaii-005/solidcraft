@@ -19,7 +19,9 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("model.edges", "List Edges", model_edges).icon("inspect").noundo().params("body: name"),
     CommandSpec::new("model.faces", "List Faces", model_faces).icon("inspect").noundo().params(
         "body: name → per face: index, name (what face.delete, sheet.convert `face`, solid.shell … take in place of a point), exact, area, centroid (not always on the face), \
-         plane_normal, point (a point on the face that picks it), cylinder? ({origin, axis, radius} of a cylindrical face)",
+         plane_normal, point (a point on the face that picks it), cylinder? ({origin, axis, radius} of a cylindrical face), \
+         sheet_face? (a folded sheet's face: `sheet:<body>:<panel>:<side>`, panel base or a flange's tag F<feature>.<k>, side top | bottom | rim.<edge> | bend.inner | bend.outer; \
+         taken wherever a face name is, and it holds while sizes change and flanges come and go)",
     ),
     CommandSpec::new("model.threads", "List Threads", model_threads).icon("inspect").noundo(),
     CommandSpec::new("material.assign", "Physical Material", physical_material)
@@ -42,6 +44,13 @@ pub static COMMANDS: &[CommandSpec] = &[
         .doc_only()
         .params("→ the built-in materials, then the design's own (user: true, with their look)"),
     CommandSpec::new("engine.commands", "List Commands", commands).icon("list").noundo(),
+    CommandSpec::new("engine.describe", "Describe Command", crate::checked!("engine.describe", DESCRIBE_CONTRACT, describe))
+        .icon("list")
+        .noundo()
+        .doc_only()
+        .contract(&DESCRIBE_CONTRACT)
+        .output(crate::schema::output_schema_for::<crate::schema::inspect::DescribeResult>)
+        .params("command: a command id. Returns {id, label, params, input, output} (and param_warnings in the warn parameter-check mode): the command's parameter documentation and, once the command has a typed contract, the JSON Schemas (2020-12) of its parameters and of a successful result (null otherwise). Read-only."),
 ];
 
 pub fn measure_json(b: &solidcraft_doc::ModelBody) -> Value {
@@ -291,6 +300,10 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
     let names = solidcraft_doc::naming::face_names(b);
     let tol = (b.body.size() * 2e-3).max(1e-3);
     let spots = solidcraft_doc::naming::face_spots(b);
+    // A folded sheet's faces also have the readable names its sheet gives them, worked out in
+    // the body's own coordinates.
+    let model = s.model.state();
+    let sheet_names = model.body(&b.name).map(|own| solidcraft_doc::sheet::body_sheet_face_names(&model, own)).unwrap_or_default();
     let faces: Vec<Value> = b
         .body
         .faces(tol)?
@@ -299,6 +312,9 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
             let spot = spots.get(f.index).copied().flatten();
             let mut v = json!({"index": f.index, "name": names.get(f.index), "exact": solidcraft_doc::naming::face_name_exact(b, f.index),
                    "area": f.area, "centroid": f.centroid, "plane_normal": f.plane_normal, "point": spot.map(|x| x.point)});
+            if let (Some(Some(name)), Some(o)) = (sheet_names.get(f.index), v.as_object_mut()) {
+                o.insert("sheet_face".into(), json!(name));
+            }
             if let (Some(solidcraft_kernel::FaceSurface::Cylinder { origin, axis, radius }), Some(o)) =
                 (spot.and_then(|x| x.surface), v.as_object_mut())
             {
@@ -308,6 +324,23 @@ fn model_faces(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .collect();
     Ok(json!({"body": b.name, "faces": faces}))
+}
+
+const DESCRIBE_CONTRACT: crate::schema::TypedContract<crate::schema::inspect::DescribeParams> = crate::schema::TypedContract::new();
+
+/// A command's prose documentation and, for converted commands, its schemas.
+fn describe(_s: &mut Session, p: &Value) -> Result<Value> {
+    let id = p.get("command").and_then(Value::as_str).ok_or_else(|| crate::params::bad("engine.describe", "`command` must be a command id"))?;
+    let spec = super::find_command(id).ok_or_else(|| crate::EngineError::UnknownCommand(id.to_string()))?;
+    let reply = crate::schema::inspect::DescribeResult {
+        id: spec.id.to_string(),
+        label: spec.label.to_string(),
+        params: spec.params.to_string(),
+        input: spec.contract.map(|c| c.input_schema().to_value()),
+        output: spec.output.map(|f| f().to_value()),
+        param_warnings: Vec::new(),
+    };
+    serde_json::to_value(reply).map_err(|e| crate::EngineError::Other(e.to_string()))
 }
 
 fn commands(s: &mut Session, _p: &Value) -> Result<Value> {

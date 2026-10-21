@@ -29,7 +29,7 @@ fn near_z(c: vec4<f32>) -> f32 {
 }
 
 @group(1) @binding(2) var acc_t: texture_2d<f32>;
-@group(2) @binding(0) var ao_depth: texture_depth_2d;
+@group(2) @binding(0) var ao_depth: texture_2d<u32>;
 
 fn clipped(p: vec3<f32>) -> bool {
     return length(u.clip.xyz) > 0.5 && dot(u.clip.xyz, p) > u.clip.w;
@@ -141,11 +141,19 @@ fn solid(i: TOut, front: bool) -> vec4<f32> {
 }
 
 // A single-sample opaque depth map, independent of the window's MSAA and its UI offsets.
+// Preserve the depth's bits in R32Uint: GLSL cannot textureLoad a depth texture,
+// and float colour attachments are not available on every GL adapter.
+struct AoDepth {
+    @builtin(frag_depth) depth: f32,
+    @location(0) value: u32,
+};
+
 @fragment
-fn fs_ao_depth(i: TOut, @builtin(front_facing) front: bool) -> @builtin(frag_depth) f32 {
+fn fs_ao_depth(i: TOut, @builtin(front_facing) front: bool) -> AoDepth {
     if (clipped(i.wp) || length(i.n) < 0.5) { discard; }
-    if (!front && length(u.clip.xyz) > 0.5) { return cap_depth(i.wp, i.pos.z); }
-    return i.pos.z;
+    var depth = i.pos.z;
+    if (!front && length(u.clip.xyz) > 0.5) { depth = cap_depth(i.wp, i.pos.z); }
+    return AoDepth(depth, bitcast<u32>(depth));
 }
 
 // Deterministic cosine-weighted hemisphere samples. Projecting the sample and a point one
@@ -180,7 +188,7 @@ fn occlusion(i: TOut) -> f32 {
         let ndc = q.xyz / q.w;
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
         if (any(uv < vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || ndc.z < 0.0 || ndc.z > 1.0) { continue; }
-        let d0 = textureLoad(ao_depth, vec2<i32>(uv * vec2<f32>(size)), 0);
+        let d0 = bitcast<f32>(textureLoad(ao_depth, vec2<i32>(uv * vec2<f32>(size)), 0).x);
         let zs = select(ndc.z, 1.0 - ndc.z, flip);
         let zn = select(near.z / near.w, 1.0 - near.z / near.w, flip);
         let d = select(d0, 1.0 - d0, flip);
@@ -347,10 +355,14 @@ fn vs_line(@builtin(vertex_index) vi: u32, @location(0) a: vec3<f32>, @location(
     let t = ts[vi];
     let s = ss[vi];
     let base = select(ca, cb, t > 0.5);
-    let off = nrm * s * w * 0.5 + dir * (t * 2.0 - 1.0) * w * 0.5;
+    // A line thinner than a pixel is drawn a pixel wide, faded by the width it lacks: a narrower
+    // quad covers no pixel centre when it falls between two rows, so without multisampling thin
+    // lines (the grid's) came and went as the view zoomed (#2823).
+    let wd = max(w, 1.0);
+    let off = nrm * s * wd * 0.5 + dir * (t * 2.0 - 1.0) * wd * 0.5;
     var o: LOut;
     o.pos = vec4<f32>(base.xy + off / half * base.w, base.z, base.w);
-    o.c = c;
+    o.c = vec4<f32>(c.rgb, c.a * (w / wd));
     o.wp = select(pa, pb, t > 0.5);
     return o;
 }

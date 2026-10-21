@@ -86,9 +86,10 @@ geometry, used for measurements, or used to seed evaluated model state. The orig
 design remains intact until the complete rebuilt session is ready. Cancellation or
 any change of active document/revision discards both preview and completion.
 
-Normal design reading, CLI and browser opening still rebuild authoritatively.
-Native B-rep caches can supply provisional display as described below; they never
-supply evaluated session state. The saved picture is not an interactive viewport.
+Desktop Open takes the evaluation from the model cache when the file keeps one for
+this document and build (see below); otherwise it evaluates the timeline, as
+design reading in the CLI and browser does. The saved picture is not an
+interactive viewport.
 
 ## Seekable reader (phase 2, first increment)
 
@@ -110,45 +111,87 @@ stored blob; deferral means not loading or decoding the complete payload, not ze
 physical reads of its byte range. Optional cache metadata is capped at 16 MiB;
 larger metadata misses the cache and uses the normal authoritative part-size budget.
 
-## Native evaluated cache
+## Model cache
 
-Engine Save/Save As can include `cache/key.json` and `cache/brep.bin` when
-explicitly requested with `cache: true` and geometry is warm. The default is
-`cache: false`, including browser downloads, to avoid extra save time and file size.
-JSON and recovery/autosave
-remain independent of the native cache. Saving never forces cold placement,
-evaluation or tessellation. Active sketches, uncaptured moves, errors, mesh bodies,
-unsupported adapter representations and exceeded budgets omit the cache.
+Engine Save/Save As write the evaluated model with the design by default
+(`cache: true`; `cache: false` leaves it out): `cache/model.json` and
+`cache/bodies.bin`. Plain JSON, recovery/autosave and browser downloads do not
+carry it. Saving never forces placement, evaluation or tessellation: the model is
+the session's own evaluation, and only when it is the evaluation of the document
+being saved (`Model::is_current`). An active sketch, uncaptured moves, feature
+errors, mesh bodies or exceeded budgets leave the cache out; the design saves as
+before.
 
-The manifest records `solidcraft-brep-cache/1`, the package version, the explicit
-producer revision `solidcraft-truck-adapter/2`, exact document/payload SHA-256 hashes
-and contiguous named body slices. The producer revision is deliberately maintained
-when adapter semantics change; it is not a source-tree fingerprint or build script.
-The binary data uses [SolidCraft's portable B-rep schema and codec](native-brep.md),
-including topology, curves/surfaces, face-source certificates, appearances and
-operation history. Truck's serialized structures are never stored. A different
-kernel can implement the same schema; until its adapter is tested it conservatively
-misses this producer's cache and rebuilds the authoritative document.
+The model is the whole evaluation: every feature's result (warning, boolean
+diagnostics, whether it was skipped, its fingerprint) and the state after it
+(bodies, solved sketches, construction geometry, sheet metal bodies, threads and
+the blend records later features read). States share what they share: a body that
+later features pass through unchanged, its face names and a solved sketch are each
+recorded once. Face names are kept as worked out (saving works out any not asked
+for yet), so a body taken from the file is named exactly as when it was saved.
+A design whose stored names predate format 14 (marked `?`) finds them through
+names worked out from geometry on demand, which the cache does not keep: it saves
+without a model.
 
-Native caches cap 4,096 bodies, 100,000 total faces, a 1 MiB manifest and 64 MiB
-binary payload. Individual bodies have the schema/codec's additional limits.
-The reader validates metadata, manifest, slices and bodies before requesting a
-bounded provisional mesh. Original STEP/image/mesh blobs are resolved afterwards.
-No redundant display mesh is stored by default: `preview: true` remains a separate
-opt-in for already warm display meshes, which take precedence when present.
+Both entries are Deflate-compressed (level one) under either compression policy: the
+encoded bodies shrink about fourfold (an imported assembly) to tenfold (modelled parts),
+for a few tens of milliseconds.
 
-Every failure in the optional cache is a miss. Even a checksum-valid forged body
-never becomes editable state: Open builds a fresh session from the document and
-original blobs, then replaces the provisional picture. Picking, measurements,
-persistent names and subsequent modelling use that rebuilt session. Existing
-cancellation/document-revision guards also apply. The web build retains synchronous
-authoritative rebuilding; portability does not imply background web evaluation.
+`cache/bodies.bin` holds every distinct body once, in
+[SolidCraft's native B-rep encoding](native-brep.md), as contiguous slices. The
+encoding is exact: a decoded body is the body that was saved, number for number
+(procedural intersection curves, placed revolutions and planes are stored as the
+kernel holds them, never refitted). Identical bodies share one slice (keyed by the
+SHA-256 of their encoding), and a placed copy of a repeated part (an instance from
+a STEP assembly) records the part and its matrix, so it shows that part's display
+again instead of being meshed on its own.
 
-A counting-reader regression uses a 2.6 MB stored source blob and obtains the saved
-preview with fewer than 256 KiB read, then verifies the authoritative document is
-identical after resolving its source. Corrupt-source and preview-miss regressions,
-and truncation/seeded mutations through the combined reader, protect the boundary.
-This is an IO-volume test, not a geometry or first-frame benchmark.
+`cache/model.json` records `solidcraft-model-cache/2`, the producer revision
+`solidcraft-truck-adapter/3`, the application version, the build (source commit,
+CPU architecture and OS), the SHA-256 of the exact `document.json` (whose blob
+references pin every STEP, mesh and image payload) and of `cache/bodies.bin`, the
+slices, each kernel body's slice and display share, and the model's records. A
+cache is read back only when every one of these matches: the same source compiled
+for the same platform computes the same numbers, so another build's cache is a
+miss. A build of unknown source (a tarball without git) never reads a cache.
+
+The fixed budgets of earlier caches (4,096 bodies, 100,000 faces, 64 MiB) scale
+with the design now: up to 200,000 body records, 100,000 distinct bodies, a 32 MiB
+manifest and a payload within the container's part budget (256 MiB), leaving room
+for the document. Individual bodies keep the codec's own limits. The archive-wide
+budgets (256 MiB per part, 512 MiB expanded, 10,000 entries) are unchanged, and the
+cache is left out when it would push the container near them. Decoding runs under
+`kernel::guard` and is linear in the payload's bytes.
+
+### Opening from the model
+
+Open takes the model as the design's evaluation (`Model::adopt`) when the key
+matches and every feature's fingerprint (its definition, the parameters and
+imported files it reads, the features before it, the timeline marker) is the one
+the opened document gives it now. Nothing is evaluated: the imported STEP text is
+resolved and hashed, never parsed. Every feature is up to date, so an edit
+evaluates from the first feature it changes, as after any evaluation: a feature
+appended or edited at the end evaluates from the saved final state, an edit to
+feature k from the saved state before k. Moving the timeline marker, undo and redo
+reuse the saved results whose fingerprints come back. `SOLIDCRAFT_NO_MODEL_CACHE`
+set evaluates anyway. Any failure (a key or fingerprint mismatch, a malformed
+record, a body that does not decode) is a miss: the design is evaluated from its
+timeline as before, and only that.
+
+This replaces the earlier rule that a cache never supplies evaluated session
+state. It is safe because the cache is the result of evaluating exactly this
+document with exactly this build: the hashes tie it to the document (and through
+it to every source blob) and to its own payload, the build key to the code that
+computed it, the fingerprints to every feature's inputs, and the exact encoding
+gives back the bodies number for number. Hashes are not trust: a crafted file can
+carry a cache whose geometry disagrees with its timeline, as a crafted STEP file
+can carry any geometry. Every decoded body passes the same structural and resource
+checks, under `kernel::guard`, and Compute All (`timeline.compute_all`) evaluates
+the whole timeline again.
+
+Before the session is ready the cache still supplies the picture (a bounded mesh
+of the placed bodies) shown while opening. Earlier `cache/key.json` and
+`cache/brep.bin` entries are ignored.
 
 ## Review increments and kernel independence
 
@@ -188,7 +231,7 @@ run standalone wasm validation on each published code revision.
 
 ## Portable thumbnail
 
-A warm save with `cache: true` may add `cache/thumbnail.png` and its small
+A warm save (with `cache`, the default) may add `cache/thumbnail.png` and its small
 `cache/thumbnail.json` key. The picture is a 240 x 150 PNG, bounded to 256 KiB,
 keyed by `solidcraft-thumbnail/1`, application version, exact document SHA-256 and
 PNG SHA-256. It contains an isometric view of visible solid bodies with their
@@ -200,9 +243,8 @@ work at four million supersampled pixels and face-color lookups at one million,
 so overlapping triangles cannot make a small picture arbitrarily expensive.
 It never evaluates or tessellates a cold
 model for a picture. Active edits, pending moves, model errors, absent warm
-geometry or exceeded limits omit the picture. Ordinary saves and browser downloads
-default to `cache: false` and omit the PNG; `cache: true` explicitly opts in. Plain JSON
-never contains the PNG. The same writer is used by desktop and browser saves.
+geometry or exceeded limits omit the picture, as does `cache: false`. Browser
+downloads omit the PNG. Plain JSON never contains the PNG. The same writer is used by desktop and browser saves.
 
 The seekable thumbnail reader checks the small key, retained document metadata,
 PNG size/header and hashes without resolving source blobs. The Home/Recent Files

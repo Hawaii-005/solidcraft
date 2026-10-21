@@ -138,7 +138,7 @@ fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKin
         return None;
     }
     let mut trial = sk.clone();
-    let rep = solidcraft_sketch::solve(&mut trial);
+    let rep = solidcraft_sketch::solve_with(&mut trial, &solidcraft_sketch::Hold::default(), None, solidcraft_sketch::Analysis::Freedom, None);
     if rep.ok() && rep.dof < dof {
         *sk = trial;
         return Some(rep.dof);
@@ -150,13 +150,12 @@ fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKin
     None
 }
 
-fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datum: usize) -> (Vec<String>, usize) {
+fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datum: usize, mut dof: usize) -> (Vec<String>, usize) {
     use ConstraintKind::*;
     let tol = num(p, "tolerance").filter(|t| *t > 0.0).unwrap_or(0.01);
     let atol = num(p, "angle_tolerance").filter(|t| *t > 0.0).unwrap_or(1.0).to_radians();
     let dims = crate::params::bool_(p, "dimensions").unwrap_or(true);
     let n0 = sk.constraints.len();
-    let mut dof = dof_now(sk);
     let mut trials = 0;
     let mut attempt = |sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKind, dim: bool, dof: &mut usize| {
         if *dof == 0 || trials >= MAX_TRIALS {
@@ -258,7 +257,9 @@ fn auto(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         if !rep.keeps_orientation() {
             return Err(bad(cmd, rep.failure(|f| format!("the sketch constraints conflict ({f})"))));
         }
-        Ok(run_auto(sk, doc, p, datum))
+        // This is the exact state just solved for the current parameter values. Trials update
+        // its freedom whenever they change constraints; no separate initial solve is needed.
+        Ok(run_auto(sk, doc, p, datum, rep.dof))
     })?;
     Ok(json!({"added": added, "dof": dof, "sketch": info}))
 }
@@ -448,6 +449,7 @@ fn anchor(sk: &Sketch, k: &ConstraintKind) -> Option<Vec2> {
         }
         Distance { p, q, .. } | DistanceX { p, q, .. } | DistanceY { p, q, .. } => Some((pt(p)? + pt(q)?) * 0.5),
         PointLineDistance { p, .. } | LinearDiameter { p, .. } => pt(p),
+        LineCircleDistance { c, .. } => sk.center(c),
         Length { l, .. } | LineAngle { l, .. } => mid(l),
         Radius { c, .. } | Diameter { c, .. } | ArcLength { c, .. } | ArcSweep { c, .. } => mid(c),
         SlotOverallLength { a, b, .. } => Some((sk.center(a)? + sk.center(b)?) * 0.5),

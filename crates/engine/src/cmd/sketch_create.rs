@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 use solidcraft_geom::Vec2;
-use solidcraft_sketch::{ConstraintKind, CurveKind, LinkKind, LinkSource, Sketch, TextAlign, TextExprs, TextStyle};
+use solidcraft_sketch::{ConstraintKind, CurveKind, LinkKind, LinkSource, Shape, Sketch, TextAlign, TextExprs, TextStyle};
 
 /// The style parameters of `sketch.text` and `sketch.edit_text`.
 macro_rules! text_style_doc {
@@ -112,7 +112,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(concat!(
             "link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg (numbers or expressions as in sketch.text; a number replaces an expression, and so does moving the text), font?: family or file path (empty: the built-in font), ",
             text_style_doc!(),
-            " (each kept when left out); live?: bool: one frame of an interactive change (the sketch is solved, the features after it stay as they were until `sketch.drag_end`)",
+            " (each kept when left out); or edits: [{link or entity, text?, at?, …}]: several texts changed together, the design rebuilt once \
+             (all or nothing; returns edits: each one's result); live?: bool: one frame of an interactive change (the sketch is solved, the features after it stay as they were until `sketch.drag_end`)",
             created_doc!()
         )),
 ];
@@ -165,7 +166,7 @@ const AT_MUST: &str = "`at` must be the baseline start [x, y], each a number or 
 /// it names a parameter, so that the text follows it; one that names none is the number it comes
 /// to. Returns the value (mm or radians) and the expression kept. Anything else is refused with
 /// `must`.
-fn text_number(doc: &solidcraft_doc::Document, v: &Value, cmd: &str, key: &str, must: &str, angle: bool) -> Result<(f64, Option<String>)> {
+pub(super) fn text_number(doc: &solidcraft_doc::Document, v: &Value, cmd: &str, key: &str, must: &str, angle: bool) -> Result<(f64, Option<String>)> {
     use solidcraft_doc::expr::{self, Kind};
     let kind = if angle { Kind::Angle } else { Kind::Length };
     match v {
@@ -344,6 +345,9 @@ pub(super) fn move_text(sk: &mut Sketch, link: &str, translate: Vec2, rotation: 
     Ok(sk.link_curves(&link))
 }
 
+/// The most texts one `sketch.edit_text {edits}` changes.
+const MAX_TEXT_EDITS: usize = 1000;
+
 fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.edit_text";
     let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;
@@ -352,7 +356,7 @@ fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
     // The numbers its expressions give now (a parameter may have changed since the sketch was
     // last stored); one that cannot be evaluated is left as it was, to be replaced by this edit.
     let _ = doc.apply_text_values(&doc.param_values().0, &mut sk);
-    let out = apply_text_edit(&mut sk, &doc, p)?;
+    let out = apply_text_edits(&mut sk, &doc, p)?;
     *doc.sketch_mut(id)? = sk;
     *s.doc_mut() = doc;
     Ok(out)
@@ -363,8 +367,27 @@ fn edit_text(s: &mut Session, p: &Value) -> Result<Value> {
 fn edit_text_live(s: &mut Session, p: &Value) -> Result<(Value, Option<crate::LiveEdit>)> {
     let cmd = "sketch.edit_text";
     let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;
-    let (out, report) = super::sketch::edit_solved(s, id, false, |sk, doc| Ok((apply_text_edit(sk, doc, p)?, super::sketch::Left::Unsolved)))?;
+    let (out, report) = super::sketch::edit_solved(s, id, false, solidcraft_sketch::Analysis::Full, |sk, doc| {
+        Ok((apply_text_edits(sk, doc, p)?, super::sketch::Left::Unsolved))
+    })?;
     Ok((out, report.map(|report| crate::LiveEdit { sketch: id, report })))
+}
+
+/// `sketch.edit_text`'s change: one text's (`link` or `entity`), or each of `edits` in turn.
+/// One command, so the features after the sketch are rebuilt once for all of them.
+fn apply_text_edits(sk: &mut Sketch, doc: &solidcraft_doc::Document, p: &Value) -> Result<Value> {
+    let cmd = "sketch.edit_text";
+    match p.get("edits") {
+        None | Some(Value::Null) => apply_text_edit(sk, doc, p),
+        Some(Value::Array(edits)) => {
+            if edits.is_empty() || edits.len() > MAX_TEXT_EDITS {
+                return Err(bad(cmd, format!("`edits` must hold 1 to {MAX_TEXT_EDITS} edits")));
+            }
+            let outs = edits.iter().map(|e| apply_text_edit(sk, doc, e)).collect::<Result<Vec<_>>>()?;
+            Ok(json!({"edits": outs}))
+        }
+        Some(_) => Err(bad(cmd, "`edits` must be a list of edits")),
+    }
 }
 
 /// `sketch.edit_text`'s change to its sketch: the text source's new values and its outlines
@@ -464,9 +487,9 @@ fn joint_derivatives(sk: &Sketch, ci: usize, pi: usize, order: usize, leaving: b
 fn blend(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.blend_curve";
     let order = blend_order(p, cmd)?;
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
-        let pa = req_parg(sk, p, "a", cmd)?.idx().ok_or_else(|| bad(cmd, "`a` must be the end point of a curve"))?;
-        let pb = req_parg(sk, p, "b", cmd)?.idx().ok_or_else(|| bad(cmd, "`b` must be the end point of a curve"))?;
+    let (out, info) = edit(s, p, cmd, false, |sk, doc| {
+        let pa = req_parg(sk, doc, p, "a", cmd)?.idx().ok_or_else(|| bad(cmd, "`a` must be the end point of a curve"))?;
+        let pb = req_parg(sk, doc, p, "b", cmd)?.idx().ok_or_else(|| bad(cmd, "`b` must be the end point of a curve"))?;
         let (ca, ta) = end_of(sk, pa).ok_or_else(|| bad(cmd, "no curve ends at `a`"))?;
         let (cb, tb) = end_of(sk, pb).ok_or_else(|| bad(cmd, "no curve ends at `b`"))?;
         let (qa, qb) = (sk.point(pa).unwrap_or_default(), sk.point(pb).unwrap_or_default());
@@ -590,14 +613,14 @@ fn ellipse(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(result(out, info))
 }
 
-fn point_list(sk: &mut Sketch, p: &Value, cmd: &str) -> Result<Vec<usize>> {
+fn point_list(sk: &mut Sketch, doc: &solidcraft_doc::Document, p: &Value, cmd: &str) -> Result<Vec<usize>> {
     let list = p.get("points").and_then(Value::as_array).ok_or_else(|| bad(cmd, "`points` must be a list"))?;
     if list.len() < 2 || list.len() > solidcraft_sketch::MAX_SPLINE_POINTS {
         return Err(bad(cmd, "a spline needs 2 to 500 points"));
     }
     let mut out = Vec::new();
     for v in list {
-        let a = super::sketch::parg(sk, v, cmd)?;
+        let a = super::sketch::parg(sk, doc, v, cmd)?;
         let i = match a.idx() {
             Some(i) => i,
             None => sk.add_point(a.pos(), None)?,
@@ -620,8 +643,8 @@ fn spline(s: &mut Session, p: &Value, cmd: &str, control: bool, degree: u8) -> R
         return Err(bad(cmd, "periodic mode requires a cubic fit spline"));
     }
     let p = &super::sketch_project::snap_points(s, p, cmd)?;
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
-        let mut pts = point_list(sk, p, cmd)?;
+    let (out, info) = edit(s, p, cmd, false, |sk, doc| {
+        let mut pts = point_list(sk, doc, p, cmd)?;
         if periodic
             && sk.point(*pts.first().ok_or_else(|| bad(cmd, "missing first point"))?)
                 != sk.point(*pts.last().ok_or_else(|| bad(cmd, "missing last point"))?)
@@ -652,10 +675,10 @@ fn conic(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`rho` must be between 0 and 1"));
     }
     let p = &super::sketch_project::snap_points(s, p, cmd)?;
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
+    let (out, info) = edit(s, p, cmd, false, |sk, doc| {
         let mut idx = Vec::new();
         for k in ["start", "end", "apex"] {
-            let a = req_parg(sk, p, k, cmd)?;
+            let a = req_parg(sk, doc, p, k, cmd)?;
             idx.push(match a.idx() {
                 Some(i) => i,
                 None => sk.add_point(a.pos(), None)?,
@@ -675,8 +698,8 @@ fn conic(s: &mut Session, p: &Value) -> Result<Value> {
 fn midpoint_line(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.line.midpoint";
     let end = req_vec2(cmd, p, "end")?;
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
-        let m = req_parg(sk, p, "mid", cmd)?;
+    let (out, info) = edit(s, p, cmd, false, |sk, doc| {
+        let m = req_parg(sk, doc, p, "mid", cmd)?;
         let start = m.pos() * 2.0 - end;
         if start.dist(end) < 1e-9 {
             return Err(bad(cmd, "the end must differ from the midpoint"));
@@ -744,8 +767,8 @@ fn leaving_dir(sk: &Sketch, ci: usize, pi: usize) -> Option<Vec2> {
 fn arc_tangent(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.arc.tangent";
     let end = req_vec2(cmd, p, "end")?;
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
-        let st = req_parg(sk, p, "start", cmd)?;
+    let (out, info) = edit(s, p, cmd, false, |sk, doc| {
+        let st = req_parg(sk, doc, p, "start", cmd)?;
         let picked = st.idx().ok_or_else(|| bad(cmd, "`start` must be the end point of a line or arc"))?;
         // The picked point, then any other point at the same place: a trimmed arc's end is its own
         // point, lying on the end of the curve that trimmed it, which is the one a click picks (#1485).
@@ -799,6 +822,39 @@ fn guess_radius(sk: &Sketch, curves: &[usize], at: Vec2) -> f64 {
     if r.is_finite() && r > 1e-6 { r } else { 1.0 }
 }
 
+/// Where the centre of a circle of radius `d` touching `sh` can lie: the line moved `d` to either
+/// side, or the circle grown and shrunk by `d` (arcs as their full circle).
+fn centre_paths(sh: &Shape, d: f64) -> Vec<Shape> {
+    match *sh {
+        Shape::Line { a, b } => {
+            (b - a).normalized().map(|u| [d, -d].map(|s| Shape::Line { a: a + u.perp() * s, b: b + u.perp() * s }).to_vec()).unwrap_or_default()
+        }
+        Shape::Round { c, r, .. } => [r + d, (r - d).abs()]
+            .into_iter()
+            .filter(|x| *x > 1e-12)
+            .map(|r| Shape::Round { c, r, start: 0.0, sweep: std::f64::consts::TAU })
+            .collect(),
+    }
+}
+
+/// The centre nearest `near` of a circle of radius `r` touching curves `a` and `b` (#3141): the
+/// solver starts from the answer instead of from the click, which lies on a curve, where the
+/// tangency has no side yet and the solve fails or moves the curves.
+fn tangent_centre(sk: &Sketch, a: usize, b: usize, r: f64, near: Vec2) -> Option<Vec2> {
+    let (sa, sb) = (sk.shape(a)?, sk.shape(b)?);
+    let mut best: Option<Vec2> = None;
+    for x in centre_paths(&sa, r) {
+        for y in centre_paths(&sb, r) {
+            for q in solidcraft_sketch::intersections_within(&x, &y, 1e-9 * (1.0 + r)) {
+                if q.x.is_finite() && q.y.is_finite() && best.is_none_or(|b| q.dist(near) < b.dist(near)) {
+                    best = Some(q);
+                }
+            }
+        }
+    }
+    best
+}
+
 fn tangent_curves(sk: &Sketch, p: &Value, cmd: &str, n: usize) -> Result<Vec<usize>> {
     let ids = string_list(p, "curves");
     if ids.len() != n {
@@ -819,10 +875,14 @@ fn tangent_circle(s: &mut Session, p: &Value, cmd: &str, n: usize, radius: Optio
         if !(r0 > 1e-9 && r0 < 1e8) {
             return Err(bad(cmd, "radius must be positive"));
         }
-        // Start where the circle already nearly touches: move the centre so the guessed circle
-        // sits between the curves.
+        // Start where the circle already touches when that can be worked out (two curves and a
+        // radius), so that only the new circle moves.
+        let start = match cs.as_slice() {
+            [a, b] if radius.is_some() => tangent_centre(sk, *a, *b, r0, near).unwrap_or(near),
+            _ => near,
+        };
         let first_new = sk.points.len();
-        let c = sk.add_circle(near, r0, None, None)?;
+        let c = sk.add_circle(start, r0, None, None)?;
         let mut cons = Vec::new();
         for k in &cs {
             cons.push(add_c(sk, ConstraintKind::Tangent { a: *k, b: c })?);

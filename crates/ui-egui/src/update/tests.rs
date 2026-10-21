@@ -369,12 +369,13 @@ fn the_title_bar_offers_the_new_version_and_opens_the_update_window() {
     h.frame();
     wait_for_check(&mut h);
     h.frames(2);
-    // An accent pill reading "Update to <version>", just left of Report a bug, on the bar.
+    // An accent pill reading "Update to <version>", left of the Settings/Help/Report cluster.
     let label = format!("Update to {version}");
     let at = h.widget(&label).unwrap_or_else(|| panic!("no `{label}` in the title bar"));
     let pill = crate::scenario::rect_of("titlebar:update").unwrap();
     assert!(pill.contains(egui::pos2(at[0] as f32, at[1] as f32)));
-    assert!(pill.right() <= report.left() && report.left() - pill.right() < 12.0, "beside Report a bug: {pill:?} {report:?}");
+    let assistant = crate::scenario::rect_of("titlebar:assistant").unwrap();
+    assert!(pill.right() < assistant.left() && assistant.left() - pill.right() < 12.0, "beside Assistant: {pill:?} {assistant:?}");
     assert!((pill.center().y - report.center().y).abs() < 1.0 && pill.height() <= report.height());
     assert_eq!(crate::scenario::rect_of("titlebar:report"), Some(report), "Report a bug stays where it was");
     assert!(!h.app.updater.open, "no window pops up by itself");
@@ -419,7 +420,7 @@ fn the_pill_shortens_in_a_narrow_title_bar() {
             last = p.width();
         }
         shortened |= pill.is_none_or(|p| p.width() < wide.width());
-        if width == 800.0 {
+        if width == 1000.0 {
             assert!(h.widget("Update").is_some() && h.widget(&label).is_none(), "the short label keeps room for the tabs");
         }
     }
@@ -454,19 +455,38 @@ fn release_notes_read_as_markdown() {
                 Span::Text(" Revolve and ".into()),
                 Span::Code("solidcraft-cli mcp".into()),
                 Span::Text(" continued (".into()),
-                Span::Link("#925".into()),
+                Span::Link { text: "#925".into(), url: Some("https://x/925".into()) },
                 Span::Text(").".into()),
             ]
         ))
     );
     assert_eq!(b.get(3), Some(&Block::Item(1, vec![Span::Text("nested".into())])));
-    assert_eq!(b.get(4), Some(&Block::Item(0, vec![Span::Text("Fix by @a in ".into()), Span::Link("#1064".into())])));
+    assert_eq!(
+        b.get(4),
+        Some(&Block::Item(
+            0,
+            vec![
+                Span::Text("Fix by @a in ".into()),
+                Span::Link { text: "#1064".into(), url: Some("https://github.com/bherbruck/solidcraft/pull/1064".into()) }
+            ]
+        ))
+    );
     assert_eq!(b.get(5), Some(&Block::Paragraph(vec![Span::Text("See https://example.com/x.".into())])));
     // Unclosed markers and odd input show as written, without panicking.
     for s in ["**open", "`tick", "[a](b", "[a]", "#", "- ", "é**", "https://github.com/", "**[x](y)**"] {
         let _ = parse_markdown(s);
     }
     assert_eq!(inline("**[x](y)**"), vec![Span::Strong("x".into())]);
+}
+
+/// #2943: a release note's links keep where they go, so the window can open them; only web
+/// addresses are kept (a relative or other link shows as text that opens nothing).
+#[test]
+fn release_note_links_keep_their_web_targets() {
+    let spans = inline("[guide](https://docs.solidcraft.io/guide) and [file](file:///etc/passwd) and [rel](../x)");
+    let links: Vec<(String, Option<String>)> =
+        spans.into_iter().filter_map(|s| if let Span::Link { text, url } = s { Some((text, url)) } else { None }).collect();
+    assert_eq!(links, vec![("guide".into(), Some("https://docs.solidcraft.io/guide".into())), ("file".into(), None), ("rel".into(), None)]);
 }
 
 #[test]

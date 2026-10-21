@@ -181,17 +181,38 @@ pub(crate) fn modifier_motion(
     })
 }
 
-/// View keys (#1541): the arrows turn the view 15° (with Shift a quarter turn, as the navigation
-/// cube's arrows), Ctrl+arrows pan it a tenth of the view, and Ctrl+8 looks straight at the
-/// selected face, plane or sketch. Not while a menu, the command box or a focused widget has the
-/// arrows. Returns whether the key was used.
-pub(crate) fn view_key(app: &mut SolveApp, ctx: &egui::Context, key: egui::Key, mods: egui::Modifiers) -> bool {
-    use egui::Key;
-    let menu_open = egui::Popup::is_any_open(ctx)
+/// A tap (press and release) shorter than this is one animated step; held longer, the arrow
+/// turns the view continuously.
+const TAP_SECONDS: f64 = 0.15;
+/// How fast a held arrow turns the view (Shift: twice as fast).
+const HOLD_DEGREES_PER_SECOND: f64 = 90.0;
+
+/// An arrow key turning the view that is still down (`ViewportState::key_hold`).
+#[derive(Clone, Copy)]
+pub(crate) struct KeyHold {
+    key: egui::Key,
+    action: &'static str,
+    shift: bool,
+    since: f64,
+}
+
+/// A menu, the command box or a focused widget has the keyboard, so the view keys are not ours.
+fn view_keys_blocked(app: &SolveApp, ctx: &egui::Context) -> bool {
+    egui::Popup::is_any_open(ctx)
         || app.viewport.context_menu.is_some()
         || app.ui.palette_open
         || ctx.memory(|m| m.focused().is_some())
-        || ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::new("sc_panel_open")).is_some());
+        || ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::new("sc_panel_open")).is_some())
+}
+
+/// View keys (#1541): the arrows turn the view 15° (with Shift a quarter turn, as the navigation
+/// cube's arrows), Ctrl+arrows pan it a tenth of the view, and Ctrl+8 looks straight at the
+/// selected face, plane or sketch. Held longer than a tap, an arrow keeps turning the view at a
+/// steady rate (`step_key_hold`); the operating system's key repeat does nothing. Not while a
+/// menu, the command box or a focused widget has the arrows. Returns whether the key was used.
+pub(crate) fn view_key(app: &mut SolveApp, ctx: &egui::Context, key: egui::Key, mods: egui::Modifiers, repeat: bool) -> bool {
+    use egui::Key;
+    let menu_open = view_keys_blocked(app, ctx);
     let ctrl = mods.command || mods.ctrl;
     if mods.alt || menu_open {
         return false;
@@ -200,7 +221,7 @@ pub(crate) fn view_key(app: &mut SolveApp, ctx: &egui::Context, key: egui::Key, 
         crate::viewport::look_at_selection(app);
         return true;
     }
-    let (action, dx, dy) = match key {
+    let (action, dx, dy): (&'static str, f32, f32) = match key {
         Key::ArrowLeft => ("left", -1.0, 0.0),
         Key::ArrowRight => ("right", 1.0, 0.0),
         Key::ArrowUp => ("up", 0.0, -1.0),
@@ -213,11 +234,46 @@ pub(crate) fn view_key(app: &mut SolveApp, ctx: &egui::Context, key: egui::Key, 
             let step = rect.height() * 0.1;
             camera_motion(app, rect, json!({"motion": "pan", "delta": [dx * step, dy * step]}));
         }
-    } else {
+    } else if !repeat {
         let degrees = if mods.shift { 90.0 } else { 15.0 };
-        let _ = app.run("view.navigate", json!({"camera": app.cam, "action": action, "degrees": degrees}));
+        app.viewport.key_hold = Some(KeyHold { key, action, shift: mods.shift, since: app.now });
+        // Turn from where a step in flight is going, so taps add up and the one animation is
+        // retargeted rather than a second started.
+        let from = app.cam_anim.map_or(app.cam, |a| a.to);
+        let _ = app.run("view.navigate", json!({"camera": from, "action": action, "degrees": degrees}));
     }
     true
+}
+
+/// Each frame an arrow turning the view is held past a tap: turn at a steady rate by the frame's
+/// time, with no animation of its own. Ends when the key is released or the keyboard goes
+/// elsewhere.
+pub(crate) fn step_key_hold(app: &mut SolveApp, ctx: &egui::Context) {
+    let Some(hold) = app.viewport.key_hold else { return };
+    let (down, dt) = ctx.input(|i| (i.key_down(hold.key), f64::from(i.unstable_dt)));
+    if !down || view_keys_blocked(app, ctx) {
+        app.viewport.key_hold = None;
+        return;
+    }
+    ctx.request_repaint();
+    if app.now - hold.since < TAP_SECONDS {
+        return;
+    }
+    let rate = if hold.shift { 2.0 * HOLD_DEGREES_PER_SECOND } else { HOLD_DEGREES_PER_SECOND };
+    let degrees = rate * if dt.is_finite() { dt.clamp(0.0, 0.1) } else { 0.0 };
+    if degrees <= 1e-6 {
+        return;
+    }
+    let params = json!({"camera": app.cam, "action": hold.action, "degrees": degrees});
+    if let Ok(v) = app.session.execute("view.navigate", &params)
+        && let Some(cam) = v.get("camera").and_then(|c| serde_json::from_value::<Camera>(c.clone()).ok())
+        && cam.is_valid()
+    {
+        app.cancel_view_animation();
+        app.viewport.orbit_snap = None;
+        app.viewport.orbit_free = None;
+        app.cam = cam;
+    }
 }
 
 /// Continuous camera changes use the same JSON command as programmatic callers.
@@ -276,6 +332,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
             i.pointer.delta(),
         )
     });
+    let hover = hover.filter(|p| !crate::shell::covered(app, *p));
     // The right button belongs to the marking menu while it is open.
     let secondary_down = secondary_down && app.viewport.context_menu.is_none();
     // The axis view handles its own clicks; the model underneath must not see them.
@@ -294,10 +351,9 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     } else {
         resp.contains_pointer() && ui.rect_contains_pointer(rect)
     };
-    let inside = over && hover.is_some_and(|p| rect.contains(p) && !axes.contains(p));
+    let inside = ui.is_enabled() && over && hover.is_some_and(|p| rect.contains(p) && !axes.contains(p));
     app.viewport.mouse = hover.filter(|_| inside);
-    // Ctrl or Alt held: drawing and dragging don't snap.
-    crate::drag_snap::set_suppressed(mods.ctrl || mods.alt || mods.command);
+    // Sketch snap suppression is set once in `viewport::show` from preferences.
     middle_double_click(app, ui, inside);
     // The 3D mouse's motion this frame, with what this page's camera may do.
     device(app, rect, caps);
@@ -562,7 +618,10 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     } else {
         None
     };
-    let dragging = resp.dragged() || (inside && button.is_some());
+    // An orbit started on the viewport owns its button until release, including over a
+    // floating shell card that disables the underlying egui response.
+    let captured_orbit = app.viewport.orbit_from.is_some() && button.is_some();
+    let dragging = resp.dragged() || (inside && button.is_some()) || captured_orbit;
     // Without orbit (a flat page), bindings that orbit do nothing.
     let allowed = |m: NavMode| caps.orbit || m != NavMode::Orbit;
     let motion = modifier_motion(app, ui, inside, hover, mods, picking).filter(|(m, _)| allowed(*m));
@@ -961,7 +1020,7 @@ mod tests {
             let mut app = crate::SolveApp::new(s, crate::Services::default());
             app.preferences.nav = preset.into();
             app.viewport.spin = true;
-            let ctx = egui::Context::default();
+            let ctx = crate::fonts::test_context();
             let mut time = 0.0;
             let mut frame = |app: &mut crate::SolveApp, mods: Modifiers, events: Vec<Event>| {
                 time += 1.0 / 60.0;
@@ -1026,7 +1085,7 @@ mod tests {
             let mut s = solidcraft_engine::Session::default();
             s.execute("solid.box", &serde_json::json!({"length":40,"width":30,"height":20})).unwrap();
             let mut app = crate::SolveApp::new(s, crate::Services::default());
-            let ctx = egui::Context::default();
+            let ctx = crate::fonts::test_context();
             let before = app.cam;
             app.viewport.device_motion = Some(every_axis);
             let raw = egui::RawInput {
@@ -1112,6 +1171,96 @@ mod view_key_tests {
             }
         }
         assert!(crate::keymap::RESERVED.contains(&crate::keymap::key_name(egui::Key::Num8, egui::Modifiers::COMMAND).as_str()));
+    }
+
+    fn arrow(pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key { key: egui::Key::ArrowLeft, physical_key: None, pressed, repeat, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// A press and release in one frame, without the harness settling the view after it.
+    fn tap(h: &mut Harness) {
+        h.app.synthetic.push(arrow(true, false));
+        h.app.synthetic.push(arrow(false, false));
+        h.frame();
+    }
+
+    /// The signed turn from `a` to `b`, past the wrap.
+    fn turn(a: f64, b: f64) -> f64 {
+        (b - a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+    }
+
+    fn front_view() -> Harness {
+        let mut h = Harness::new();
+        h.app.preferences.look_at_anim = true;
+        h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        h.step(&json!({"call": "ui.view", "params": {"view": "front"}})).unwrap();
+        h.settle();
+        h
+    }
+
+    /// Holding an arrow turns the view steadily, by frame time, whatever the key repeat does:
+    /// one animation at most, never a second one fighting the first.
+    #[test]
+    fn a_held_arrow_turns_the_view_steadily_and_ignores_key_repeat() {
+        let hold = |repeats: bool| {
+            let mut h = front_view();
+            let mut last = h.app.cam.yaw;
+            h.app.synthetic.push(arrow(true, false));
+            h.frame();
+            let log = h.app.session.log.len();
+            let mut deltas = Vec::new();
+            for frame in 0..60 {
+                if repeats && frame % 3 == 2 {
+                    h.app.synthetic.push(arrow(true, true));
+                }
+                h.frame();
+                deltas.push(turn(last, h.app.cam.yaw));
+                last = h.app.cam.yaw;
+            }
+            assert!(h.app.cam_anim.is_none(), "the held turn runs on key state, not on a tween");
+            assert_eq!(h.app.session.log.len(), log, "turn frames do not flood the command log");
+            assert!(deltas.iter().all(|d| *d > 0.0), "the view never stops or reverses while held: {deltas:?}");
+            let steady = &deltas[20..];
+            let per_frame = 90f64.to_radians() / 60.0;
+            assert!(steady.iter().all(|d| (d - per_frame).abs() < 1e-3), "{steady:?}");
+            let held = h.app.cam.yaw;
+            h.app.synthetic.push(arrow(false, false));
+            h.frames(5);
+            assert_eq!(h.app.cam.yaw, held, "releasing stops the turn at once");
+            h.app.cam.yaw
+        };
+        assert!((hold(false) - hold(true)).abs() < 1e-9, "OS key repeat changes nothing");
+    }
+
+    /// A tap is still one animated step of 15°, with one animation.
+    #[test]
+    fn a_tap_is_one_animated_step() {
+        let mut h = front_view();
+        let before = h.app.cam.yaw;
+        tap(&mut h);
+        h.frames(2);
+        assert!(h.app.cam_anim.is_some(), "the step animates");
+        h.settle();
+        assert!(h.app.cam_anim.is_none());
+        assert!((turn(before, h.app.cam.yaw).abs() - 15f64.to_radians()).abs() < 1e-6);
+    }
+
+    /// A tap while a step is in flight retargets that animation: the turns add up and only one
+    /// animation exists, starting where the camera is.
+    #[test]
+    fn a_tap_during_a_step_retargets_the_one_animation() {
+        let mut h = front_view();
+        let before = h.app.cam.yaw;
+        tap(&mut h);
+        h.frames(5);
+        let mid = h.app.cam;
+        tap(&mut h);
+        h.frames(1);
+        let anim = h.app.cam_anim.expect("one animation");
+        assert!((turn(before, anim.to.yaw).abs() - 30f64.to_radians()).abs() < 1e-6, "retargeted past the first step");
+        assert!(turn(mid.yaw, anim.from.yaw).abs() < 15f64.to_radians(), "continues from the camera as it is");
+        h.settle();
+        assert!((turn(before, h.app.cam.yaw).abs() - 30f64.to_radians()).abs() < 1e-6);
     }
 
     /// #1886: Ctrl+8 looks straight at the sketch; pressed again while the view faces it, it

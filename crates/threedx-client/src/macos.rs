@@ -53,6 +53,7 @@ type RegisterClient = unsafe extern "C" fn(u32, *const u8, u16, u32) -> u16;
 type SetMask = unsafe extern "C" fn(u16, u32);
 
 type Sink = Box<dyn Fn(Event) + Send + Sync>;
+type Connected = Box<dyn FnOnce(Result<(), Error>) + Send>;
 
 static SINK: OnceLock<Sink> = OnceLock::new();
 /// The id the driver gave this client: it broadcasts every message to every client.
@@ -157,17 +158,19 @@ fn connect(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn start(name: &str, sink: Sink) -> Result<(), Error> {
+/// Starts the client thread and returns without waiting for the driver: its registration
+/// waits for the main thread, which is usually the caller (a wait here hangs the app at launch).
+/// `connected` gets the outcome on the client thread.
+pub fn start(name: &str, sink: Sink, connected: Connected) -> Result<(), Error> {
     SINK.set(sink).map_err(|_| Error::AlreadyStarted)?;
     let name = name.to_owned();
-    let (ready, started) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("3dx-client".into())
         .spawn(move || {
             let result = connect(&name);
-            let connected = result.is_ok();
-            let _ = ready.send(result);
-            if !connected {
+            let ok = result.is_ok();
+            connected(result);
+            if !ok {
                 return;
             }
             // The driver's messages arrive on this thread's run loop. Waking up now and then keeps
@@ -177,8 +180,8 @@ pub fn start(name: &str, sink: Sink) -> Result<(), Error> {
                 unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, 0) };
             }
         })
-        .map_err(|error| Error::Thread(error.to_string()))?;
-    started.recv().map_err(|error| Error::Thread(error.to_string()))?
+        .map(|_| ())
+        .map_err(|error| Error::Thread(error.to_string()))
 }
 
 #[cfg(test)]

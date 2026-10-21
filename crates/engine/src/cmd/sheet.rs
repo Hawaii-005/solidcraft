@@ -7,7 +7,7 @@ use solidcraft_doc::sheet::{self, SheetBody, SheetRule};
 use solidcraft_doc::{BodyName, SketchId};
 use solidcraft_doc::{FacePick, Position};
 use solidcraft_doc::{FeatureKind, FlangeEdge};
-use solidcraft_geom::{Vec2, Vec3};
+use solidcraft_geom::{Aabb2, Ring, Vec2, Vec3};
 
 use super::CommandSpec;
 use super::features::{add_feature, check_expr, feature_sketch, profiles, sketch_id};
@@ -494,13 +494,9 @@ fn loop_shape(lp: &solidcraft_geom::Loop2) -> Value {
 
 fn flat_json(sh: &SheetBody) -> Result<Value> {
     let regions = sh.flat_regions()?;
-    let loops: Vec<Vec<Vec2>> = regions.iter().map(|r| r.outer.polyline(1e-3)).collect();
-    let (mut lo, mut hi) = (Vec2::new(f64::MAX, f64::MAX), Vec2::new(f64::MIN, f64::MIN));
-    for p in loops.iter().flatten() {
-        lo = Vec2::new(lo.x.min(p.x), lo.y.min(p.y));
-        hi = Vec2::new(hi.x.max(p.x), hi.y.max(p.y));
-    }
-    let (w, h) = (hi.x - lo.x, hi.y - lo.y);
+    let loops: Vec<Ring<Vec2>> = regions.iter().map(|r| r.outer.polyline(1e-3)).collect();
+    let size = loops.iter().fold(Aabb2::EMPTY, |b, l| b.union(&l.bounds())).size();
+    let (w, h) = (size.x, size.y);
     let pt = |v: &Vec2| json!([v.x, v.y]);
     let outline: Vec<Value> = loops.iter().map(|l| Value::Array(l.iter().map(pt).collect())).collect();
     let holes: Vec<Value> = regions.iter().flat_map(|r| &r.holes).map(|h| Value::Array(h.polyline(1e-3).iter().map(pt).collect())).collect();
@@ -562,6 +558,7 @@ fn flat_json(sh: &SheetBody) -> Result<Value> {
 
 fn flat_pattern(s: &mut Session, p: &Value) -> Result<Value> {
     let sh = sheet_of(s, p, "sheet.flat_pattern")?;
+    sh.flat_matches_body()?;
     flat_json(&sh)
 }
 
@@ -822,7 +819,13 @@ fn export_dxf(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad(cmd, "there is no sheet metal body"));
         }
         // Every file is made before the first is written.
-        let texts = sheets.iter().map(|sh| flat_dxf(sh, &options)).collect::<Result<Vec<_>>>()?;
+        let texts = sheets
+            .iter()
+            .map(|sh| {
+                sh.flat_matches_body()?;
+                flat_dxf(sh, &options)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let paths = path.map(|path| body_paths(path, &sheets.iter().map(|sh| sh.body.clone()).collect::<Vec<_>>()));
         let mut files = Vec::new();
         for (i, (sh, text)) in sheets.iter().zip(&texts).enumerate() {
@@ -837,6 +840,7 @@ fn export_dxf(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!({"files": files}));
     }
     let sh = sheet_of(s, p, cmd)?;
+    sh.flat_matches_body()?;
     let text = flat_dxf(&sh, &options)?;
     if let Some(path) = path {
         solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
@@ -852,6 +856,7 @@ fn export_bend_table(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`format` must be csv or json"));
     }
     let sh = sheet_of(s, p, cmd)?;
+    sh.flat_matches_body()?;
     let table = flat_json(&sh)?;
     let text = if format == "json" {
         serde_json::to_string_pretty(&table).map_err(|e| EngineError::Other(e.to_string()))?
@@ -904,3 +909,7 @@ mod convert_tests;
 #[cfg(test)]
 #[path = "sheet_dxf_tests.rs"]
 mod dxf_tests;
+
+#[cfg(test)]
+#[path = "sheet_face_names_tests.rs"]
+mod face_names_tests;

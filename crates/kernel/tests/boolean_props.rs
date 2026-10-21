@@ -118,6 +118,25 @@ fn identity(a: &Prim, b: &Prim) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+fn scale(a: &Prim, b: &Prim, k: f64) -> Result<(), TestCaseError> {
+    let sc = |p: &Prim| match p.clone() {
+        Prim::Box { at, size } => Prim::Box { at: at.map(|x| x * k), size: size.map(|x| x * k) },
+        Prim::Cyl { at, axis, r, h } => Prim::Cyl { at: at.map(|x| x * k), axis, r: r * k, h: h * k },
+        Prim::Sph { at, r } => Prim::Sph { at: at.map(|x| x * k), r: r * k },
+    };
+    let (ba, bb, ka, kb) = (a.body(), b.body(), sc(a).body(), sc(b).body());
+    let s = vol(&ba) + vol(&bb);
+    for op in [BoolOp::Union, BoolOp::Intersect, BoolOp::Cut] {
+        let (one, big) = (run(&ba, &bb, op), run(&ka, &kb, op));
+        if edge_contact_refusal(a, b, op, &one) && edge_contact_refusal(a, b, op, &big) {
+            continue;
+        }
+        let (one, big) = (one?, big? / (k * k * k));
+        prop_assert!(close(one, big, s), "{op:?} at scale 1 gives {one:.4}, at scale {k} gives {big:.4} (normalised)");
+    }
+    Ok(())
+}
+
 fn cfg(default: u32) -> ProptestConfig {
     // The env var overrides the default; proptest reads PROPTEST_CASES itself only when the
     // config does not set `cases`, so read it here.
@@ -186,21 +205,7 @@ proptest! {
     /// (40x) expose tolerances that do not scale.
     #[test]
     fn scale_invariant(a in grid_prim(), b in grid_prim(), k in prop::sample::select(vec![0.05, 1.0, 40.0])) {
-        let sc = |p: &Prim| match p.clone() {
-            Prim::Box { at, size } => Prim::Box { at: at.map(|x| x * k), size: size.map(|x| x * k) },
-            Prim::Cyl { at, axis, r, h } => Prim::Cyl { at: at.map(|x| x * k), axis, r: r * k, h: h * k },
-            Prim::Sph { at, r } => Prim::Sph { at: at.map(|x| x * k), r: r * k },
-        };
-        let (ba, bb, ka, kb) = (a.body(), b.body(), sc(&a).body(), sc(&b).body());
-        let s = vol(&ba) + vol(&bb);
-        for op in [BoolOp::Union, BoolOp::Intersect, BoolOp::Cut] {
-            let (one, big) = (run(&ba, &bb, op), run(&ka, &kb, op));
-            if edge_contact_refusal(&a, &b, op, &one) && edge_contact_refusal(&a, &b, op, &big) {
-                continue;
-            }
-            let (one, big) = (one?, big? / (k * k * k));
-            prop_assert!(close(one, big, s), "{op:?} at scale 1 gives {one:.4}, at scale {k} gives {big:.4} (normalised)");
-        }
+        scale(&a, &b, k)?;
     }
 
     /// A∪A = A, A∩A = A, A−A = nothing.
@@ -279,6 +284,19 @@ fn edge_only_box_join_is_refused_in_both_orders() {
     }
 }
 
+/// The saved scale-invariance failure: these boxes meet at y=30, z=20 along an
+/// edge, so a join is refused at every scale. Intersection and cut still scale.
+#[test]
+fn edge_only_box_contact_is_scale_invariant() {
+    let a = Prim::Box { at: [0.0, 15.0, 7.5], size: [7.5, 15.0, 12.5] };
+    let b = Prim::Box { at: [0.0, 30.0, 20.0], size: [5.0, 5.0, 5.0] };
+    assert!(edge_only_boxes(&a, &b));
+    for k in [0.05, 1.0, 40.0] {
+        check(scale(&a, &b, k));
+        check(scale(&b, &a, k));
+    }
+}
+
 fn check(r: Result<(), TestCaseError>) {
     if let Err(e) = r {
         panic!("{e}");
@@ -294,9 +312,9 @@ fn generic_box_cylinder_intersect() {
     check(identity(&a, &b));
 }
 
-/// A sphere and a box on the grid: the union has a face that does not mesh.
+/// A sphere and a box on the grid: the sphere touches the box's bottom edge, so the union has a
+/// face pinched to a point there, which did not mesh (#1648).
 #[test]
-#[ignore = "kernel bug, #1648"]
 fn grid_sphere_box_union_is_sound() {
     let a = Prim::Sph { at: [2.5, 15.0, 27.5], r: 12.5 };
     let b = Prim::Box { at: [0.0, 0.0, 17.5], size: [5.0, 7.5, 5.0] };

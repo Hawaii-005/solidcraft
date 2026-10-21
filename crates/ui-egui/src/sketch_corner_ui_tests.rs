@@ -2,6 +2,32 @@ use super::*;
 use solidcraft_engine::sketch::CurveKind;
 
 #[test]
+fn three_point_arc_follows_its_snapped_through_point_after_dimension_change() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[-20,0],[20,0]],"ids":["base"]})).unwrap();
+    h.app.run("sketch.constraint.fix", json!({"entity":"base"})).unwrap();
+    h.app.run("sketch.line", json!({"points":["origin",[0,10]],"ids":["height"],"infer":true})).unwrap();
+    let dim = h.app.run("sketch.dimension", json!({"entities":["height"],"value":10})).unwrap();
+    h.settle();
+    h.step(&json!({"start":"sketch.arc.three_point"})).unwrap();
+    for point in [[-20, 0, 0], [20, 0, 0], [0, 10, 0]] {
+        h.step(&json!({"click":{"world":point}})).unwrap();
+    }
+    h.app.run("parameters.change", json!({"name":dim["param"],"expression":"15 mm"})).unwrap();
+    let sid = h.app.session.active_sketch.unwrap();
+    let state = h.app.session.model.state();
+    let ss = state.sketch(sid).unwrap();
+    let sk = &ss.sketch;
+    let arc = sk.curves.iter().position(|c| matches!(c.kind, CurveKind::Arc { .. })).unwrap();
+    let through = sk.point(sk.resolve_point("height.end").unwrap()).unwrap();
+    assert!(ss.report.ok());
+    assert!(through.dist(Vec2::new(0.0, 15.0)) < 1e-6, "{through:?}");
+    let distance = sk.shape(arc).unwrap().dist(through);
+    assert!(distance < 1e-6, "the arc misses its snapped through point by {distance} mm");
+}
+
+#[test]
 fn clicked_periodic_fit_closes_at_start_and_right_click_keeps_natural() {
     let mut h = crate::scenario::Harness::new();
     h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
@@ -226,6 +252,86 @@ fn corner_window_takes_the_corner_then_applies_the_typed_size() {
     }
 }
 
+/// #2420: the shared corner window shows the design unit, including both chamfer legs.
+#[test]
+fn corner_defaults_show_design_units() {
+    for units in ["mm", "cm", "m", "in", "ft"] {
+        for command in ["sketch.fillet", "sketch.chamfer.equal_distance", "sketch.chamfer.two_distance", "sketch.chamfer.distance_angle"] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.run("document.units", json!({"units": units})).unwrap();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.step(&json!({"start":command})).unwrap();
+            let Some(crate::dialogs::Kind::SketchModify(crate::sketch_modify_ui::Mod::Corner { size, distance2, angle, .. })) =
+                h.app.dialog.as_ref().map(|d| &d.kind)
+            else {
+                panic!("{command}: no corner window");
+            };
+            assert_eq!(size, &format!("2 {units}"), "{command}");
+            assert_eq!(distance2, &format!("2 {units}"), "{command}");
+            assert_eq!(angle, "45 deg", "length units must not change angles");
+        }
+    }
+}
+
+/// A typed inch radius must reach both corner selection routes as a persistent dimension.
+#[test]
+fn fillet_window_reads_design_units_and_preserves_explicit_units_and_parameters() {
+    for (units, text, radius) in
+        [("in", "0.25", 6.35), ("cm", "0.25", 2.5), ("mm", "0.25", 0.25), ("in", "2 mm", 2.0), ("mm", "0.25 in", 6.35), ("in", "rounding", 3.0)]
+    {
+        for lines in [false, true] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.preferences.length_decimals = 4;
+            h.app.run("document.units", json!({"units":units})).unwrap();
+            h.app.run("parameters.add", json!({"name":"rounding", "expression":"3 mm"})).unwrap();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]})).unwrap();
+            // Keep the outer size fixed when the driving radius changes.
+            h.app.run("sketch.dimension", json!({"entities":["l1"],"value":"40 mm"})).unwrap();
+            h.app.run("sketch.dimension", json!({"entities":["l2"],"value":"30 mm"})).unwrap();
+            h.frames(2);
+            h.step(&json!({"start":"sketch.fillet"})).unwrap();
+            if lines {
+                for point in [[25, 0, 0], [40, 15, 0]] {
+                    h.step(&json!({"click":{"world":point}})).unwrap();
+                }
+            } else {
+                h.step(&json!({"click":{"world":[40,0,0]}})).unwrap();
+            }
+            retype(&mut h, "dialog:Radius", text);
+            apply(&mut h);
+            assert!(h.app.dialog.is_none(), "{units}, {text}, lines {lines}: {:?}", h.app.status);
+            let check = |session: &solidcraft_engine::Session, expected: f64| {
+                let state = session.world_state();
+                let ss = state.sketch(1).unwrap();
+                let arc = ss
+                    .sketch
+                    .curves
+                    .iter()
+                    .find_map(|c| match c.kind {
+                        CurveKind::Arc { c: center, a: start, .. } => Some(ss.sketch.point(center).unwrap().dist(ss.sketch.point(start).unwrap())),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!((arc - expected).abs() < 1e-6, "{units}, {text}, lines {lines}: radius {arc}, expected {expected}");
+                let area = 1200.0 - expected * expected * (1.0 - std::f64::consts::PI / 4.0);
+                assert!(
+                    (ss.profiles[0].area - area).abs() < 1e-6,
+                    "{units}, {text}, lines {lines}: area {}, expected {area}, radius {expected}",
+                    ss.profiles[0].area
+                );
+            };
+            check(&h.app.session, radius);
+            if text == "rounding" {
+                h.app.run("parameters.change", json!({"name":"rounding", "expression":"4 mm"})).unwrap();
+                check(&h.app.session, 4.0);
+            }
+            let reopened = solidcraft_engine::Session::new(solidcraft_engine::doc::Document::from_json(&h.app.session.doc.to_json()).unwrap());
+            check(&reopened, if text == "rounding" { 4.0 } else { radius });
+        }
+    }
+}
+
 /// The window's reason to exist: a chamfer angle other than the 45 degrees the command used to
 /// receive hard-coded. 10 mm along the first line at 30 degrees puts the second cut at
 /// 10 * sin 30 / sin 60 mm, where 45 degrees would put it at 10 mm.
@@ -389,6 +495,9 @@ fn fully_constrained_center_rectangle_corners_can_be_picked_and_filleted() {
     h.frames(2);
     h.step(&json!({"start":"sketch.fillet"})).unwrap();
     h.frames(2);
+    // Fit after opening the dialog so all four corners clear the shell and both panels.
+    h.app.fit_view();
+    h.settle();
     for corner in [[-20, -15, 0], [20, -15, 0], [20, 15, 0], [-20, 15, 0]] {
         h.step(&json!({"click":{"world":corner}})).unwrap();
         h.frames(2);
@@ -514,4 +623,59 @@ fn fillet_chamfer_corner_preview_draws_curves() {
 
     let sk = h.app.session.world_state().sketch(sid).unwrap().sketch.clone();
     assert_eq!(sk.curves.len(), 2, "chamfer preview must not modify the sketch");
+}
+
+/// #3052: with Trim, the hover over a line crossed by two others is the piece between them, the
+/// one a click takes away; the whole line is no longer shown hovered. With another tool, nothing.
+#[test]
+fn trim_hover_shows_the_piece_a_click_takes_away() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    let line = h.app.run("sketch.line", json!({"points": [[0,0],[30,0]], "connect": false})).unwrap()["curves"][0].as_str().unwrap().to_string();
+    h.app.run("sketch.line", json!({"points": [[10,-5],[10,5]], "connect": false})).unwrap();
+    h.app.run("sketch.line", json!({"points": [[20,-5],[20,5]], "connect": false})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    h.step(&json!({"start":"sketch.trim"})).unwrap();
+    h.step(&json!({"move":{"world":[15,0,0]}})).unwrap();
+    assert!(matches!(&h.app.viewport.hover, Some(crate::viewport::Hit::SketchCurve { id, .. }) if *id == line), "{:?}", h.app.viewport.hover);
+    let piece = trim_hover_piece(&h.app, sid, &line).unwrap();
+    let ends = [piece[0], piece[piece.len() - 1]];
+    assert!(
+        ends.iter().all(|p| p.y.abs() < 1e-6) && ends.iter().any(|p| (p.x - 10.0).abs() < 1e-6) && ends.iter().any(|p| (p.x - 20.0).abs() < 1e-6),
+        "{ends:?}"
+    );
+    h.step(&json!({"key":"Escape"})).unwrap();
+    h.step(&json!({"move":{"world":[15,0,0]}})).unwrap();
+    assert!(trim_hover_piece(&h.app, sid, &line).is_none(), "only Trim shows a piece");
+}
+
+/// #3141: the 2-tangent circle tool, clicked on two sides of a rectangle drawn away from the
+/// origin, puts its circle in the corner between the clicks without moving the rectangle, and
+/// fixed sides no longer make it fail.
+#[test]
+fn two_tangent_circle_clicked_on_two_sides_fits_the_corner_and_moves_nothing() {
+    for fixed in [false, true] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        let r = h.app.run("sketch.rectangle.two_point", json!({"p0":[-800,0],"p1":[-300,500]})).unwrap();
+        if fixed {
+            h.app.run("sketch.constraint.fix", json!({"entities": r["curves"]})).unwrap();
+        }
+        h.step(&json!({"call":"ui.view","params":{"view":"fit"}})).unwrap();
+        h.settle();
+        let sid = h.app.session.active_sketch.unwrap();
+        let points =
+            |h: &crate::scenario::Harness| h.app.session.model.state().sketch(sid).unwrap().sketch.points.iter().map(|p| p.pos).collect::<Vec<_>>();
+        let before = points(&h);
+        h.step(&json!({"start":"sketch.circle.two_tangent"})).unwrap();
+        h.step(&json!({"click":{"world":[-550,0,0]}})).unwrap();
+        h.step(&json!({"click":{"world":[-800,250,0]}})).unwrap();
+        let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+        let circle = sk.curves.iter().position(|c| matches!(c.kind, CurveKind::Circle { .. }));
+        let circle = circle.unwrap_or_else(|| panic!("fixed {fixed}: no circle: {:?}", h.app.status));
+        assert!(sk.center(circle).unwrap().dist(Vec2::new(-750.0, 50.0)) < 1e-6, "fixed {fixed}: {:?}", sk.center(circle));
+        let after = points(&h);
+        assert!(before.iter().zip(&after).all(|(a, b)| a.dist(*b) < 1e-9), "fixed {fixed}: the rectangle moved: {after:?}");
+    }
 }

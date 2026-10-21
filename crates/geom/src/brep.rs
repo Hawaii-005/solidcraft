@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod envelope;
 
-pub const VERSION: u32 = 2;
-pub const MAX_ITEMS: usize = 100_000;
+pub const VERSION: u32 = 3;
+pub const MAX_ITEMS: usize = 1_000_000;
 const MAX_DEPTH: usize = 16;
+/// Most control points along one direction of a spline (a helical thread flank written as one
+/// spline has thousands along the helix); the item budget bounds a surface's grid as a whole.
+pub const MAX_SPLINE_CONTROLS: usize = 8192;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,26 +61,113 @@ pub struct Frame {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Curve {
-    Line { start: [f64; 3], end: [f64; 3] },
-    CircleArc { frame: Frame, radius: f64, angle: [f64; 2] },
-    EllipseArc { frame: Frame, radii: [f64; 2], angle: [f64; 2] },
-    Polyline { points: Vec<[f64; 3]> },
-    Spline { knots: Vec<f64>, points: Vec<[f64; 3]> },
-    RationalSpline { knots: Vec<f64>, homogeneous: Vec<[f64; 4]> },
-    Intersection { knots: Vec<f64>, points: Vec<[f64; 3]>, fitting_tolerance: f64, faces: Option<[u32; 2]> },
+    Line {
+        start: [f64; 3],
+        end: [f64; 3],
+    },
+    CircleArc {
+        frame: Frame,
+        radius: f64,
+        angle: [f64; 2],
+    },
+    EllipseArc {
+        frame: Frame,
+        radii: [f64; 2],
+        angle: [f64; 2],
+    },
+    Polyline {
+        points: Vec<[f64; 3]>,
+    },
+    Spline {
+        knots: Vec<f64>,
+        points: Vec<[f64; 3]>,
+    },
+    RationalSpline {
+        knots: Vec<f64>,
+        homogeneous: Vec<[f64; 4]>,
+    },
+    Intersection {
+        knots: Vec<f64>,
+        points: Vec<[f64; 3]>,
+        fitting_tolerance: f64,
+        faces: Option<[u32; 2]>,
+    },
+    /// The intersection of two surfaces, traced from `leader` (a polyline or spline near it)
+    /// to within `tolerance`: the procedural curve itself, exactly as its producer holds it.
+    SurfaceIntersection {
+        surfaces: [Box<Surface>; 2],
+        leader: Box<Curve>,
+        tolerance: f64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Surface {
-    Plane { origin: [f64; 3], u_axis: [f64; 3], v_axis: [f64; 3] },
-    Cylinder { frame: Frame, radius: f64, angle: [f64; 2], height: [f64; 2] },
-    Cone { frame: Frame, radius_at_origin: f64, half_angle: f64, angle: [f64; 2], height: [f64; 2] },
-    Sphere { frame: Frame, radius: f64, longitude: [f64; 2], latitude: [f64; 2] },
-    Torus { frame: Frame, major_radius: f64, minor_radius: f64, longitude: [f64; 2], meridian: [f64; 2] },
-    Spline { u_knots: Vec<f64>, v_knots: Vec<f64>, points: Vec<Vec<[f64; 3]>> },
-    RationalSpline { u_knots: Vec<f64>, v_knots: Vec<f64>, homogeneous: Vec<Vec<[f64; 4]>> },
-    Revolution { profile: Box<Curve>, origin: [f64; 3], axis: [f64; 3], angle: [f64; 2] },
+    Plane {
+        origin: [f64; 3],
+        u_axis: [f64; 3],
+        v_axis: [f64; 3],
+    },
+    /// The plane through three points, parameter (1, 0) at `u_point` and (0, 1) at `v_point`:
+    /// the points themselves, as its producer holds them (axes worked out from them would round).
+    PlaneThrough {
+        origin: [f64; 3],
+        u_point: [f64; 3],
+        v_point: [f64; 3],
+    },
+    Cylinder {
+        frame: Frame,
+        radius: f64,
+        angle: [f64; 2],
+        height: [f64; 2],
+    },
+    Cone {
+        frame: Frame,
+        radius_at_origin: f64,
+        half_angle: f64,
+        angle: [f64; 2],
+        height: [f64; 2],
+    },
+    Sphere {
+        frame: Frame,
+        radius: f64,
+        longitude: [f64; 2],
+        latitude: [f64; 2],
+    },
+    Torus {
+        frame: Frame,
+        major_radius: f64,
+        minor_radius: f64,
+        longitude: [f64; 2],
+        meridian: [f64; 2],
+    },
+    Spline {
+        u_knots: Vec<f64>,
+        v_knots: Vec<f64>,
+        points: Vec<Vec<[f64; 3]>>,
+    },
+    RationalSpline {
+        u_knots: Vec<f64>,
+        v_knots: Vec<f64>,
+        homogeneous: Vec<Vec<[f64; 4]>>,
+    },
+    Revolution {
+        profile: Box<Curve>,
+        origin: [f64; 3],
+        axis: [f64; 3],
+        angle: [f64; 2],
+    },
+    /// A full revolution of `profile` about `origin` and unit `axis`, then mapped by the
+    /// column-major affine `matrix`, with the normal reversed unless `forward`: the
+    /// revolution exactly as its producer holds it, nothing baked into the profile.
+    PlacedRevolution {
+        profile: Box<Curve>,
+        origin: [f64; 3],
+        axis: [f64; 3],
+        matrix: [[f64; 4]; 4],
+        forward: bool,
+    },
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -108,7 +198,7 @@ fn knots(values: &[f64], count: usize, budget: &mut Budget) -> Result<()> {
     budget.add(values.len())?;
     numbers(values.iter().copied())?;
     let degree = values.len().checked_sub(count.saturating_add(1)).ok_or(Invalid("spline degree"))?;
-    require((2..=4096).contains(&count) && (1..=16).contains(&degree) && degree < count, "spline degree or size")?;
+    require((2..=MAX_SPLINE_CONTROLS).contains(&count) && (1..=16).contains(&degree) && degree < count, "spline degree or size")?;
     require(values.windows(2).all(|w| w.first() <= w.get(1)), "unordered knots")?;
     require(values.get(degree) < values.get(count), "empty spline domain")?;
     // No knot may have multiplicity greater than degree + 1.
@@ -190,6 +280,27 @@ fn curve(c: &Curve, depth: usize, budget: &mut Budget) -> Result<()> {
             knots(k, p.len(), budget)?;
             points(p, budget)
         }
+        Curve::SurfaceIntersection { surfaces, leader, tolerance } => {
+            require(tolerance.is_finite() && (0.0..=1e3).contains(tolerance), "intersection tolerance")?;
+            for s in surfaces {
+                surface(s, depth + 1, budget)?;
+            }
+            // The leader is only a starting guess for the trace: its knots are the producer's,
+            // and a traced polyline may repeat a point.
+            require(depth < MAX_DEPTH, "geometry depth")?;
+            budget.add(1)?;
+            match &**leader {
+                Curve::Polyline { points: p } => {
+                    require(p.len() >= 2, "empty intersection leader")?;
+                    points(p, budget)
+                }
+                Curve::Spline { knots: k, points: p } => {
+                    knots(k, p.len(), budget)?;
+                    points(p, budget)
+                }
+                _ => Err(Invalid("intersection leader")),
+            }
+        }
     }
 }
 fn surface(s: &Surface, depth: usize, budget: &mut Budget) -> Result<()> {
@@ -199,6 +310,11 @@ fn surface(s: &Surface, depth: usize, budget: &mut Budget) -> Result<()> {
         Surface::Plane { origin, u_axis, v_axis } => {
             points(&[*origin, *u_axis, *v_axis], budget)?;
             require(vector(*u_axis).cross(vector(*v_axis)).len() > 1e-12, "degenerate plane")
+        }
+        Surface::PlaneThrough { origin, u_point, v_point } => {
+            points(&[*origin, *u_point, *v_point], budget)?;
+            let o = vector(*origin);
+            require((vector(*u_point) - o).cross(vector(*v_point) - o).len() > 1e-12, "degenerate plane")
         }
         Surface::Cylinder { frame: f, radius: r, angle: a, height } => {
             frame(f, budget)?;
@@ -241,6 +357,14 @@ fn surface(s: &Surface, depth: usize, budget: &mut Budget) -> Result<()> {
             points(&[*origin, *axis], budget)?;
             require((vector(*axis).len() - 1.0).abs() <= 1e-8, "revolution axis is not unit length")?;
             angle(a)?;
+            curve(profile, depth + 1, budget)
+        }
+        Surface::PlacedRevolution { profile, origin, axis, matrix, .. } => {
+            points(&[*origin, *axis], budget)?;
+            require((vector(*axis).len() - 1.0).abs() <= 1e-8, "revolution axis is not unit length")?;
+            points(matrix, budget)?;
+            let [x, y, z, _] = matrix.map(|c| vector([c[0], c[1], c[2]]));
+            require(x.cross(y).dot(z).abs() > 1e-12, "singular revolution placement")?;
             curve(profile, depth + 1, budget)
         }
     }
@@ -361,6 +485,40 @@ mod tests {
         assert!(surface(&p, 0, &mut Budget(0)).is_err());
         assert!(curve(&Curve::Line { start: [0.; 3], end: [1.; 3] }, MAX_DEPTH + 1, &mut Budget(0)).is_err());
         assert!(Budget(MAX_ITEMS).add(1).is_err());
+        // Control points along one direction: up to the cap, not one more (a clamped cubic).
+        let clamped = |count: usize| {
+            let mut k = vec![0.0; 4];
+            k.extend((1..count - 3).map(|i| i as f64));
+            k.extend([(count - 3) as f64; 4]);
+            k
+        };
+        assert!(knots(&clamped(MAX_SPLINE_CONTROLS), MAX_SPLINE_CONTROLS, &mut Budget(0)).is_ok());
+        assert!(knots(&clamped(MAX_SPLINE_CONTROLS + 1), MAX_SPLINE_CONTROLS + 1, &mut Budget(0)).is_err());
+    }
+
+    #[test]
+    fn exact_procedural_records_are_validated_and_round_trip() {
+        let plane = |z: f64| Box::new(Surface::Plane { origin: [0., 0., z], u_axis: [1., 0., 0.], v_axis: [0., 1., 0.] });
+        let leader = Box::new(Curve::Polyline { points: vec![[0.; 3], [0.; 3], [1., 0., 0.]] });
+        let c = Curve::SurfaceIntersection { surfaces: [plane(0.), plane(1.)], leader: leader.clone(), tolerance: 1e-6 };
+        curve(&c, 0, &mut Budget(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Curve>(&serde_json::to_string(&c).unwrap()).unwrap(), c);
+        let line = Box::new(Curve::Line { start: [0.; 3], end: [1.; 3] });
+        for bad in [
+            Curve::SurfaceIntersection { surfaces: [plane(0.), plane(1.)], leader: line.clone(), tolerance: 1e-6 },
+            Curve::SurfaceIntersection { surfaces: [plane(0.), plane(1.)], leader: leader.clone(), tolerance: f64::NAN },
+            Curve::SurfaceIntersection { surfaces: [plane(f64::INFINITY), plane(1.)], leader, tolerance: 1e-6 },
+        ] {
+            assert!(curve(&bad, 0, &mut Budget(0)).is_err());
+        }
+        let identity = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]];
+        let s = Surface::PlacedRevolution { profile: line.clone(), origin: [0.; 3], axis: [0., 0., 1.], matrix: identity, forward: false };
+        surface(&s, 0, &mut Budget(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Surface>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
+        let mut flat = identity;
+        flat[2] = [0.; 4];
+        let bad = Surface::PlacedRevolution { profile: line, origin: [0.; 3], axis: [0., 0., 1.], matrix: flat, forward: true };
+        assert!(surface(&bad, 0, &mut Budget(0)).is_err());
     }
 
     #[test]

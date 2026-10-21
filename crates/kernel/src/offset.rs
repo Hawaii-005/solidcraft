@@ -28,8 +28,9 @@ pub(crate) enum Surf {
     /// outward normal points away from the axis.
     Cone { v: Vec3, a: Vec3, half: f64, convex: bool },
     /// Axis point and unit axis, the tube's centre circle (radius `big` at height `h` along the
-    /// axis) and the tube radius; `convex` when the outward normal points away from the tube's
-    /// centre.
+    /// axis) and the tube radius; `big` is negative on the inner sheet of a spindle torus,
+    /// whose meridian circle's centre lies across the axis. `convex` when the outward normal
+    /// points away from the tube's centre.
     Torus { o: Vec3, a: Vec3, big: f64, h: f64, r: f64, convex: bool },
 }
 
@@ -292,9 +293,10 @@ fn torus_of(f: &mt::Face, s: &[(Vec3, Vec3)], tol: f64) -> Option<Surf> {
     }
     let x = crate::polyhedron::solve3_pub(m, rhs)?;
     let (big, h, r) = (x[0], x[1], x[2]);
-    // (A tube wider than its circle, a spindle torus, is fine: blends use its outer part, where
-    // each point's tube centre is the one on its own side of the axis.)
-    if !(big > 1e-9 && r.abs() > 1e-9) {
+    // A spindle torus also has an inner sheet: a barrel revolved from an arc whose
+    // centre is across the axis. Its signed ring radius is negative; retain that sign
+    // so distances, normals and the moved meridian use the centre on the opposite side.
+    if !(big.abs() > 1e-9 && r.abs() > 1e-9) {
         return None;
     }
     let t = Surf::Torus { o, a, big, h, r: r.abs(), convex: r > 0.0 };
@@ -1088,6 +1090,13 @@ pub(crate) fn offset_body(b: &Body, shift: impl Fn(usize, Vec3) -> f64) -> Resul
                     let (o, s, n) = pick(fs);
                     let m2 =
                         move_point(m, &o, &s, &n, size * 1e-6).ok_or_else(|| fail("an edge whose faces don't meet the same way after the move"))?;
+                    // An arc turned round: its ends moved past its middle (next to a face it meets
+                    // tangentially), so the arc through them goes the long way round its circle.
+                    let (a0, c0, a1, c1) =
+                        (from_p3(e.absolute_front().point()), from_p3(e.absolute_back().point()), from_p3(a.point()), from_p3(c.point()));
+                    if (m - a0).cross(c0 - a0).dot((m2 - a1).cross(c1 - a1)) < 0.0 {
+                        return Err(fail("not supported yet: the move is larger than a wall or step is thick (faces would cross)"));
+                    }
                     builder::circle_arc(a, c, p3(m2))
                 }
             };

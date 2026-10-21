@@ -521,3 +521,57 @@ fn pattern_of_cuts_beside_a_round_needs_no_retries() {
     let v = volume(&mut s);
     assert!(rel(v, expected) < 1e-5, "{v} vs {expected}");
 }
+
+/// #2755: a cut cylinder with `targets` cuts only those bodies, and so do its pattern and mirror
+/// copies: a body over the plate that the cylinder was told to leave alone keeps its volume.
+#[test]
+fn copies_of_a_primitive_cut_only_its_targets() {
+    let body_volume = |s: &mut Session, name: &str| {
+        let m = run(s, "inspect.measure", json!({"bodies": [name]}));
+        m["bodies"][0]["volume_mm3"].as_f64().unwrap_or(f64::NAN)
+    };
+    // The command, and the holes in the plate after it (the cylinder's and its copies).
+    for (copy, holes) in [
+        (json!(["solid.pattern.rectangular", {"features": ["Trou"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 30}]), 3.0),
+        (json!(["solid.mirror", {"features": ["Trou"], "plane": {"origin": [50, 0, 0], "normal": [1, 0, 0]}}]), 2.0),
+    ] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 100, "width": 60, "height": 10, "body_name": "Plaque"}));
+        run(&mut s, "solid.box", json!({"length": 100, "width": 60, "height": 10, "corner": [0, 0, 5], "operation": "new", "body_name": "Voisin"}));
+        let cyl = json!({"radius": 3, "height": 30, "base": [10, 10, -5], "operation": "cut", "targets": ["Plaque"], "name": "Trou"});
+        run(&mut s, "solid.cylinder", cyl);
+        assert!(rel(body_volume(&mut s, "Voisin"), 60000.0) < 1e-9);
+        let (id, p) = (copy[0].as_str().unwrap_or_default(), copy[1].clone());
+        let r = run(&mut s, id, p);
+        assert_eq!(r["changed_bodies"], json!(["Plaque"]), "{id}");
+        assert!(rel(body_volume(&mut s, "Voisin"), 60000.0) < 1e-9, "{id} cut Voisin");
+        let removed = 60000.0 - body_volume(&mut s, "Plaque");
+        assert!(rel(removed, holes * PI * 9.0 * 10.0) < 1e-3, "{id}: {removed} mm³ cut from Plaque");
+    }
+}
+
+/// #3378: a pattern or mirror of a join whose targets the join merged into one body copies onto
+/// that body, as before #2755, instead of looking for the target the join used up.
+#[test]
+fn copies_of_a_join_that_merged_its_targets_join_the_merged_body() {
+    for (copy, n) in [
+        (json!(["solid.pattern.circular", {"features": ["spoke"], "axis": "Y", "count": 5}]), 5.0),
+        (json!(["solid.mirror", {"features": ["spoke"], "plane": {"origin": [0, 0, 0], "normal": [1, 0, 0]}}]), 2.0),
+    ] {
+        let mut s = Session::default();
+        run(&mut s, "solid.cylinder", json!({"radius": 66, "height": 3, "base": [0, 0, 0], "axis": "Y", "body_name": "rim"}));
+        run(&mut s, "solid.cylinder", json!({"radius": 63, "height": 3, "base": [0, 0, 0], "axis": "Y", "operation": "cut", "targets": ["rim"]}));
+        run(&mut s, "solid.cylinder", json!({"radius": 12, "height": 3, "base": [0, 0, 0], "axis": "Y", "body_name": "hub"}));
+        let v0 = volume(&mut s);
+        let spoke = json!({"length": 52, "width": 3, "height": 2.5, "corner": [12, 0, -1.25], "operation": "join", "targets": ["rim", "hub"], "name": "spoke"});
+        run(&mut s, "solid.box", spoke);
+        let v1 = volume(&mut s);
+        let (id, p) = (copy[0].as_str().unwrap_or_default(), copy[1].clone());
+        run(&mut s, id, p);
+        let names = run(&mut s, "inspect.measure", json!({}))["bodies"].as_array().map(|b| b.iter().map(|x| x["name"].clone()).collect::<Vec<_>>());
+        assert_eq!(names, Some(vec![json!("rim")]), "{id}: one body, the merged rim and hub");
+        // Every copy adds what the seed spoke added (curved bodies measure to about 0.02 %; a
+        // missing or doubled spoke is about 5 %).
+        assert!(rel(volume(&mut s), v0 + n * (v1 - v0)) < 1e-3, "{id}: {} vs {}", volume(&mut s), v0 + n * (v1 - v0));
+    }
+}

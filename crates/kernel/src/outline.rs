@@ -503,6 +503,7 @@ fn divided(body: &Body, faces: &[usize], other: &[(mt::Edge, Piece)], fr: &Frame
     let split = Body {
         solid: std::sync::Arc::new(solid),
         size: 0.0,
+        boundary_tol: body.boundary_tol,
         volume: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
         coarse_missing: None,
         mesh: None,
@@ -513,6 +514,8 @@ fn divided(body: &Body, faces: &[usize], other: &[(mt::Edge, Piece)], fr: &Frame
         history: None,
         regularization_protected: true,
         display_of: None,
+        meshes: None,
+        phased: false,
     };
     Ok(Some(record::rebuilt_body(split, &[&body.solid], &rec)))
 }

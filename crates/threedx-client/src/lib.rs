@@ -67,15 +67,21 @@ impl std::error::Error for Error {}
 
 /// Connects to the driver and calls `sink` (on the client's own thread) for everything it reports.
 /// `name` is how the driver lists this app. Only one client per process; the connection lasts
-/// until the process ends.
-pub fn start(name: &str, sink: impl Fn(Event) + Send + Sync + 'static) -> Result<(), Error> {
+/// until the process ends. Returns once the client thread runs, without waiting for the driver
+/// (which needs the main thread to register the client); `connected` gets that outcome later, on
+/// the client's thread.
+pub fn start(
+    name: &str,
+    sink: impl Fn(Event) + Send + Sync + 'static,
+    connected: impl FnOnce(Result<(), Error>) + Send + 'static,
+) -> Result<(), Error> {
     #[cfg(target_os = "macos")]
     {
-        macos::start(name, Box::new(sink))
+        macos::start(name, Box::new(sink), Box::new(connected))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (name, sink);
+        let _ = (name, sink, connected);
         Err(Error::Unsupported)
     }
 }

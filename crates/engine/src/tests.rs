@@ -325,6 +325,7 @@ mod primitive_points;
 mod rim_cut;
 mod robustness;
 mod robustness_goldens;
+mod sphere_lens;
 mod spiral_join;
 mod step_import_options;
 mod xz_plane;
@@ -802,6 +803,7 @@ fn hostile_params_never_panic() {
         "kind",
         "prefix",
         "orientation",
+        "seam",
         "twist",
         "scale",
         "continuity",
@@ -809,6 +811,11 @@ fn hostile_params_never_panic() {
         "faces",
         "u",
         "v",
+        "keep",
+        "with",
+        "keep_with",
+        "stitch",
+        "extend",
     ];
     // Commands are independent; worker threads take them one at a time (their costs vary a lot).
     let ids: Vec<&str> = command_specs()
@@ -1536,6 +1543,31 @@ fn section_analysis() {
     assert_eq!(s.undo.len(), undo);
 }
 
+/// A section index finds the same cut segments, in the same order, as cutting every triangle:
+/// tilted and axis normals, cuts through vertices, at the ends and beyond the part.
+#[test]
+fn section_index_cuts_like_every_triangle() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 12, "height": 30}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 8, "operation": "join"}));
+    let st = s.model.state();
+    let m = st.bodies.first().unwrap().mesh();
+    assert!(m.triangles.len() > 64, "enough triangles for several slabs: {}", m.triangles.len());
+    for n in [Vec3::Z, -Vec3::Y, Vec3::new(1.0, 2.0, 3.0).normalized().unwrap(), Vec3::new(-0.3, 0.1, 0.9).normalized().unwrap()] {
+        let index = view::SectionIndex::new(&m, n);
+        let heights: Vec<f64> = m.positions.iter().map(|p| n.dot(*p)).collect();
+        let (lo, hi) = heights.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), h| (a.min(*h), b.max(*h)));
+        let mut cuts: Vec<f64> = (0..=40).map(|k| lo - 1.0 + (hi - lo + 2.0) * k as f64 / 40.0).collect();
+        cuts.extend(heights.iter().step_by(7).copied());
+        cuts.extend([lo, hi]);
+        for at in cuts {
+            let o = n * at;
+            let segments = view::section_segments(&m, o, n);
+            assert_eq!(index.segments(&m, o), segments, "{n:?} at {at}");
+        }
+    }
+}
+
 /// Press Pull: positive pulls a face out, negative pushes it in (a cut), edges get a fillet.
 #[test]
 fn press_pull() {
@@ -1751,6 +1783,23 @@ fn checkpoint_restores_with_a_full_undo_history() {
     run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id, "forget": true}));
     assert!(s.doc.find_feature("Kept").is_some());
     assert!(s.execute("edit.restore_checkpoint", &json!({"checkpoint": id})).is_err());
+}
+
+/// Regression (#3242): `file.new` replaced the session and its checkpoints with it, so a
+/// batch that failed after `file.new` could not go back to the design it began in.
+#[test]
+fn a_checkpoint_survives_file_new() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1.0, "width": 1.0, "height": 1.0}));
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "file.new", json!({"name": "Replacement"}));
+    run(&mut s, "solid.box", json!({"length": 2.0, "width": 2.0, "height": 2.0}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64(), Some(8.0));
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64(), Some(1.0));
+    // The undo history is the restored design's own: one step back is the empty design.
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64(), Some(0.0));
 }
 
 #[test]
@@ -2690,6 +2739,34 @@ fn unequal_chamfers() {
     assert!(s.execute("solid.chamfer", &json!({"edges": [[0, 15, 20]], "distance": 1, "distance2": 2, "angle": "30 deg"})).is_err());
 }
 
+/// Unequal chamfers of a cylinder's circular rims: each cross-section is a right triangle
+/// revolved about the axis (Pappus: area × the path of its centroid).
+#[test]
+fn unequal_chamfers_on_circular_rims() {
+    use std::f64::consts::PI;
+    let ring = |r: [f64; 3], legs: (f64, f64)| 2.0 * PI * (r[0] + r[1] + r[2]) / 3.0 * 0.5 * legs.0 * legs.1;
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 20}));
+    // The measured volume is of the meshed cylinder: compare what each chamfer takes away.
+    let full = volume(&mut s);
+    assert!(rel(full, PI * 100.0 * 20.0) < 1e-3);
+    // Top rim: 2 across the top (the face facing up), 3 down the wall.
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": 2, "distance2": 3}));
+    let top = ring([10.0, 8.0, 10.0], (2.0, 3.0));
+    assert!(rel(full - volume(&mut s), top) < 5e-3, "{} vs {top}", full - volume(&mut s));
+    // Bottom rim: 2 along the bottom at 30° from it (flipped: the wall would be first).
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 0]], "distance": 2, "angle": "30 deg", "flip": true}));
+    let d2 = 2.0 * 30f64.to_radians().tan();
+    let bottom = ring([10.0, 8.0, 10.0], (2.0, d2));
+    assert!(rel(full - volume(&mut s), top + bottom) < 5e-3, "{} vs {}", full - volume(&mut s), top + bottom);
+    // Flipped on the top rim instead: 2 down the wall, 3 across the top (a different solid).
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": 2, "distance2": 3, "flip": true}));
+    let flipped = ring([10.0, 7.0, 10.0], (2.0, 3.0));
+    assert!(rel(full - volume(&mut s), flipped) < 5e-3, "{} vs {flipped}", full - volume(&mut s));
+}
+
 /// An enclosure built in the usual order: shell, bosses, then the lip on the rim.
 #[test]
 fn lip_after_boss() {
@@ -2953,6 +3030,40 @@ fn shell_directions_and_tangent_chain() {
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
     assert!(s.execute("solid.shell", &json!({"faces": [[20, 15, 20]], "thickness": 2, "direction": "sideways"})).is_err());
+}
+
+/// #209: selecting a tangent chain must explain why no shell can remain.
+#[test]
+fn shell_tangent_chain_that_opens_every_face_explains_how_to_keep_walls() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 60}));
+    run(
+        &mut s,
+        "solid.fillet",
+        json!({
+            "edges": [[0,0,30], [40,0,30], [40,30,30], [0,30,30],
+                      [20,0,60], [20,30,60], [0,15,60], [40,15,60],
+                      [20,0,0], [20,30,0], [0,15,0], [40,15,0]],
+            "radius": 1.5
+        }),
+    );
+    let before = s.doc.to_json();
+    for direction in ["inside", "outside", "both"] {
+        let error = s
+            .execute(
+                "solid.shell",
+                &json!({
+                    "faces": [[20,0,30]], "thickness": 2, "tangent_chain": true, "direction": direction
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Tangent Chain") && error.contains("every face") && error.contains("turn off"), "{direction}: {error}");
+        assert_eq!(s.doc.to_json(), before, "a refused shell must preserve the design");
+    }
+    run(&mut s, "solid.shell", json!({"faces": [[20,0,30]], "thickness": 2, "tangent_chain": false}));
+    assert!((volume(&mut s) - 15_305.28).abs() < 0.1);
+    assert_eq!(s.model.state().bodies.len(), 1);
 }
 
 /// Hole To Object (a face it meets, or a point) and holes at every point of a sketch.
@@ -3743,4 +3854,97 @@ fn a_sketch_on_one_piece_stays_attached_when_the_side_joins() {
     assert_eq!(faces(&mut s), 6, "the side is straight now: one face");
     let sketch = run(&mut s, "timeline.inspect", json!({"feature": "Sketch2"}));
     assert!(sketch["error"].is_null() && sketch["warning"].is_null(), "{sketch}");
+}
+
+/// With a taper too, a side drawn in two collinear pieces extrudes into one face (#1788).
+#[test]
+fn a_tapered_side_drawn_in_two_collinear_pieces_is_one_face() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [10, 0], [20, 0], [20, 10], [0, 10], [0, 0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5, "taper": "5 deg"}));
+    let m = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(m["bodies"][0]["kernel"]["faces"], 6, "{m}");
+}
+
+/// #3044: renaming a body of an imported assembly (a part placed twice, so the file has more
+/// solids than the part has bodies) evaluates nothing, not even the file again, and leaves the
+/// model evaluating the renamed design gives; undo does the same.
+#[test]
+fn renaming_an_imported_assembly_body_reads_nothing_again() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-rename-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut a = Session::default();
+    run(&mut a, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Cube"}));
+    run(&mut a, "solid.box", json!({"length": 4, "width": 4, "height": 4, "center": [30, 0, 2], "operation": "new", "body_name": "Pin"}));
+    run(&mut a, "component.from_bodies", json!({"bodies": ["Cube"]}));
+    run(&mut a, "occurrence.copy", json!({"component": "Cube", "translate": [0, 40, 0]}));
+    let p = dir.join("Assembly.step");
+    run(&mut a, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut s = Session::default();
+    run(&mut s, "doc.open", json!({"path": p.to_string_lossy()}));
+    let names = |s: &Session| s.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    let before = names(&s);
+    let body = before.first().cloned().unwrap();
+    s.evaluations = 0;
+    run(&mut s, "body.rename", json!({"body": body, "name": "Renamed"}));
+    assert_eq!(s.evaluations, 0, "a rename evaluates nothing");
+    let after = names(&s);
+    assert_eq!(after.first().map(String::as_str), Some("Renamed"));
+    assert_eq!(after.len(), before.len());
+    let mut fresh = Session::new((*s.doc).clone());
+    fresh.refresh();
+    assert_eq!(names(&fresh), after, "the same names as evaluating the renamed design");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(names(&s), before);
+    assert_eq!(s.evaluations, 0, "nor does its undo");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #3044: on a design with thousands of bodies the cheap commands stay cheap: showing, hiding,
+/// selecting, colouring and renaming a body or a feature, and undoing them, recompute no feature
+/// (renames don't even look over the timeline) and leave every body's display mesh as it was, so
+/// nothing is meshed or uploaded again.
+#[test]
+fn cheap_commands_on_thousands_of_bodies_evaluate_nothing() {
+    let mut s = Session::default();
+    for k in 0..2 {
+        run(
+            &mut s,
+            "solid.box",
+            json!({"length": 4, "width": 4, "height": 4, "center": [0, 6 * k, 2], "operation": "new", "name": format!("Seed{k}")}),
+        );
+        run(
+            &mut s,
+            "solid.pattern.rectangular",
+            json!({"features": [format!("Seed{k}")], "dir1": [1, 0, 0], "count1": 1000, "spacing1": 6, "name": format!("Row{k}")}),
+        );
+    }
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 2000);
+    let meshes = |s: &Session| s.model.state().bodies.iter().map(|b| std::sync::Arc::as_ptr(&b.mesh())).collect::<Vec<_>>();
+    let shown = meshes(&s);
+    s.refresh();
+    for (command, params) in [
+        ("select.set", json!({"items": [{"type": "body", "name": "Body7"}]})),
+        ("browser.visibility", json!({"visible": false, "items": ["Body7"]})),
+        ("browser.visibility", json!({"visible": true, "items": ["Body7"]})),
+        ("appearance.assign", json!({"bodies": ["Body7"], "appearance": "Aluminum - Satin"})),
+        ("body.rename", json!({"body": "Body7", "name": "Renamed"})),
+        ("timeline.rename", json!({"feature": "Row1", "name": "Second row"})),
+        ("edit.undo", json!({})),
+        ("edit.undo", json!({})),
+        ("edit.redo", json!({})),
+    ] {
+        s.evaluations = 0;
+        run(&mut s, command, params);
+        // Renames are followed in the model; the rest may look over the timeline, which then
+        // finds every result as it was.
+        assert_eq!(s.model.last_recomputed, 0, "{command} recomputed a feature");
+        if command.ends_with("rename") {
+            assert_eq!(s.evaluations, 0, "{command} evaluated the design");
+        }
+    }
+    assert_eq!(meshes(&s), shown, "every body keeps its mesh");
 }

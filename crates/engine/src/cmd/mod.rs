@@ -20,8 +20,9 @@ macro_rules! planned {
     };
 }
 
+mod bom;
 mod browser;
-mod clearance;
+pub(crate) mod clearance;
 mod clipboard;
 mod compare;
 mod component;
@@ -34,11 +35,16 @@ mod edit;
 mod face;
 mod features;
 mod features_more;
+pub(crate) use face::{FaceRefForm, face_ref_form};
+pub(crate) use features::profiles as feature_profiles;
+pub(crate) use features::{EdgeRefForm, edge_ref_form, sketch_key};
 pub use features::{auto_operation, extrude_reach};
+pub use sketch_modify::trim_piece;
 mod component_link;
 mod config;
 mod file;
 mod inspect;
+mod interference;
 pub(crate) mod joints;
 mod libraries;
 mod material_properties;
@@ -93,6 +99,7 @@ pub type Run = fn(&mut Session, &Value) -> Result<Value>;
 /// evaluate as usual).
 pub type LiveRun = fn(&mut Session, &Value) -> Result<(Value, Option<crate::LiveEdit>)>;
 pub type Enabled = fn(&Session) -> std::result::Result<(), String>;
+pub type SchemaFn = fn() -> schemars::Schema;
 
 pub struct CommandSpec {
     pub id: &'static str,
@@ -117,6 +124,11 @@ pub struct CommandSpec {
     pub reads_model: bool,
     /// Registered but not built yet (see `planned!`): the GitHub issue number that tracks it.
     pub planned: Option<&'static str>,
+    /// The command's typed parameter contract, which carries its input schema; `None` until
+    /// the command is converted (see `crate::schema`).
+    pub contract: Option<&'static dyn crate::schema::Contract>,
+    /// The JSON Schema of a successful result; `None` until described.
+    pub output: Option<SchemaFn>,
 }
 
 impl CommandSpec {
@@ -135,6 +147,8 @@ impl CommandSpec {
             live: None,
             reads_model: true,
             planned: None,
+            contract: None,
+            output: None,
         }
     }
     /// Not built yet; `issue` tracks building it.
@@ -163,6 +177,16 @@ impl CommandSpec {
     }
     pub const fn key(mut self, k: &'static str) -> Self {
         self.shortcut = Some(k);
+        self
+    }
+    /// The command's typed parameter contract (see `crate::schema`).
+    pub const fn contract(mut self, c: &'static dyn crate::schema::Contract) -> Self {
+        self.contract = Some(c);
+        self
+    }
+    /// The JSON Schema of a successful result.
+    pub const fn output(mut self, f: SchemaFn) -> Self {
+        self.output = Some(f);
         self
     }
     pub const fn params(mut self, p: &'static str) -> Self {
@@ -259,6 +283,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(motion::COMMANDS.iter());
     v.extend(config::COMMANDS.iter());
     v.extend(parts::COMMANDS.iter());
+    v.extend(bom::COMMANDS.iter());
     v.extend(browser::COMMANDS.iter());
     v.extend(delete::COMMANDS.iter());
     v.extend(edit::COMMANDS.iter());
@@ -321,7 +346,7 @@ pub(crate) fn did_you_mean(id: &str) -> String {
 }
 
 /// Levenshtein distance: the single-character edits that turn `a` into `b`.
-fn edit_distance(a: &str, b: &str) -> usize {
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {

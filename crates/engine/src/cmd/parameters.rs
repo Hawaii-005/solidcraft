@@ -12,7 +12,8 @@ use crate::{EngineError, Result, Session};
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("parameters.change", "Change Parameters", change_param).at("SOLID", "MODIFY").icon("params").params(
         "name, expression (number or text), unit?: mm|cm|m|in|ft|deg|rad|\"\" (new parameters default to their value's unit), comment?, \
-             favorite?: bool, new_name?: rename (references follow); or delete: name → recomputed: features rebuilt, \
+             favorite?: bool, new_name?: rename (references follow); or delete: name; or changes: {name: expression, …} (existing \
+         parameters, checked together and rebuilt once, all or nothing) → changed?: {name: value} (with changes), recomputed: features rebuilt, \
          restored: features whose earlier result for the same inputs was reused (e.g. a value set back)",
     ),
     CommandSpec::new("parameters.list", "List Parameters", list).icon("list").noundo().doc_only().params(
@@ -82,6 +83,9 @@ fn known(s: &Session, name: &str) -> bool {
 fn change_param(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "parameters.change";
     let solved = s.solved_sketches();
+    if let Some(changes) = p.get("changes") {
+        return change_many(s, changes, &solved);
+    }
     if let Some(n) = str_(p, "delete") {
         s.doc_mut().remove_param(n.trim())?;
         s.settle_value_edit(&solved)?;
@@ -127,6 +131,26 @@ fn change_param(s: &mut Session, p: &Value) -> Result<Value> {
     out["restored"] = json!(s.model.last_restored);
     out["errors"] = json!(failing(s));
     Ok(out)
+}
+
+/// `parameters.change {changes}`: several existing parameters set at once, so a design is
+/// rebuilt once for all of them instead of once per parameter.
+fn change_many(s: &mut Session, changes: &Value, solved: &crate::SketchValues) -> Result<Value> {
+    let cmd = "parameters.change";
+    let Some(map) = changes.as_object() else { return Err(bad(cmd, "`changes` must be an object of name: expression")) };
+    if map.is_empty() {
+        return Err(bad(cmd, "`changes` is empty"));
+    }
+    let mut list = Vec::with_capacity(map.len());
+    for (name, e) in map {
+        let e = expr_arg(&json!({"e": e}), "e").ok_or_else(|| bad(cmd, format!("`changes.{name}` must be a number or text")))?;
+        list.push((name.trim().to_string(), e));
+    }
+    s.doc_mut().change_params_atomic(&list)?;
+    s.settle_value_edit(solved)?;
+    let (vals, _) = s.doc.param_values();
+    let values: serde_json::Map<String, Value> = list.iter().map(|(n, _)| (n.clone(), json!(vals.get(n).map(|v| v.v)))).collect();
+    Ok(json!({"changed": values, "recomputed": s.model.last_recomputed, "restored": s.model.last_restored, "errors": failing(s)}))
 }
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
@@ -324,11 +348,16 @@ fn complete(s: &mut Session, p: &Value) -> Result<Value> {
     let text = str_(p, "prefix").unwrap_or("");
     // The identifier being typed: trailing letters, digits and underscores.
     let word: String = text.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<Vec<_>>().into_iter().rev().collect();
-    let starts = |n: &str| word.is_empty() || n.to_ascii_lowercase().starts_with(&word.to_ascii_lowercase());
+    let lower = word.to_ascii_lowercase();
+    let starts = |n: &str| word.is_empty() || n.to_ascii_lowercase().starts_with(&lower);
+    // A parameter matches wherever the word appears in its name (`side` finds
+    // `cab_side_thickness`, #2757); functions, constants and units match from the start.
+    let within = |n: &str| word.is_empty() || n.to_ascii_lowercase().contains(&lower);
     let mut out: Vec<Value> = Vec::new();
-    let mut rows: Vec<solidcraft_doc::ParamRow> = s.doc.param_rows().into_iter().filter(|r| starts(&r.name)).collect();
-    // Favourites, then user parameters, then the rest.
-    rows.sort_by_key(|r| (!r.favorite, r.source != "user"));
+    let mut rows: Vec<solidcraft_doc::ParamRow> = s.doc.param_rows().into_iter().filter(|r| within(&r.name)).collect();
+    // Names that start with the word, then the rest; within each, favourites, then user
+    // parameters, then the others.
+    rows.sort_by_key(|r| (!starts(&r.name), !r.favorite, r.source != "user"));
     for r in rows.into_iter().take(200) {
         let v = r.value.map(|v| format!("{v:.4} {}", r.unit).trim().to_string()).unwrap_or_else(|| "error".into());
         let mut detail = format!("{} = {v}", r.expression);

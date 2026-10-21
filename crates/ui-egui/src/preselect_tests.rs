@@ -1,6 +1,7 @@
 //! Pre-selection fills every input of a command, each item going to the input that takes its
 //! type, whether the command starts from a shortcut, the toolbar or a menu.
 
+use crate::test_support::app_with_script as app_with;
 use serde_json::json;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
 use solidcraft_engine::geom::Vec3;
@@ -51,8 +52,8 @@ fn confirming_coplanar_body_faces_uses_one_atomic_extrusion() {
     assert!((volume - 11_968.0).abs() < 1e-5, "{volume}");
 }
 
+use crate::SolveApp;
 use crate::dialogs::{Dialog, Kind, apply_commands};
-use crate::{Services, SolveApp};
 
 #[test]
 fn feature_mirror_and_patterns_reopen_as_feature_replays_even_for_body_creators() {
@@ -127,15 +128,26 @@ fn feature_pattern_controls_preview_without_committing_and_cancel_cleanly() {
     }
 }
 
+#[track_caller]
 fn wait_feature_preview(h: &mut crate::scenario::Harness) {
-    for _ in 0..300 {
+    // A large faceted thread can outlive 300 UI frames on a busy CI host. This checks
+    // completion, not preview speed; use a bounded wall-clock wait for the worker.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
         h.frames(2);
-        if h.app.preview.active && !h.app.preview.busy {
+        if !h.app.preview.busy && (h.app.preview.active || h.app.preview.error.is_some()) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(h.app.preview.active && !h.app.preview.busy, "preview failed: {:?}", h.app.preview.error);
+    assert!(
+        h.app.preview.active && !h.app.preview.busy,
+        "preview failed: active={} busy={} error={:?} dialog={:?}",
+        h.app.preview.active,
+        h.app.preview.busy,
+        h.app.preview.error,
+        h.app.dialog
+    );
     assert!(h.app.preview.error.is_none());
 }
 
@@ -462,12 +474,6 @@ fn cylinder_emboss_edit_retains_second_source_and_author_paths_and_all_profiles(
     assert_eq!(h.app.session.active_component, 0);
 }
 
-fn app_with(script: serde_json::Value) -> SolveApp {
-    let mut s = Session::default();
-    s.run_script(&script).unwrap();
-    SolveApp::new(s, Services::default())
-}
-
 #[test]
 fn cylinder_emboss_profile_guide_uses_target_or_unique_foreign_sketch_frame() {
     for target_owned in [true, false] {
@@ -649,6 +655,54 @@ fn edges_then_fillet_takes_them_with_chains() {
     assert_eq!(d.inputs[0].items.len(), 2, "box edges are not tangent to others");
     let cmds = apply_commands(&app, &d).unwrap();
     assert_eq!(cmds[0].1["edges"].as_array().unwrap().len(), 2);
+
+    // #3370: on a bar with rounded ends and a slot whose wall lies on the seam between the flat
+    // top and the rounded end, picking the slot's sharp top edge must not chain the two smooth
+    // seams that continue it in a straight line.
+    let mut h = crate::scenario::Harness::new();
+    for (cmd, p) in [
+        ("sketch.create", json!({"plane": "YZ", "name": "Stadium"})),
+        ("sketch.line", json!({"points": [[0, -9.5], [25, -9.5]]})),
+        ("sketch.arc.center_point", json!({"center": [25, 0], "start": [25, -9.5], "end": [25, 9.5]})),
+        ("sketch.line", json!({"points": [[25, 9.5], [0, 9.5]]})),
+        ("sketch.arc.center_point", json!({"center": [0, 0], "start": [0, 9.5], "end": [0, -9.5]})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"sketch": "Stadium", "distance": 14})),
+        ("solid.box", json!({"corner": [3.5, -12, -10], "length": 6, "width": 12, "height": 20, "operation": "cut"})),
+    ] {
+        h.app.run(cmd, p).unwrap();
+    }
+    let slot_top = crate::viewport::grouped_selection(&h.app.session, &edge(&h.app, Vec3::new(6.5, 0.0, 9.5)));
+    h.app.session.selection = slot_top.clone();
+    h.app.start("solid.fillet");
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, slot_top, "smooth stadium seams are not chained onto a sharp slot edge");
+
+    // On a rounded slot extrusion, picking one straight top edge chains the 4 tangent top edges;
+    // unticking Tangent Chain leaves only the picked edge, and ticking it again re-chains all 4.
+    let mut h = crate::scenario::Harness::new();
+    for (cmd, p) in [
+        ("sketch.create", json!({"plane":"XY"})),
+        ("sketch.slot.center_to_center", json!({"p0":[-20,0],"p1":[20,0],"width":20})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"distance":10})),
+    ] {
+        h.app.run(cmd, p).unwrap();
+    }
+    let top_line = crate::viewport::grouped_selection(&h.app.session, &edge(&h.app, Vec3::new(0.0, 10.0, 10.0)));
+    h.app.session.selection = top_line.clone();
+    h.app.start("solid.fillet");
+    h.frames(2);
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 4);
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, top_line);
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 4);
+    // Picking while Tangent Chain is off adds only that edge; unpicking with Tangent Chain on removes its chain.
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, top_line);
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    h.app.dialog.as_mut().unwrap().pick(&h.app.session, top_line[0].clone());
+    assert!(h.app.dialog.as_ref().unwrap().inputs[0].items.is_empty());
 }
 
 #[test]
@@ -910,6 +964,43 @@ fn shell_direction_and_tangent_chain_round_trip() {
 }
 
 #[test]
+fn shell_tangent_chain_highlights_and_counts_faces_without_saving_extra_picks() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length":40,"width":30,"height":20})).unwrap();
+    h.app.run("solid.fillet", json!({"edges":[[20,0,20]],"radius":4})).unwrap();
+    let top = face(&h.app, Vec3::new(20.0, 17.0, 20.0));
+    start(&mut h.app, vec![top.clone()], "solid.shell");
+    h.frames(3);
+    let shown = |app: &SolveApp| -> std::collections::BTreeSet<usize> {
+        app.highlighted()
+            .into_iter()
+            .filter_map(|sel| match sel {
+                Sel::Face { index, .. } => Some(index),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(shown(&h.app).len(), 3, "the top, round and front are one tangent chain");
+    assert!(h.widget("3 selected").is_some());
+    let d = h.app.dialog.as_ref().unwrap();
+    assert_eq!(d.inputs[0].items, vec![top.clone()]);
+    assert_eq!(apply_commands(&h.app, d).unwrap()[0].1["faces"].as_array().unwrap().len(), 1);
+
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    h.frames(3);
+    assert_eq!(shown(&h.app).len(), 1);
+    assert!(h.widget("1 selected").is_some());
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, vec![top]);
+
+    h.step(&json!({"click":{"handle":"dialog:Tangent Chain"}})).unwrap();
+    h.frames(3);
+    assert_eq!(shown(&h.app).len(), 3);
+    h.step(&json!({"click":{"handle":"dialog:clear:Faces/Body"}})).unwrap();
+    h.frames(3);
+    assert!(h.app.dialog.as_ref().unwrap().highlighted(&h.app.session).is_empty(), "clear must also clear the expanded highlight");
+}
+
+#[test]
 fn variable_fillet_round_trip() {
     let mut app = boxed();
     let e0 = edge(&app, Vec3::new(40.0, 15.0, 20.0));
@@ -1083,6 +1174,97 @@ fn thread_size_suggestion_can_be_cleared_and_edited_in_the_dialog() {
 }
 
 #[test]
+fn modeled_thread_survives_timeline_double_click_and_ok() {
+    for (analytic_pick, change_length) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.apply_off_thread = Some(std::time::Duration::ZERO);
+        h.app.run("solid.cylinder", json!({"radius":4,"height":4})).unwrap();
+        let smooth_volume = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        let Sel::Face { point, .. } = thread_face(&h.app, "Body1") else { panic!("face") };
+        let point = if analytic_pick { Vec3::new(4.0, 0.0, 2.0) } else { point };
+        let id = h.app.run("solid.thread", json!({"face":point,"designation":"M8x1","modeled":true})).unwrap()["feature"].as_u64().unwrap();
+        let threaded_volume = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        assert!(smooth_volume - threaded_volume > 1.0);
+        h.frames(4);
+        h.step(&json!({"click":{"handle":"timeline:Thread1"},"double":true})).unwrap();
+        h.frames(4);
+        assert_eq!(h.app.dialog.as_ref().unwrap().extra["modeled"], true);
+        assert_eq!(h.app.dialog.as_ref().unwrap().editing, Some((id, None)));
+        assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 1, "the cylinder stays selected");
+        if change_length {
+            h.step(&json!({"click":{"handle":"dialog:Full Length"}})).unwrap();
+            h.step(&json!({"click":{"handle":"dialog:Length"}})).unwrap();
+            h.step(&json!({"key":"A","cmd":true})).unwrap();
+            h.step(&json!({"text":"2 mm"})).unwrap();
+        }
+        if h.app.dialog.as_ref().unwrap().previews() {
+            wait_feature_preview(&mut h);
+            assert_eq!(h.app.preview.replaced, ["Body1"]);
+        }
+        h.step(&json!({"widget":"OK"})).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while h.app.applying.is_some() && std::time::Instant::now() < deadline {
+            h.frames(1);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        h.frames(4);
+        assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog);
+        assert!(h.app.applying.is_none() && !h.app.preview.active && h.app.preview.replaced.is_empty());
+        assert_eq!(h.app.session.doc.marker, None);
+        assert!(matches!(h.app.session.doc.feature(id).unwrap().kind, solidcraft_engine::doc::FeatureKind::Thread { modeled: true, .. }));
+        let result = h.app.session.model.result(id).unwrap();
+        assert!(!result.skipped && result.error.is_none(), "{result:?}");
+        let edited_volume = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        assert!(smooth_volume - edited_volume > 1.0, "the modeled cut disappeared: {smooth_volume} -> {edited_volume}");
+        if change_length {
+            assert!(edited_volume - threaded_volume > 1.0, "shortening the thread restores some material");
+        } else {
+            assert!((edited_volume - threaded_volume).abs() < 1e-6);
+        }
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(h.app.session.doc.marker, None);
+        let restored = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        assert!((restored - threaded_volume).abs() < 1e-6, "one undo restores the original modeled thread");
+    }
+}
+
+#[test]
+fn planar_face_reopen_keeps_the_tight_pick_tolerance() {
+    for (command, mut params, point) in [
+        ("solid.box", json!({"length":100,"width":100,"height":100}), Vec3::new(50.0, 50.0, 100.0)),
+        ("solid.cylinder", json!({"radius":50,"height":100}), Vec3::new(0.0, 0.0, 100.0)),
+    ] {
+        let mut h = crate::scenario::Harness::new();
+        let base = h.app.run(command, params.clone()).unwrap()["feature"].clone();
+        let feature = h.app.run("solid.offset_face", json!({"faces":[point],"distance":2})).unwrap()["feature"].as_u64().unwrap();
+        h.app.edit_feature(feature);
+        assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 1, "an unchanged planar pick reopens");
+        crate::dialogs::cancel(&mut h.app);
+
+        // Move the upstream face away from its saved pick, but by less than the body's
+        // display tolerance. The cylinder case also checks planar caps on curved bodies.
+        params["height"] = json!(99.99);
+        h.app.run("timeline.redefine", json!({"feature":base,"command":command,"params":params})).unwrap();
+        h.app.edit_feature(feature);
+        assert!(h.app.session.world_state().body("Body1").unwrap().display_tol() > 0.01);
+        assert!(crate::dialogs::face_sel(&h.app.session, point - Vec3::Z * 0.01).is_some());
+        assert!(h.app.dialog.as_ref().unwrap().inputs[0].items.is_empty(), "{command}: a stale planar pick must stay empty");
+    }
+}
+
+#[test]
+fn curved_face_refill_keeps_its_pick_but_rejects_points_outside_the_mesh_tolerance() {
+    let mut app = app_with(json!([]));
+    app.run("solid.cylinder", json!({"radius":4,"height":4})).unwrap();
+    let point = Vec3::new(4.0, 0.0, 2.0);
+    let pick = crate::dialogs::face_sel(&app.session, point).unwrap();
+    assert!(matches!(pick, Sel::Face { point: kept, .. } if kept == point));
+    assert!(crate::dialogs::face_sel(&app.session, Vec3::new(4.1, 0.0, 2.0)).is_none());
+    assert!(crate::dialogs::face_sel(&app.session, Vec3::new(f64::NAN, 0.0, 2.0)).is_none());
+}
+
+#[test]
 fn thread_choices_apply_a_fine_pitch_and_partial_modelled_thread() {
     let mut h = crate::scenario::Harness::new();
     h.app.run("solid.cylinder", json!({"radius":4,"height":10})).unwrap();
@@ -1172,11 +1354,84 @@ fn thread_choices_can_start_without_a_face_and_recover_from_invalid_text() {
     h.step(&json!({"text":"Munknown"})).unwrap();
     h.frames(2);
     assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation == "Munknown"));
-    for handle in ["dialog:Size", "dialog:Size:8 mm"] {
-        h.step(&json!({"click":{"handle":handle}})).unwrap();
-    }
+    h.step(&json!({"click":{"handle":"dialog:Size"}})).unwrap();
+    // Plex's taller rows put 8 mm below the first page of this long popup. Scroll the
+    // visible list before clicking its choice, as a person would, rather than a clipped handle.
+    let first = crate::scenario::handle_at("dialog:Size:1.6 mm").unwrap();
+    h.call("ui.scroll", json!({"x":first.x,"y":first.y,"delta":-60}));
+    h.frames(12);
+    h.step(&json!({"click":{"handle":"dialog:Size:8 mm"}})).unwrap();
     assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Thread { designation, .. } if designation == "M8x1.25"));
     assert!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).is_err(), "a face is still required");
+}
+
+#[test]
+fn modelled_thread_preview_updates_reports_errors_and_cancels_without_changes() {
+    fn designation(h: &mut crate::scenario::Harness, text: &str) {
+        h.step(&json!({"click":{"handle":"dialog:thread_size"}})).unwrap();
+        h.step(&json!({"key":"A","cmd":true})).unwrap();
+        h.step(&json!({"text":text})).unwrap();
+    }
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.cylinder", json!({"radius":4,"height":2})).unwrap();
+    let saved = h.app.session.doc.to_json();
+    let undo = h.app.session.undo.len();
+    h.app.session.selection = vec![thread_face(&h.app, "Body1")];
+    h.step(&json!({"start":"solid.thread"})).unwrap();
+    designation(&mut h, "M8x1");
+    h.step(&json!({"click":{"handle":"dialog:Modeled"}})).unwrap();
+    assert_eq!(h.app.dialog.as_ref().unwrap().extra.get("modeled"), Some(&json!(true)), "{:?}", h.app.dialog);
+    assert!(crate::dialogs::preview_commands(&h.app, h.app.dialog.as_ref().unwrap()).is_ok(), "{:?}", h.app.dialog);
+    wait_feature_preview(&mut h);
+    assert_eq!(h.app.preview.replaced, ["Body1"]);
+    let first_key = h.app.preview.key;
+    designation(&mut h, "M8x1.3");
+    wait_feature_preview(&mut h);
+    assert_ne!(h.app.preview.key, first_key, "changing pitch updates the preview before OK");
+    // An 8 mm shaft is turned down for an M6.
+    let m8_key = h.app.preview.key;
+    designation(&mut h, "M6x1.3");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while h.app.preview.key == m8_key && std::time::Instant::now() < deadline {
+        h.frames(2);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    wait_feature_preview(&mut h);
+    assert!(h.app.preview.error.is_none(), "{:?}", h.app.preview.error);
+    assert_eq!(h.app.preview.replaced, ["Body1"]);
+    // A shaft thinner than the thread is still refused.
+    designation(&mut h, "M10x1.5");
+    for _ in 0..500 {
+        h.frames(2);
+        if !h.app.preview.busy && h.app.preview.error.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(h.app.preview.error.as_deref().is_some_and(|e| e.contains("does not fit")), "{:?}", h.app.preview.error);
+    designation(&mut h, "M8x1.3");
+    // The M10 error stays until the new preview starts; wait for it to go, or
+    // `wait_feature_preview` would stop at the stale error on a host that schedules the
+    // preview a few frames later.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while h.app.preview.error.is_some() && std::time::Instant::now() < deadline {
+        h.frames(2);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    wait_feature_preview(&mut h);
+    assert!(h.app.preview.error.is_none());
+    assert_eq!(h.app.session.doc.to_json(), saved);
+    assert_eq!(h.app.session.undo.len(), undo);
+    h.step(&json!({"click":{"handle":"dialog:Modeled"}})).unwrap();
+    h.frames(2);
+    assert!(!h.app.preview.active && h.app.preview.replaced.is_empty(), "cosmetic threads leave the original body visible");
+    h.step(&json!({"click":{"handle":"dialog:Modeled"}})).unwrap();
+    wait_feature_preview(&mut h);
+    h.step(&json!({"key":"Escape"})).unwrap();
+    h.frames(2);
+    assert!(h.app.dialog.is_none() && !h.app.preview.active && h.app.preview.replaced.is_empty());
+    assert_eq!(h.app.session.doc.to_json(), saved);
+    assert_eq!(h.app.session.undo.len(), undo);
 }
 
 #[test]
@@ -1214,7 +1469,7 @@ fn boundary_fill_finds_the_cells_and_fills_the_ticked_ones() {
     d.inputs[0].items = vec![Sel::Body { name: "Body1".into() }, Sel::Body { name: "Body2".into() }];
     app.dialog = Some(d);
     // The dialog finds the cells on its next frame.
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     ctx.run_ui(Default::default(), |ui| crate::dialogs::show(&mut app, ui.ctx())).textures_delta.clear();
     let mut d = app.dialog.take().unwrap();
     let Kind::BoundaryFill { cells, .. } = &mut d.kind else { panic!() };
@@ -1243,6 +1498,32 @@ fn align_snaps_to_centres_and_edge_middles() {
     let p = apply_commands(&app, &d).unwrap().remove(0).1;
     assert_eq!(p["from"]["snap"], json!("face_center"));
     assert_eq!(p["to"]["snap"], json!("edge_mid"));
+}
+
+/// The Align dialog takes a plane (viewport or browser click) and the origin plane stays a plane
+/// in the command, so the bodies follow it when it moves.
+#[test]
+fn align_accepts_a_plane_click() {
+    let mut app = boxed();
+    let mut d = start(&mut app, vec![], "solid.align");
+    d.inputs[0].items = vec![Sel::Body { name: "Body1".into() }];
+    d.inputs[1].items = vec![face(&app, Vec3::new(20.0, 15.0, 0.0))];
+    let plane = crate::viewport::Hit::Plane { name: "XZ".into(), point: Vec3::ZERO };
+    d.active = 2;
+    let sel = d.candidate(&app.session, &plane);
+    assert_eq!(sel, Some(Sel::Plane { name: "XZ".into() }), "the To input takes a plane");
+    d.pick(&app.session, sel.unwrap());
+    let p = apply_commands(&app, &d).unwrap().remove(0).1;
+    assert_eq!(p["to_plane"], json!("XZ"));
+    assert!(p.get("to").is_none() && p["from_face"].is_array());
+    // The origin point is a From/To too.
+    let origin = crate::viewport::Hit::Vertex { body: String::new(), point: Vec3::ZERO };
+    let sel = d.candidate(&app.session, &origin);
+    assert!(sel.is_some(), "the To input takes the origin point");
+    d.inputs[2].items.clear();
+    d.pick(&app.session, sel.unwrap());
+    let p = apply_commands(&app, &d).unwrap().remove(0).1;
+    assert_eq!(p["to"], json!("origin"));
 }
 
 #[test]
@@ -1451,6 +1732,59 @@ fn ruled_surface_dialog_takes_edges_a_face_and_a_direction() {
     // Edit Feature runs the command's parameters as an edit of the feature.
     let (_, p) = apply_commands(&app, &back).unwrap().remove(0);
     assert_eq!((&p["params"]["mode"], &p["params"]["direction"]), (&json!("direction"), &json!([0.0, 0.0, 1.0])), "{p}");
+}
+
+#[test]
+fn trim_dialog_takes_curves_several_keep_points_and_another_surface() {
+    // Two 20 × 10 sheets crossing at x = 0 / z = 0 and a sketch line x = 3 on XY.
+    let mut app = app_with(json!([
+        {"command": "sketch.create", "params": {"plane": "XY", "name": "F"}},
+        {"command": "sketch.rectangle.two_point", "params": {"p0": [-10, 0], "p1": [10, 10]}},
+        {"command": "sketch.finish", "params": {}},
+        {"command": "surface.patch", "params": {"sketch": "F", "body_name": "Floor"}},
+        {"command": "sketch.create", "params": {"plane": "YZ", "name": "W"}},
+        {"command": "sketch.rectangle.two_point", "params": {"p0": [0, -10], "p1": [10, 10]}},
+        {"command": "sketch.finish", "params": {}},
+        {"command": "surface.patch", "params": {"sketch": "W", "body_name": "Wall"}},
+        {"command": "sketch.create", "params": {"plane": "XY", "name": "Cut"}},
+        {"command": "sketch.line", "params": {"points": [[3, -5], [3, 15]], "ids": ["c1"]}},
+        {"command": "sketch.finish", "params": {}}
+    ]));
+    let face = |body: &str, p: [f64; 3]| Sel::Face { body: body.into(), index: 0, point: Vec3::new(p[0], p[1], p[2]) };
+    let mut d = start(&mut app, vec![], "surface.trim");
+    assert_eq!(d.inputs.len(), 5);
+    d.inputs[0].items = vec![Sel::Body { name: "Floor".into() }];
+    d.inputs[1].items = vec![Sel::SketchCurve { id: "c1".into() }];
+    // Two places on the one face both count (a face pick would toggle the face off).
+    d.inputs[2].toggle(vec![face("Floor", [1.0, 5.0, 0.0])]);
+    d.inputs[2].toggle(vec![face("Floor", [-5.0, 5.0, 0.0])]);
+    assert_eq!(d.inputs[2].items.len(), 2);
+    let (id, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!(p["curves"]["curves"], json!(["c1"]), "{p}");
+    assert_eq!(p["keep"], json!([[1.0, 5.0, 0.0], [-5.0, 5.0, 0.0]]), "{p}");
+    app.session.execute(&id, &p).unwrap();
+    let area = |app: &SolveApp, n: &str| app.session.world_state().body(n).unwrap().mesh().measure().area;
+    assert!((area(&app, "Floor") - 130.0).abs() < 1e-6, "{}", area(&app, "Floor"));
+    app.session.execute("edit.undo", &json!({})).unwrap();
+    // Mutual: the other surface replaces the tool; stitched into an L.
+    d.inputs[1].items.clear();
+    d.inputs[2].items = vec![face("Floor", [5.0, 5.0, 0.0])];
+    d.inputs[3].items = vec![Sel::Body { name: "Wall".into() }];
+    assert!(apply_commands(&app, &d).is_err(), "nothing kept of the wall yet");
+    d.inputs[4].items = vec![face("Wall", [0.0, 5.0, 5.0])];
+    if let Kind::Surface(crate::dialogs_surface::Surf::Trim { stitch, .. }) = &mut d.kind {
+        *stitch = true;
+    }
+    let (id, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!((&p["with"], &p["keep_with"], &p["stitch"]), (&json!("Wall"), &json!([0.0, 5.0, 5.0]), &json!(true)), "{p}");
+    assert!(p.get("extend").is_none() && p.get("plane").is_none(), "{p}");
+    app.session.execute(&id, &p).unwrap();
+    assert!((area(&app, "Floor") - 200.0).abs() < 1e-6 && app.session.world_state().body("Wall").is_none());
+    let fid = app.session.doc.features.last().unwrap().id;
+    let back = crate::dialogs::for_feature(&app, fid, None).unwrap();
+    assert!(matches!(back.kind, Kind::Surface(crate::dialogs_surface::Surf::Trim { stitch: true, extend: false, direction: None })));
+    let counts: Vec<usize> = back.inputs.iter().map(|i| i.items.len()).collect();
+    assert_eq!(counts, [1, 0, 1, 1, 1]);
 }
 
 #[test]
@@ -1742,6 +2076,37 @@ fn every_construct_tool_opens_a_dialog_instead_of_failing() {
     }
 }
 
+/// #2167: Delete Face asks for its faces instead of failing with "`faces` must be a list of
+/// points or face names". Started with nothing selected it opens a dialog; with a face picked
+/// first it takes that face, and OK takes the fillet off.
+#[test]
+fn delete_face_asks_for_faces_and_takes_the_preselected_one() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length":40,"width":30,"height":20,"body_name":"B"})).unwrap();
+    h.app.run("solid.fillet", json!({"edges":[[40,15,20]],"radius":5})).unwrap();
+    let volume = |h: &crate::scenario::Harness| h.app.session.world_state().body("B").unwrap().mesh().measure().volume;
+    let filleted = volume(&h);
+
+    h.app.session.selection.clear();
+    h.app.start("face.delete");
+    h.frames(1);
+    let status = h.app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+    assert!(!status.contains("must be a list"), "{status}");
+    assert!(h.app.dialog.as_ref().is_some_and(|d| !d.inputs.is_empty()), "Delete Face opens a dialog that asks for faces");
+    crate::dialogs::cancel(&mut h.app);
+
+    // A point on the fillet's surface, 45 degrees round from its axis (35, y, 15).
+    let r = 5.0 * std::f64::consts::FRAC_1_SQRT_2;
+    let point = Vec3::new(35.0 + r, 15.0, 15.0 + r);
+    h.app.session.selection = vec![crate::dialogs::face_sel(&h.app.session, point).expect("the fillet face")];
+    h.app.start("face.delete");
+    h.frames(1);
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 1, "the selected face fills the input");
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    assert!(volume(&h) > filleted + 1.0, "the rounded edge is square again");
+}
+
 /// #2494: two planes selected first, Axis Through Two Planes takes both and makes the axis
 /// where they meet.
 #[test]
@@ -1787,4 +2152,99 @@ fn point_along_path_has_its_position_and_missing_picks_are_named() {
     h.step(&json!({"key":"Enter"})).unwrap();
     let e = h.app.dialog.as_ref().and_then(|d| d.error.clone()).unwrap_or_default();
     assert!(e.contains("path"), "{e}");
+}
+
+/// #3001: Convert Mesh opens a dialog instead of failing with "select a mesh body". With the
+/// mesh selected first it takes it, and OK rebuilds it as faces.
+#[test]
+fn convert_mesh_asks_for_the_body_and_converts_the_selected_one() {
+    use solidcraft_engine::doc::{Document, FeatureKind, MeshData};
+    let body = solidcraft_engine::kernel::box_solid(Vec3::ZERO, Vec3::new(10., 20., 30.)).unwrap();
+    let mesh = body.tessellate(0.01).unwrap();
+    let mut doc = Document::default();
+    doc.add_feature(
+        FeatureKind::MeshImport {
+            file: "box.stl".into(),
+            meshes: vec![MeshData {
+                name: "Mesh".into(),
+                positions: mesh.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
+                triangles: mesh.triangles.iter().flatten().copied().collect(),
+                color: None,
+            }],
+        },
+        Some("Imported mesh"),
+    )
+    .unwrap();
+    let mut h = crate::scenario::Harness::new();
+    h.app.session = Session::new(doc);
+    h.app.start("mesh.convert");
+    h.frames(1);
+    let status = h.app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+    assert!(!status.contains("select a mesh body"), "{status}");
+    assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(Kind::MeshConvert { .. })));
+    crate::dialogs::cancel(&mut h.app);
+
+    h.app.session.selection = vec![Sel::Body { name: "Mesh".into() }];
+    h.app.start("mesh.convert");
+    h.frames(1);
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, vec![Sel::Body { name: "Mesh".into() }]);
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    let state = h.app.session.model.state();
+    assert!(!state.body("Mesh").unwrap().body.is_mesh(), "rebuilt as faces");
+}
+
+/// #3745: hovering a large body never waits for its pick index. A long modelled thread's mesh
+/// has a quarter of a million triangles and its index took a third of a second to make, on the
+/// first hover, in the frame. Now the index is made on a worker and the first hovers scan the
+/// mesh: the first hover takes a small part of what making the index takes, and still finds
+/// the face under the pointer.
+#[test]
+fn hovering_a_large_body_does_not_wait_for_its_pick_index() {
+    // A closed ball of 300 000 triangles, inserted as a mesh body.
+    let (rings, segments) = (500usize, 300usize);
+    let at = |i: usize, j: usize| {
+        let (theta, phi) = (std::f64::consts::PI * i as f64 / rings as f64, std::f64::consts::TAU * j as f64 / segments as f64);
+        [20.0 * theta.sin() * phi.cos(), 20.0 * theta.sin() * phi.sin(), 20.0 * theta.cos()]
+    };
+    let mut stl = vec![0u8; 80];
+    let mut tris: Vec<[[f64; 3]; 3]> = Vec::new();
+    for i in 0..rings {
+        for j in 0..segments {
+            let (a, b, c, d) = (at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
+            if i > 0 {
+                tris.push([a, b, d]);
+            }
+            if i + 1 < rings {
+                tris.push([b, c, d]);
+            }
+        }
+    }
+    stl.extend((tris.len() as u32).to_le_bytes());
+    for t in &tris {
+        stl.extend([0u8; 12]);
+        for p in t {
+            for c in p {
+                stl.extend((*c as f32).to_le_bytes());
+            }
+        }
+        stl.extend([0u8; 2]);
+    }
+    let mut h = crate::scenario::Harness::new();
+    let path = h.dir.join("ball.stl");
+    std::fs::write(&path, stl).unwrap();
+    h.app.run("file.insert_mesh", json!({"path": path.to_string_lossy()})).unwrap();
+    let mesh = h.app.session.world_state().bodies[0].mesh();
+    assert!(mesh.triangles.len() > 250_000, "{}", mesh.triangles.len());
+    let t = std::time::Instant::now();
+    let _ = solidcraft_engine::geom::MeshIndex::new(&mesh);
+    let index_ms = t.elapsed().as_secs_f64() * 1000.0;
+    h.app.fit_view();
+    h.frames(3);
+    let at = h.at(&json!({"world": [0.0, -20.0, 0.0]})).unwrap();
+    let t = std::time::Instant::now();
+    h.step(&json!({"move": at})).unwrap();
+    let hover_ms = t.elapsed().as_secs_f64() * 1000.0;
+    assert!(matches!(h.app.viewport.hover, Some(crate::viewport::Hit::Face { .. })), "{:?}", h.app.viewport.hover);
+    assert!(hover_ms < index_ms / 3.0, "the first hover took {hover_ms:.1} ms; making the index takes {index_ms:.1} ms");
 }

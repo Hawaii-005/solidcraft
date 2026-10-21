@@ -20,7 +20,7 @@ Keys handled by the window itself:
 
 | Key | Action |
 |---|---|
-| S | the S box: search every command at the cursor |
+| S | command search under the ribbon search field |
 | V | show or hide the selected bodies, sketches and planes |
 | F2 | rename the selected browser or timeline item |
 | F6 | fit the view to the model |
@@ -50,3 +50,15 @@ With the **Touchpad** navigation preset, hold **Shift** while moving the pointer
 **Alt/Option** to orbit, without pressing a mouse button. Vertical scrolling zooms. These
 viewport gestures are separate from rebindable command shortcuts; mouse-button selection
 and editing keep their existing modifiers.
+
+### Sketch modifiers
+
+While drawing or dragging a sketch point:
+
+| Keys | Action |
+|---|---|
+| Ctrl/Cmd or Alt/Option (default) | suppress auto-snap for that gesture |
+| Shift | prefer a line midpoint when targeting |
+
+Change the snap-suppress chord in Preferences › Sketch. Selection still uses Shift and
+Ctrl/Cmd to add or toggle (Preferences › Selection can make Shift add-only).
