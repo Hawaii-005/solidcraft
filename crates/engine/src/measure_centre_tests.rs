@@ -75,6 +75,64 @@ fn measure(s: &mut Session, items: Vec<Value>) -> Value {
 }
 
 #[test]
+fn connected_lines_measure_the_corner_regardless_of_endpoint_or_selection_order() {
+    // cos(angle) = -3/5: the corner is 126.869898°, not its 53.130102° supplement.
+    for (end, want) in
+        [([-24.0, 32.0], (-0.6f64).acos().to_degrees()), ([24.0, 32.0], 0.6f64.acos().to_degrees()), ([0.0, 40.0], 90.0), ([-40.0, 0.0], 180.0)]
+    {
+        for reverse_a in [false, true] {
+            for reverse_b in [false, true] {
+                let mut s = Session::default();
+                run(&mut s, "sketch.create", json!({"plane": "XY"}));
+                let mut a = [[0.0, 0.0], [40.0, 0.0]];
+                let mut b = [[0.0, 0.0], end];
+                if reverse_a {
+                    a.reverse();
+                }
+                if reverse_b {
+                    b.reverse();
+                }
+                run(&mut s, "sketch.line", json!({"points": a}));
+                run(&mut s, "sketch.line", json!({"points": b}));
+                let (a, b) = (json!({"type": "sketch_curve", "id": "l1"}), json!({"type": "sketch_curve", "id": "l2"}));
+                for items in [vec![a.clone(), b.clone()], vec![b, a]] {
+                    let r = measure(&mut s, items);
+                    assert!(close(&r["angle_deg"], want, 1e-8), "{reverse_a} {reverse_b}: {r}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn solid_edges_measure_the_obtuse_corner() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.line", json!({"points": [[40, 0], [0, 0], [-24, 32]], "closed": true}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10}));
+    let a = edge(&s, |p| p.z.abs() < 1e-8 && p.y.abs() < 1e-8);
+    let b = edge(&s, |p| p.z.abs() < 1e-8 && (4.0 * p.x + 3.0 * p.y).abs() < 1e-8);
+    for items in [vec![a.clone(), b.clone()], vec![b, a]] {
+        let r = measure(&mut s, items);
+        assert!(close(&r["angle_deg"], (-0.6f64).acos().to_degrees(), 1e-8), "{r}");
+    }
+}
+
+#[test]
+fn separate_and_duplicate_lines_keep_the_undirected_angle() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [40, 0]]}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 10], [-24, 42]]}));
+    let (a, b) = (json!({"type": "sketch_curve", "id": "l1"}), json!({"type": "sketch_curve", "id": "l2"}));
+    let r = measure(&mut s, vec![a.clone(), b]);
+    assert!(close(&r["angle_deg"], 0.6f64.acos().to_degrees(), 1e-8), "{r}");
+    let r = measure(&mut s, vec![a.clone(), a]);
+    assert!(close(&r["angle_deg"], 0.0, 1e-8), "{r}");
+}
+
+#[test]
 fn two_holes_measure_centre_to_centre_with_min_and_max() {
     let mut s = Session::default();
     plate(&mut s);
@@ -327,4 +385,146 @@ fn combine_cut_volume_does_not_depend_on_placement() {
     for (by, v) in moved {
         assert!((v - here).abs() <= 1e-6 * here, "after a move by {by:?}: {v} vs {here} at the origin");
     }
+}
+
+#[test]
+fn box_faces_measure_by_point_only() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 20, "body_name": "Box"}));
+    for (point, area) in [([5.0, 5.0, 20.0], 100.0), ([10.0, 5.0, 10.0], 200.0)] {
+        let pick = json!({"type": "face", "body": "Box", "point": point});
+        let r = measure(&mut s, vec![pick.clone()]);
+        assert!(close(&r["items"][0]["area_mm2"], area, 1e-9), "{r}");
+        let index = solidcraft_doc::appearance::face_index_at(s.model.state().body("Box").unwrap(), Vec3::from(point)).unwrap();
+        let mut indexed = pick.clone();
+        indexed["index"] = json!(index);
+        assert_eq!(measure(&mut s, vec![indexed.clone()]), r);
+        assert_eq!(measure(&mut s, vec![pick, indexed]), r);
+    }
+    for pick in [
+        json!({"type": "face", "body": "Missing", "point": [5, 5, 20]}),
+        json!({"type": "face", "body": "Box", "point": [100, 100, 100]}),
+        json!({"type": "face", "body": "Box"}),
+    ] {
+        assert!(s.execute("inspect.measure", &json!({"items": [pick]})).is_err());
+    }
+}
+
+#[test]
+fn box_edges_measure_by_point_only() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 15, "height": 20, "body_name": "Box"}));
+    for (point, length) in [([5, 0, 0], 10.0), ([10, 15, 10], 20.0)] {
+        let pick = json!({"type": "edge", "body": "Box", "point": point});
+        let r = measure(&mut s, vec![pick]);
+        assert!(close(&r["items"][0]["length_mm"], length, 1e-9), "{r}");
+    }
+    for pick in [json!({"type": "edge", "body": "Missing", "point": [5, 0, 0]}), json!({"type": "edge", "body": "Box", "point": [100, 100, 100]})] {
+        assert!(s.execute("inspect.measure", &json!({"items": [pick]})).is_err());
+    }
+}
+
+fn open_revolve(s: &mut Session) {
+    run(s, "sketch.create", json!({"plane": "XY", "name": "Profile"}));
+    run(s, "sketch.line", json!({"points": [[30, 0], [30, 40]], "ids": ["side"]}));
+    run(s, "sketch.finish", json!({}));
+    run(s, "surface.revolve", json!({"sketch": "Profile", "curves": ["side"], "axis": "y", "angle": "270 deg", "body_name": "OpenTube"}));
+}
+
+#[test]
+fn open_surface_measurements_have_no_volume_properties() {
+    let mut s = Session::default();
+    open_revolve(&mut s);
+    let r = run(&mut s, "inspect.measure", json!({"bodies": ["OpenTube"]}));
+    let b = &r["bodies"][0];
+    assert_eq!(b["closed"], false);
+    for key in ["volume_mm3", "center_of_mass", "density_g_cm3", "mass_g"] {
+        assert!(b[key].is_null(), "{key}: {b}");
+    }
+    assert!(b["area_mm2"].as_f64().unwrap() > 0.0);
+    assert!(b["bbox"].is_object() && b["faces"].as_u64().unwrap() > 0);
+    assert_eq!(r["total"]["open_bodies_skipped"], 1);
+    assert_eq!(r["total"]["volume_mm3"], 0.0);
+    assert_eq!(r["total"]["mass_g"], 0.0);
+    let document = run(&mut s, "document.inspect", json!({"measure": true}));
+    assert_eq!(document["bodies"][0]["closed"], false);
+    assert!(document["bodies"][0]["center_of_mass"].is_null());
+    let picked = run(&mut s, "inspect.measure", json!({"items": [{"type": "body", "name": "OpenTube"}]}));
+    assert_eq!(picked["items"][0]["closed"], false);
+    assert!(picked["items"][0]["volume_mm3"].is_null());
+    let props = run(&mut s, "component.properties", json!({"component": "root"}));
+    assert_eq!(props["total"]["open_bodies_skipped"], 1);
+    assert!(props["bodies"][0]["mass_g"].is_null());
+    assert!(props["total"]["center_of_mass"].is_null());
+}
+
+#[test]
+fn volume_totals_skip_open_surfaces_and_keep_closed_box_properties() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30, "body_name": "Box"}));
+    let before = run(&mut s, "inspect.measure", json!({}));
+    let b = &before["bodies"][0];
+    assert_eq!(b["closed"], true);
+    assert!(close(&b["volume_mm3"], 6000.0, 1e-9));
+    assert!(close(&b["mass_g"], 6.0 * s.doc.density("Box"), 1e-9));
+    for (axis, expected) in [5.0, 10.0, 15.0].into_iter().enumerate() {
+        assert!(close(&b["center_of_mass"][axis], expected, 1e-9));
+    }
+    let props_before = run(&mut s, "component.properties", json!({"component": "root"}));
+    open_revolve(&mut s);
+    let after = run(&mut s, "inspect.measure", json!({}));
+    assert_eq!(after["body_count"], 2);
+    assert_eq!(after["total"]["open_bodies_skipped"], 1);
+    for key in ["volume_mm3", "mass_g"] {
+        assert_eq!(before["total"][key], after["total"][key]);
+    }
+    assert!(after["total"]["area_mm2"].as_f64().unwrap() > before["total"]["area_mm2"].as_f64().unwrap());
+    let props_after = run(&mut s, "component.properties", json!({"component": "root"}));
+    assert_eq!(props_after["total"]["open_bodies_skipped"], 1);
+    for key in ["volume_mm3", "mass_g", "center_of_mass"] {
+        assert_eq!(props_before["total"][key], props_after["total"][key]);
+    }
+}
+
+/// An ASCII STL of the tetrahedron (0,0,0), (10,0,0), (0,10,0), (0,0,10), outward facing; `open`
+/// leaves its slanted face out.
+fn tetra_stl(open: bool) -> String {
+    let faces: &[[[i32; 3]; 3]] = &[
+        [[0, 0, 0], [0, 10, 0], [10, 0, 0]],
+        [[0, 0, 0], [10, 0, 0], [0, 0, 10]],
+        [[0, 0, 0], [0, 0, 10], [0, 10, 0]],
+        [[10, 0, 0], [0, 10, 0], [0, 0, 10]],
+    ];
+    let mut stl = String::from("solid t\n");
+    for f in &faces[..if open { 3 } else { 4 }] {
+        stl += "facet normal 0 0 0\nouter loop\n";
+        for [x, y, z] in f {
+            stl += &format!("vertex {x} {y} {z}\n");
+        }
+        stl += "endloop\nendfacet\n";
+    }
+    stl + "endsolid t\n"
+}
+
+#[test]
+fn a_watertight_mesh_keeps_its_volume_and_an_open_mesh_has_none() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-measure-open-mesh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::default();
+    for (name, open) in [("Closed", false), ("Open", true)] {
+        let path = dir.join(format!("{name}.stl"));
+        std::fs::write(&path, tetra_stl(open)).unwrap();
+        run(&mut s, "file.insert_mesh", json!({"path": path.to_string_lossy()}));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let r = run(&mut s, "inspect.measure", json!({}));
+    let bodies = r["bodies"].as_array().unwrap();
+    let by = |n: &str| bodies.iter().find(|b| b["name"] == n).unwrap_or_else(|| panic!("{n}: {r}"));
+    assert_eq!(by("Closed")["closed"], true);
+    assert!(close(&by("Closed")["volume_mm3"], 1000.0 / 6.0, 1e-6), "{r}");
+    assert_eq!(by("Open")["closed"], false);
+    assert!(by("Open")["volume_mm3"].is_null() && by("Open")["mass_g"].is_null(), "{r}");
+    assert_eq!(r["total"]["open_bodies_skipped"], 1);
+    assert!(close(&r["total"]["volume_mm3"], 1000.0 / 6.0, 1e-6), "{r}");
 }

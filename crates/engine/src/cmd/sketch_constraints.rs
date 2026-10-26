@@ -126,8 +126,8 @@ fn try_add(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, k: ConstraintKin
     let saved = sk.clone();
     let param = if dim {
         let v = k.value()?;
-        let e = if k.is_angle() { format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6) } else { format!("{} mm", (v * 1e6).round() / 1e6) };
-        Some(doc.new_model_param(&e, if k.is_angle() { "deg" } else { "mm" }))
+        let (unit, e) = if k.is_angle() { ("deg".into(), format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6)) } else { doc.design_length(v) };
+        Some(doc.new_model_param(&e, &unit))
     } else {
         None
     };
@@ -218,13 +218,13 @@ fn run_auto(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, p: &Value, datu
         }
     }
     if dims {
+        // Construction curves have degrees of freedom too: locating a circle's centre
+        // does not constrain its radius. Dimension them just like profile curves.
         for i in 0..nc {
-            let k = match sk.curves.get(i).map(|c| (c.kind.clone(), c.construction)) {
-                Some((CurveKind::Circle { r, .. }, false)) => Diameter { c: i, value: 2.0 * r },
-                Some((CurveKind::Arc { .. }, false)) => Radius { c: i, value: sk.radius(i).unwrap_or(1.0) },
-                Some((CurveKind::Line { a, b }, false)) => {
-                    Length { l: i, value: sk.point(a).zip(sk.point(b)).map(|(x, y)| x.dist(y)).unwrap_or(1.0) }
-                }
+            let k = match sk.curves.get(i).map(|c| c.kind.clone()) {
+                Some(CurveKind::Circle { r, .. }) => Diameter { c: i, value: 2.0 * r },
+                Some(CurveKind::Arc { .. }) => Radius { c: i, value: sk.radius(i).unwrap_or(1.0) },
+                Some(CurveKind::Line { a, b }) => Length { l: i, value: sk.point(a).zip(sk.point(b)).map(|(x, y)| x.dist(y)).unwrap_or(1.0) },
                 _ => continue,
             };
             attempt(sk, doc, k, true, &mut dof);
@@ -383,13 +383,10 @@ fn toggle_driven(s: &mut Session, p: &Value) -> Result<Value> {
             slot.driven = true;
             slot.param = None;
         } else {
-            let (unit, e) = if c.kind.is_angle() {
-                ("deg", format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6))
-            } else {
-                ("mm", format!("{} mm", (v * 1e6).round() / 1e6))
-            };
+            let (unit, e) =
+                if c.kind.is_angle() { ("deg".into(), format!("{} deg", (v.to_degrees() * 1e6).round() / 1e6)) } else { doc.design_length(v) };
             slot.driven = false;
-            slot.param = Some(doc.new_model_param(&e, unit));
+            slot.param = Some(doc.new_model_param(&e, &unit));
             before = None;
         }
         Ok(driven)
@@ -450,6 +447,8 @@ fn anchor(sk: &Sketch, k: &ConstraintKind) -> Option<Vec2> {
         Distance { p, q, .. } | DistanceX { p, q, .. } | DistanceY { p, q, .. } => Some((pt(p)? + pt(q)?) * 0.5),
         PointLineDistance { p, .. } | LinearDiameter { p, .. } => pt(p),
         LineCircleDistance { c, .. } => sk.center(c),
+        PointCircleDistance { p, .. } => pt(p),
+        CircleCircleDistance { a, b, .. } => Some((sk.center(a)? + sk.center(b)?) * 0.5),
         Length { l, .. } | LineAngle { l, .. } => mid(l),
         Radius { c, .. } | Diameter { c, .. } | ArcLength { c, .. } | ArcSweep { c, .. } => mid(c),
         SlotOverallLength { a, b, .. } => Some((sk.center(a)? + sk.center(b)?) * 0.5),

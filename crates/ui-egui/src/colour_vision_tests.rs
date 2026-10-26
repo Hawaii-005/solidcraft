@@ -251,7 +251,6 @@ fn groups(t: &Tokens) -> Vec<Group> {
     let lift = |c: Color32| {
         Color32::from_rgb(c.r().saturating_add(t.hover_face_lift), c.g().saturating_add(t.hover_face_lift), c.b().saturating_add(t.hover_face_lift))
     };
-    let ic = &t.icons;
     let a = &t.analysis;
     let mut out = vec![
         group(
@@ -291,9 +290,8 @@ fn groups(t: &Tokens) -> Vec<Group> {
         group("validation status", &[("form_success", t.form_success), ("error", t.error)], &[("panel", t.panel)]),
         group("validation surfaces", &[("form_success_fill", t.form_success_fill), ("form_error_fill", t.form_error_fill)], &[]),
         group("UI text", &[("error", t.error), ("warning", t.warning), ("text", t.text)], &[("panel", t.panel)]),
-        group("origin axes", &[("axis_x", t.axis_x), ("axis_y", t.axis_y), ("axis_z", t.axis_z)], &[("viewport_top", t.viewport_top)]),
-        group("view triad", &[("triad[0]", t.triad[0]), ("triad[1]", t.triad[1]), ("triad[2]", t.triad[2])], &[("viewport_top", t.viewport_top)]),
-        group("gizmo", &[("gizmo[0]", t.gizmo[0]), ("gizmo[1]", t.gizmo[1]), ("gizmo[2]", t.gizmo[2])], &[("viewport_top", t.viewport_top)]),
+        // Every axis drawn: origin, view triad, navigation cube, Move gizmo… (one set, #976).
+        group("axes", &[("axis_x", t.axis_x), ("axis_y", t.axis_y), ("axis_z", t.axis_z)], &[("viewport_top", t.viewport_top)]),
         group("bend lines", &[("bend_up", t.bend_up), ("bend_down", t.bend_down)], &[("viewport_top", t.viewport_top)]),
         group("box select", &[("box_window", t.box_window), ("box_crossing", t.box_crossing)], &[("viewport_top", t.viewport_top)]),
         group(
@@ -320,9 +318,8 @@ fn groups(t: &Tokens) -> Vec<Group> {
             ],
             &[("body", t.body), ("viewport_top", t.viewport_top)],
         ),
-        // The scale's three stops, unlit. Shaded (a stop at one angle to the light, the next at
-        // another), middle and tight merge for a red-green loss (3.3 protan, 5.2 deutan) and flat
-        // and middle for tritan (4.6). That is the scale's own fault, in Off too: #975.
+        // The scale's three stops, unlit. Along the scale, see
+        // `the_curvature_scale_lightens_steadily_for_every_eye` (#975).
         group(
             "curvature map",
             &[
@@ -336,37 +333,6 @@ fn groups(t: &Tokens) -> Vec<Group> {
             "ribbon accents",
             &[("glyph_text", t.glyph_text), ("sketch_accent", t.sketch_accent), ("construction_geom", t.construction_geom)],
             &[("toolbar", t.toolbar)],
-        ),
-        group(
-            "origin icon",
-            &[("icons.axes[0]", ic.axes[0]), ("icons.axes[1]", ic.axes[1]), ("icons.axes[2]", ic.axes[2])],
-            &[("toolbar", t.toolbar)],
-        ),
-        group(
-            "accessibility icon",
-            &[("icons.access[0]", ic.access[0]), ("icons.access[1]", ic.access[1]), ("icon_fill", t.icon_fill), ("icon", t.icon)],
-            &[],
-        ),
-        group("draft icon", &[("icons.draft[0]", ic.draft[0]), ("icons.draft[1]", ic.draft[1]), ("icon", t.icon)], &[]),
-        group(
-            "curvature icon",
-            &[("icons.curvature[0]", ic.curvature[0]), ("icons.curvature[1]", ic.curvature[1]), ("icons.curvature[2]", ic.curvature[2])],
-            &[],
-        ),
-        group(
-            "appearance icon",
-            &[("icons.paint[0]", ic.paint[0]), ("icons.paint[1]", ic.paint[1]), ("icons.paint[2]", ic.paint[2]), ("icon_fill", t.icon_fill)],
-            &[],
-        ),
-        group("environment icon", &[("icons.sky", ic.sky), ("icons.floor", ic.floor), ("icons.highlight", ic.highlight)], &[]),
-        group("warning icon", &[("icons.warning", ic.warning), ("icon", t.icon)], &[("toolbar", t.toolbar)]),
-        group("interference icon", &[("icons.interference", ic.interference), ("icon", t.icon)], &[("toolbar", t.toolbar)]),
-        group("folder icons", &[("icons.folder", ic.folder), ("icons.plane", ic.plane), ("icons.fold", ic.fold), ("icon", t.icon)], &[]),
-        group("sheet icons", &[("icons.sheet", ic.sheet), ("icons.sheet_2", ic.sheet_2), ("icon", t.icon)], &[]),
-        group(
-            "app bar buttons",
-            &[("app_bar_icon[0]", t.app_bar_icon[0]), ("app_bar_icon[1]", t.app_bar_icon[1]), ("app_bar_icon[2]", t.app_bar_icon[2])],
-            &[("app_bar", t.app_bar)],
         ),
         // Tab names and icons identify the tabs; each accent must read against the toolbar.
         group("surface tab", &[("surface_accent", t.surface_accent)], &[("toolbar", t.toolbar)]),
@@ -411,6 +377,44 @@ const SHADED: [&str; 2] = ["analysis.draft", "analysis.access"];
 /// Tokens no colour vision mode needs to keep apart, and why. A new token fails
 /// `every_token_is_measured_or_carries_no_meaning` until it is in a group above or here.
 const NO_MEANING: &[(&str, &str)] = &[
+    ("borders.primary", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("borders.secondary", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("borders.secondary_dotted", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("borders.tertiary", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("borders.container", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("borders.control", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("borders.primary_inset", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("borders.bevel", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
+    ("icon_palette", "optional SVG palette; actual roles and theme contrast are guarded in icon and theme tests"),
+    ("file_dim", "File view secondary text, WCAG guarded in theme tests"),
+    ("file_recovery_well", "decorative recovery icon ground"),
+    ("file_action_height", "layout dimension"),
+    ("file_back_height", "layout dimension"),
+    ("file_recovery_icon", "layout dimension"),
+    ("file_grid_gap", "layout dimension"),
+    ("file_nav_width", "layout dimension"),
+    ("file_nav_height", "layout dimension"),
+    ("file_tile_height", "layout dimension"),
+    ("file_tile_icon", "layout dimension"),
+    ("file_recent_height", "layout dimension"),
+    ("file_sample_image_height", "layout dimension"),
+    ("file_content_inset_x", "layout dimension"),
+    ("file_content_inset_y", "layout dimension"),
+    ("file_section_gap", "layout dimension"),
+    ("font_start_title", "layout dimension"),
+    ("file_background", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_surface", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_image_tint", "neutral image multiplication; model pixels retain their original colours"),
+    ("file_border", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_rail", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_rail_ink", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_rail_hover", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_primary", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_primary_ink", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_primary_border", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_recovery", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_recovery_ink", "File view chrome; paired text contrast is guarded in theme tests"),
+    ("file_recovery_border", "File view chrome; paired text contrast is guarded in theme tests"),
     ("space_2", "layout dimension"),
     ("space_3", "layout dimension"),
     ("space_4", "layout dimension"),
@@ -478,6 +482,7 @@ const NO_MEANING: &[(&str, &str)] = &[
     ("render_accent", "the Render workspace's identity colour"),
     // The window's chrome: grounds, text and borders (measured as grounds where meaning sits on them).
     ("panel_header", "chrome"),
+    ("icon", "neutral control ink; command artwork uses the SVG palette"),
     ("border", "chrome"),
     ("text_dim", "secondary text"),
     ("accent", "the one interface accent"),
@@ -485,8 +490,6 @@ const NO_MEANING: &[(&str, &str)] = &[
     ("dialog_bg", "chrome"),
     ("dialog_border", "chrome"),
     ("chip", "a label's ground"),
-    ("heading_bg", "chrome"),
-    ("subheading_bg", "chrome"),
     ("overlay", "a chip's ground over the view"),
     ("app_bar_text", "text"),
     ("app_bar_separator", "neutral chrome divider"),
@@ -512,6 +515,7 @@ const NO_MEANING: &[(&str, &str)] = &[
     ("origin_point", "the origin, alone"),
     ("construction_plane", "a plane"),
     ("body_edge", "the model's edges"),
+    ("sketch_halo", "neutral rim beneath sketch curves; the curves carry the state colours"),
     ("grid", "the grid"),
     ("grid_major", "the grid"),
     ("profile_fill", "a closed profile's tint"),
@@ -524,19 +528,15 @@ const NO_MEANING: &[(&str, &str)] = &[
     ("cube_border", "labelled"),
     ("cube_text", "labelled"),
     ("cube_hover", "hover highlight"),
-    // Not a colour, or the end of a mark that is measured elsewhere.
+    // Not a colour.
     ("analysis.hatch", "a flag: stripes on the failing faces"),
-    ("logo[3]", "the mark's white edge"),
     // Icon colours that are a shade of a measured one, or one mark alone.
-    ("icons.sheet_light", "a lighter shade of a sheet"),
-    ("icons.sheet_line", "lines on a sheet"),
-    ("icons.glint", "a highlight"),
-    ("icons.stripe", "zebra stripes, grey"),
+    ("icons.highlight", "white ink on viewport markers and the agent pointer"),
     ("icons.agent", "the agent's pointer, alone"),
     ("icons.marker_halo", "a dark halo under a marker"),
 ];
 
-/// Every token field, by path (`sketch`, `analysis.draft`, `logo[3]`…): the arrays of distinct
+/// Every token field, by path (`sketch`, `analysis.draft`, `triad`…): the arrays of distinct
 /// meanings by element where only some elements are measured.
 fn token_fields(t: &Tokens) -> BTreeSet<String> {
     let text = format!("{t:#?}");
@@ -562,7 +562,7 @@ fn token_fields(t: &Tokens) -> BTreeSet<String> {
     out
 }
 
-/// A group member's token field (`triad[0]` is part of `triad`).
+/// A group member's token field (`continuity[0]` is part of `continuity`).
 fn field_of(name: &str) -> &str {
     name.split('[').next().unwrap_or(name)
 }
@@ -572,7 +572,7 @@ fn every_token_is_measured_or_carries_no_meaning() {
     for t in [Tokens::light(), Tokens::dark()] {
         let measured: BTreeSet<&str> =
             groups(&t).iter().flat_map(|g| g.members.iter().chain(&g.grounds).map(|(n, _)| field_of(n))).chain(SHADED).collect();
-        // An element of an array (`logo[3]`) is listed for the record; its array is measured.
+        // An element of an array (`triad[0]`) is listed for the record; its array is measured.
         let listed: BTreeSet<&str> = NO_MEANING.iter().map(|(n, _)| field_of(n)).collect();
         let fields = token_fields(&t);
         let unplaced: Vec<&String> = fields.iter().filter(|f| !measured.contains(f.as_str()) && !listed.contains(f.as_str())).collect();
@@ -697,7 +697,7 @@ fn off_gives_the_theme_unchanged() {
     }
 }
 
-/// The token fields whose `Debug` text differs (`triad`, `analysis.draft`…), so a field cannot
+/// The token fields whose `Debug` text differs (`continuity`, `analysis.draft`…), so a field cannot
 /// change in a mode by accident.
 fn changed_fields(a: &Tokens, b: &Tokens) -> BTreeSet<String> {
     let (la, lb) = (format!("{a:#?}"), format!("{b:#?}"));
@@ -731,14 +731,11 @@ fn changed_fields(a: &Tokens, b: &Tokens) -> BTreeSet<String> {
 fn each_mode_changes_only_its_table() {
     let set = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<BTreeSet<_>>();
     let red_green_both = [
-        "triad",
-        "gizmo",
+        "axis_x",
+        "axis_y",
         "analysis.draft",
         "analysis.access",
         "analysis.hatch",
-        "icons.axes",
-        "icons.access",
-        "icons.draft",
         "bend_up",
         "bend_down",
         "surface_accent",
@@ -881,30 +878,32 @@ fn the_shader_gets_the_modes_colours_and_its_stripes() {
 #[test]
 fn the_sections_messages_are_in_every_catalog() {
     let load = |text: &str| -> serde_json::Map<String, serde_json::Value> { serde_json::from_str(text).unwrap() };
-    let english = load(include_str!("../../../assets/locales/en.json"));
+    let english = load(include_str!(concat!(env!("OUT_DIR"), "/locales/en.json")));
     let ids: Vec<&str> = ColorVision::ALL
         .into_iter()
         .flat_map(|m| [m.label_id(), m.help_id()])
-        .chain(crate::prefs::COLOUR_VISION_SAMPLE)
+        .chain(crate::ui_kit::COLOUR_VISION_SAMPLE)
         .chain(["ui.colour_vision", "ui.colour_vision_mode", "ui.colour_vision_sample", "ui.colour_vision_note"])
         .collect();
     for (lang, text) in [
-        ("cs", include_str!("../../../assets/locales/cs.json")),
-        ("da", include_str!("../../../assets/locales/da.json")),
-        ("de", include_str!("../../../assets/locales/de.json")),
-        ("ja", include_str!("../../../assets/locales/ja.json")),
-        ("ko", include_str!("../../../assets/locales/ko.json")),
-        ("pl", include_str!("../../../assets/locales/pl.json")),
-        ("ru", include_str!("../../../assets/locales/ru.json")),
-        ("zh", include_str!("../../../assets/locales/zh.json")),
+        ("cs", include_str!(concat!(env!("OUT_DIR"), "/locales/cs.json"))),
+        ("da", include_str!(concat!(env!("OUT_DIR"), "/locales/da.json"))),
+        ("de", include_str!(concat!(env!("OUT_DIR"), "/locales/de.json"))),
+        ("ja", include_str!(concat!(env!("OUT_DIR"), "/locales/ja.json"))),
+        ("ko", include_str!(concat!(env!("OUT_DIR"), "/locales/ko.json"))),
+        ("nb", include_str!(concat!(env!("OUT_DIR"), "/locales/nb.json"))),
+        ("pl", include_str!(concat!(env!("OUT_DIR"), "/locales/pl.json"))),
+        ("ru", include_str!(concat!(env!("OUT_DIR"), "/locales/ru.json"))),
+        ("zh", include_str!(concat!(env!("OUT_DIR"), "/locales/zh.json"))),
     ] {
         let catalog = load(text);
         for id in &ids {
             let (Some(en), Some(here)) = (english.get(*id), catalog.get(*id)) else {
                 panic!("{lang}: missing message {id} (English: {})", english.contains_key(*id));
             };
-            // Danish uses the same established names for these colour-vision modes.
-            let shared_name = lang == "da" && ["ui.colour_vision_deutan", "ui.colour_vision_protan", "ui.colour_vision_tritan"].contains(id);
+            // Danish and Norwegian use the same established names for these colour-vision modes.
+            let shared_name =
+                matches!(lang, "da" | "nb") && ["ui.colour_vision_deutan", "ui.colour_vision_protan", "ui.colour_vision_tritan"].contains(id);
             assert!(lang == "de" || shared_name || here != en, "{lang}: {id} is the English text {en}");
         }
     }
@@ -1023,23 +1022,44 @@ fn random_values_never_panic_and_only_the_four_ids_are_taken() {
 }
 
 #[test]
-fn cancel_puts_the_mode_back_ok_keeps_it_and_restore_defaults_resets_graphics_only() {
+fn cancel_puts_the_mode_back_ok_keeps_it_and_restore_defaults_resets_interface_only() {
     let mut app = app();
     let control = |app: &mut crate::SolveApp, p: serde_json::Value| crate::prefs::control(app, &p).unwrap();
-    control(&mut app, json!({"open": "Graphics"}));
+    control(&mut app, json!({"open": "Interface"}));
     control(&mut app, json!({"color_vision": "protan"}));
     assert_eq!(app.preferences.color_vision, ColorVision::Protan);
     control(&mut app, json!({"button": "cancel"}));
     assert_eq!(app.preferences.color_vision, ColorVision::Off);
-    control(&mut app, json!({"open": "Graphics"}));
+    control(&mut app, json!({"open": "Interface"}));
     control(&mut app, json!({"color_vision": "tritan", "button": "ok"}));
     assert_eq!(app.preferences.color_vision, ColorVision::Tritan);
     // Restore Defaults on another page leaves it.
     control(&mut app, json!({"open": "General"}));
     control(&mut app, json!({"button": "defaults"}));
     assert_eq!(app.preferences.color_vision, ColorVision::Tritan);
-    control(&mut app, json!({"open": "Graphics"}));
+    control(&mut app, json!({"open": "Interface"}));
     control(&mut app, json!({"button": "defaults"}));
     assert_eq!(app.preferences.color_vision, ColorVision::Off);
     control(&mut app, json!({"button": "ok"}));
+}
+
+/// #975: the Curvature Map reads from flat to tight with hue lost too. Along the shader's two
+/// blends its lightness rises the whole way, and each quarter of the scale is a clear step, for
+/// normal vision and each simulated loss. The former blue, green, red scale rose and fell.
+#[test]
+fn the_curvature_scale_lightens_steadily_for_every_eye() {
+    let c = Tokens::light().analysis.curvature;
+    // Flat to middle over the first half, middle to tight over the second, as the shader mixes.
+    let at = |t: f64| -> Rgb8 {
+        let (a, b, u) = if t < 0.5 { (c[0], c[1], t * 2.0) } else { (c[1], c[2], t * 2.0 - 1.0) };
+        std::array::from_fn(|k| ((f64::from(a[k]) + (f64::from(b[k]) - f64::from(a[k])) * u) * 255.0).round().clamp(0.0, 255.0) as u8)
+    };
+    for eye in [Eye::Normal, Eye::Protan, Eye::Deutan, Eye::Tritan] {
+        let labs: Vec<V3> = (0..=4).map(|i| lab(simulate(at(f64::from(i) / 4.0), eye, Instrument::Machado))).collect();
+        for w in labs.windows(2) {
+            assert!(w[1][0] > w[0][0], "{eye:?}: the lightness falls along the scale: {labs:?}");
+            let step = de2000(w[0], w[1]);
+            assert!(step >= 10.0, "{eye:?}: a quarter of the scale is only {step:.1} apart: {labs:?}");
+        }
+    }
 }

@@ -7,8 +7,9 @@
 //! The command is evaluated on a copy of the session ([`solidcraft_engine::Session::ahead`]),
 //! which leaves what it computes in the evaluation cache the session shares. Done within the
 //! app's wait ([`crate::dialogs::APPLY_AT_ONCE`]), the command just runs; otherwise the window
-//! goes on, saying it computes, and the command runs for real once the evaluation is in, finding
-//! its features in the cache. Commands asked for meanwhile wait their turn; a marker moved again
+//! goes on, saying it computes, and the command runs for real once the evaluation is in, taking
+//! the features it evaluated ([`solidcraft_engine::Session::prime`]) rather than computing them
+//! again. Commands asked for meanwhile wait their turn; a marker moved again
 //! replaces the move still waiting, so a drag computes where it ends rather than every slot it
 //! crossed.
 //!
@@ -24,18 +25,39 @@ use crate::SolveApp;
 
 /// A command computing off the window thread.
 pub struct Deferred {
-    done: std::sync::mpsc::Receiver<()>,
+    done: std::sync::mpsc::Receiver<Option<solidcraft_engine::Evaluated>>,
+    /// What it evaluated, once in (`Some(None)`: it failed, or its thread is gone).
+    evaluated: Option<Option<solidcraft_engine::Evaluated>>,
     /// When it started (ms).
     pub(crate) started: f64,
     command: (String, Value),
     /// The design's revision it was computed for: a design changed meanwhile computes it again.
     revision: u64,
+    /// Every result the evaluation ahead computed, whatever the evaluation cache dropped since,
+    /// for the run here (a parameter change evaluates twice: the first evaluation is not the
+    /// one `evaluated` holds).
+    kept: Option<std::sync::Arc<solidcraft_engine::doc::KeptResults>>,
 }
 
 impl Deferred {
-    fn finished(&self) -> bool {
-        !matches!(self.done.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+    pub(crate) fn finished(&mut self) -> bool {
+        if self.evaluated.is_none() {
+            match self.done.try_recv() {
+                Ok(evaluated) => self.evaluated = Some(evaluated),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.evaluated = Some(None),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        self.evaluated.is_some()
     }
+}
+
+/// How a command asked to run off the window thread goes.
+enum Start {
+    /// It computes off the window thread.
+    Later(Deferred),
+    /// It runs now, with what was evaluated for it ahead (if anything).
+    Now(Option<solidcraft_engine::Evaluated>, Option<std::sync::Arc<solidcraft_engine::doc::KeptResults>>),
 }
 
 /// A delete's check computing off the window thread: each check command's reply, in order.
@@ -105,18 +127,39 @@ impl SolveApp {
             return Ok(Value::Null);
         }
         match self.begin_deferred(id, &params) {
-            Some(job) => {
+            Start::Later(job) => {
                 self.deferred = Some(job);
                 Ok(Value::Null)
             }
-            None => self.run(id, params),
+            Start::Now(evaluated, kept) => self.run_evaluated(id, params, evaluated.as_ref(), kept),
         }
+    }
+
+    /// Run a command for real, taking the features `evaluated` computed for it ahead, and any
+    /// other result that evaluation `kept`, so the window thread computes none of them again.
+    fn run_evaluated(
+        &mut self,
+        id: &str,
+        params: Value,
+        evaluated: Option<&solidcraft_engine::Evaluated>,
+        kept: Option<std::sync::Arc<solidcraft_engine::doc::KeptResults>>,
+    ) -> Result<Value, String> {
+        if let Some(evaluated) = evaluated {
+            self.session.prime(evaluated);
+        }
+        let r = self.run_with_kept(kept, |app| app.run(id, params));
+        self.session.unprime();
+        r
     }
 
     /// Since when a command, or a delete's check, has been computing off the window thread (ms),
     /// if one is.
     pub fn computing_since(&self) -> Option<f64> {
-        let started = [self.deferred.as_ref().map(|d| d.started), self.delete_check.as_ref().map(|c| c.started)];
+        let started = [
+            self.deferred.as_ref().map(|d| d.started),
+            self.delete_check.as_ref().map(|c| c.started),
+            self.pending_feature_edit.as_ref().map(|edit| edit.started),
+        ];
         started.into_iter().flatten().reduce(f64::min)
     }
 
@@ -175,7 +218,7 @@ impl SolveApp {
 
     /// Each frame: a command whose evaluation is in runs, then the next one waiting starts.
     pub(crate) fn poll_deferred(&mut self, ctx: &egui::Context) {
-        if let Some(job) = &self.deferred {
+        if let Some(job) = &mut self.deferred {
             if !job.finished() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 return;
@@ -187,7 +230,7 @@ impl SolveApp {
                     // The design changed meanwhile: computed again for the design as it is now.
                     let _ = self.run_heavy(&id, params);
                 } else if !superseded {
-                    let _ = self.run(&id, params);
+                    let _ = self.run_evaluated(&id, params, job.evaluated.flatten().as_ref(), job.kept);
                 }
             }
         }
@@ -195,39 +238,50 @@ impl SolveApp {
             let (id, params) = self.deferred_queue.remove(0);
             let _ = self.run_heavy(&id, params);
         }
+        if self.deferred.is_none()
+            && self.deferred_queue.is_empty()
+            && let Some((id, sketch)) = self.start_after_roll.take()
+            && self.dialog.is_none()
+            && self.tool.is_none()
+        {
+            self.start_interactive(&id, Some(sketch));
+        }
     }
 
     /// Start evaluating a command ahead. `None` when it should just run: not asked for
     /// ([`SolveApp::apply_off_thread`]), a file operation in progress, no threads (the web), or
     /// done within the wait.
     #[cfg(not(target_arch = "wasm32"))]
-    fn begin_deferred(&self, id: &str, params: &Value) -> Option<Deferred> {
-        let wait = self.apply_off_thread?;
+    fn begin_deferred(&self, id: &str, params: &Value) -> Start {
+        let Some(wait) = self.apply_off_thread else { return Start::Now(None, None) };
         if self.file_load.busy() || self.file_picker.is_some() {
-            return None;
+            return Start::Now(None, None);
         }
         let ahead = self.session.ahead();
+        let kept = ahead.kept();
         let command = (id.to_string(), params.clone());
         let commands = vec![command.clone()];
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("history".into())
-            .spawn(move || {
-                let _ = ahead.evaluate(&commands);
-                let _ = tx.send(());
-            })
-            .ok()?;
+        let spawned = std::thread::Builder::new().name("history".into()).spawn(move || {
+            let _ = tx.send(ahead.evaluate(&commands).ok());
+        });
+        if spawned.is_err() {
+            return Start::Now(None, None);
+        }
         // Zero explicitly requests off-thread application, even if a fast worker
         // finishes before this thread is scheduled again. Apply on the next frame.
-        if wait.is_zero() || matches!(rx.recv_timeout(wait), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
-            Some(Deferred { done: rx, started: crate::now_ms(), command, revision: self.session.revision })
-        } else {
-            None
+        if !wait.is_zero() {
+            match rx.recv_timeout(wait) {
+                Ok(evaluated) => return Start::Now(evaluated, Some(kept)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Start::Now(None, Some(kept)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
+        Start::Later(Deferred { done: rx, evaluated: None, started: crate::now_ms(), command, revision: self.session.revision, kept: Some(kept) })
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn begin_deferred(&self, _id: &str, _params: &Value) -> Option<Deferred> {
-        None
+    fn begin_deferred(&self, _id: &str, _params: &Value) -> Start {
+        Start::Now(None, None)
     }
 }

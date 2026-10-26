@@ -103,6 +103,40 @@ fn set_back_reports_restored_features() {
     assert_eq!((m.last_recomputed, m.last_restored), (0, 0));
 }
 
+/// Setting a parameter back restores every feature on a design whose states are large next to
+/// the cache's budget: each cached state shares the bodies it did not change with the states
+/// before it, so it is charged only for what it made, not for the whole model again.
+#[test]
+fn set_back_restores_everything_when_states_share_bodies() {
+    let mut doc = Document::new("blocks");
+    doc.set_param("h", "10 mm", Some("mm"), None).unwrap();
+    for i in 0..30 {
+        let height = if i == 0 { "h" } else { "10" };
+        doc.add_feature(
+            FeatureKind::Box {
+                corner: point_expr(Vec3::new(20.0 * i as f64, 0.0, 0.0)),
+                length: "10".into(),
+                width: "10".into(),
+                height: height.into(),
+                operation: Operation::NewBody,
+            },
+            None,
+        )
+        .unwrap();
+    }
+    let mut m = Model::new();
+    m.evaluate(&doc);
+    // Room for a few whole models: enough for both timelines' new bodies, not for every state
+    // charged as a whole model.
+    m.cache.lock().unwrap().budget = 3 * m.state().retained_bytes();
+    doc.set_param("h", "12 mm", None, None).unwrap();
+    m.evaluate(&doc);
+    assert_eq!(m.last_recomputed, 30);
+    doc.set_param("h", "10 mm", None, None).unwrap();
+    m.evaluate(&doc);
+    assert_eq!((m.last_recomputed, m.last_restored), (0, 30));
+}
+
 /// #1989: what an evaluation ahead on a copy of the model computed is kept for the run that
 /// follows on the model itself, which finds it there even once the evaluation cache has dropped
 /// it (the cache keeps only a few states of a design with large bodies). Copies keep nothing.
@@ -123,6 +157,97 @@ fn results_kept_ahead_outlive_the_cache() {
     m.evaluate(&doc);
     assert_eq!((m.last_recomputed, m.last_restored), (0, 2), "nothing computed again");
     assert!(rel(measure(&m.state().bodies[0].body).unwrap().volume, 30000.0) < 1e-9);
+}
+
+/// Rolling the marker back must not discard unchanged results just because the bounded cache
+/// evicted them. Opening an earlier feature and returning to the end otherwise rebuilds it all.
+#[test]
+fn rolling_the_marker_back_keeps_results_after_cache_eviction() {
+    for reopen in [false, true] {
+        let (mut doc, _) = plate_doc();
+        let mut m = Model::new();
+        m.evaluate(&doc);
+        if reopen {
+            m = Model::adopt(&doc, &m.saved(&doc).unwrap()).unwrap();
+        }
+        let finished = m.state();
+        let computed = m.recomputed;
+        // Simulate eviction by previews or the cache's byte limit, without a large/slow fixture.
+        *m.cache.lock().unwrap() = Default::default();
+        for marker in [Some(1), Some(0), Some(1), None] {
+            doc.marker = marker;
+            m.evaluate(&doc);
+            assert_eq!(m.recomputed, computed, "reopen {reopen}, marker {marker:?}: unchanged features must be reused");
+            assert_eq!(m.state().bodies.len(), usize::from(marker.is_none()));
+        }
+        assert!(std::sync::Arc::ptr_eq(&m.state(), &finished), "return to the original evaluated state");
+    }
+}
+
+#[test]
+fn rolling_a_large_unchanged_timeline_forward_reuses_its_geometry() {
+    let mut doc = Document::new("marker cache budget");
+    for i in 0..80 {
+        doc.add_feature(
+            FeatureKind::Box {
+                corner: point_expr(Vec3::new((i % 10) as f64 * 15.0, (i / 10) as f64 * 15.0, 0.0)),
+                length: "10".into(),
+                width: "10".into(),
+                height: "10".into(),
+                operation: Operation::NewBody,
+            },
+            None,
+        )
+        .unwrap();
+    }
+    let mut m = Model::new();
+    m.evaluate(&doc);
+    assert!(m.results.iter().all(|r| r.error.is_none()));
+    // Exceed the actual byte budget without manually clearing the cache.
+    assert!(m.results.iter().map(|r| r.state.retained_bytes()).sum::<usize>() > 64 << 20);
+    let finished = m.state();
+    doc.marker = Some(1);
+    m.evaluate(&doc);
+    assert_eq!(m.state().bodies.len(), 1);
+    doc.marker = None;
+    m.evaluate(&doc);
+    assert_eq!(m.last_recomputed, 0, "returning to the end must not rebuild unchanged boxes");
+    assert_eq!(m.state().bodies.len(), 80);
+    assert!(std::sync::Arc::ptr_eq(&m.state(), &finished));
+}
+
+#[test]
+fn rolled_results_never_mask_edits_or_disabled_reuse() {
+    for change in ["parameter", "feature", "suppressed", "units", "no_cache"] {
+        let (mut doc, _) = plate_doc();
+        let mut m = Model::new();
+        m.evaluate(&doc);
+        doc.marker = Some(0);
+        m.evaluate(&doc);
+        *m.cache.lock().unwrap() = Default::default();
+        match change {
+            "parameter" => doc.set_param("width", "50 mm", None, None).unwrap(),
+            "feature" => {
+                let FeatureKind::Extrude { extent, .. } = &mut doc.features[1].kind else { panic!("extrude") };
+                extent.distance = "25".into();
+            }
+            "suppressed" => doc.features[1].suppressed = true,
+            "units" => doc.units = "in".into(),
+            "no_cache" => m.no_cache = true,
+            _ => panic!("unknown edit case"),
+        }
+        doc.marker = None;
+        m.evaluate(&doc);
+        let mut fresh = Model::new();
+        fresh.evaluate(&doc);
+        let volume = |model: &Model| model.state().bodies.iter().map(|b| measure(&b.body).unwrap().volume).sum::<f64>();
+        assert_eq!(m.state().bodies.len(), fresh.state().bodies.len(), "{change}");
+        assert!((volume(&m) - volume(&fresh)).abs() < 1e-6, "{change}: retained geometry must match a fresh evaluation");
+        assert_eq!(m.results.iter().map(|r| &r.error).collect::<Vec<_>>(), fresh.results.iter().map(|r| &r.error).collect::<Vec<_>>(), "{change}");
+        if matches!(change, "parameter" | "feature" | "units" | "no_cache") {
+            assert!(m.last_recomputed > 0, "{change}: changed inputs must rebuild");
+        }
+    }
 }
 
 #[test]
@@ -249,6 +374,45 @@ fn params_and_serialization() {
     let gone = doc.delete_feature(doc.features[0].id).unwrap();
     assert_eq!(gone.len(), 2, "the extrude goes with its sketch");
     assert!(doc.param("d1").is_none(), "unused model parameters are pruned");
+}
+
+/// #4783: a body reads the material its mass is computed with, as the library or the design
+/// spells it. An unknown name, or a design material with an unusable density, reads as the
+/// default material it weighs. `density` agrees in every case, and a configuration keeps the
+/// assignment as stored.
+#[test]
+fn a_body_reads_the_material_its_mass_is_computed_with() {
+    let mut doc = Document::new("materials");
+    let usable = [("Walnut", 0.65), ("Mote", f64::MIN_POSITIVE), ("Limit", MAX_DENSITY)];
+    let unusable = [("Broken", -3.0), ("Weightless", 0.0), ("Beyond", MAX_DENSITY.next_up())];
+    for (name, density) in usable.into_iter().chain(unusable) {
+        doc.user_materials.push(UserMaterial { name: name.into(), density, appearance: None, physical_card: None });
+    }
+    // (body, its assignment as stored, the material it reads and weighs, that material's density)
+    let cases = [
+        ("Known", Some("Steel"), "Steel", 7.85),
+        ("Miscased", Some("steel"), "Steel", 7.85),
+        ("Own", Some(" walnut "), "Walnut", 0.65),
+        ("Lightest", Some("Mote"), "Mote", f64::MIN_POSITIVE),
+        ("At the limit", Some("Limit"), "Limit", MAX_DENSITY),
+        ("Unknown", Some("Unobtainium"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Unusable", Some("Broken"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Zero density", Some("Weightless"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Over the limit", Some("Beyond"), DEFAULT_MATERIAL, DEFAULT_DENSITY),
+        ("Unassigned", None, DEFAULT_MATERIAL, DEFAULT_DENSITY),
+    ];
+    for (body, stored, ..) in cases {
+        if let Some(material) = stored {
+            doc.materials.insert(body.into(), material.into());
+        }
+    }
+    for (body, stored, material, density) in cases {
+        assert_eq!(doc.body_material(body), material, "{body}");
+        assert_eq!(doc.density(body), density, "{body}");
+        assert_eq!(doc.material_density(material), Some(density), "{body}: the density is its material's");
+        let cell = doc.config_current(&crate::config::Column::Material(body.into()));
+        assert_eq!(cell.as_deref(), Some(stored.unwrap_or(DEFAULT_MATERIAL)), "{body}: a configuration keeps the assignment as stored");
+    }
 }
 
 #[test]
@@ -429,4 +593,77 @@ fn self_referencing_construction_planes_are_errors() {
     let mut m = Model::new();
     m.evaluate(&doc);
     assert!(m.results.iter().any(|r| r.error.is_some()), "a cyclic perpendicular plane must report an error: {:?}", m.results);
+}
+
+/// New names take the first free number after their stem, whatever else is named alike: a gap
+/// is filled, and `Sketch07`, `Sketch+2` or `SketchLid` take no number (they are not `Sketch7`).
+#[test]
+fn new_names_take_the_first_free_number() {
+    let taken = crate::params::numbers_after("Box", ["Box1", "Box3", "Box07", "Box+2", "BoxLid", "Box", "Cylinder2"].into_iter());
+    assert_eq!(taken, std::collections::HashSet::from([1, 3]));
+    let mut doc = Document::new("names");
+    let sketch = |doc: &mut Document| {
+        doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Origin { name: "XY".into() }, sketch: Sketch::new() }, None).unwrap()
+    };
+    let name = |doc: &Document, id: u64| doc.feature(id).map(|f| f.name.clone()).unwrap_or_default();
+    let ids: Vec<u64> = (0..3).map(|_| sketch(&mut doc)).collect();
+    let names: Vec<String> = ids.iter().map(|id| name(&doc, *id)).collect();
+    assert!(names.iter().all(|n| n.starts_with("Sketch")) && names[0] != names[1] && names[1] != names[2], "{names:?}");
+    for (id, other) in [(ids[0], "SketchLid"), (ids[1], "Sketch07")] {
+        if let Some(f) = doc.feature_mut(id) {
+            f.name = other.into();
+        }
+    }
+    let next = sketch(&mut doc);
+    assert_eq!(name(&doc, next), names[0], "the first freed number is taken again");
+}
+
+#[test]
+fn empty_boolean_targets_name_overlapping_component() {
+    for (operation, offset) in [(Operation::Cut, 0.0), (Operation::Intersect, 0.0), (Operation::Cut, 40.0)] {
+        let (mut doc, sketch) = plate_doc();
+        let imported = doc.add_component(Some("Imported STEP"), 0).unwrap();
+        let part = doc.add_component(Some("Part1"), 0).unwrap();
+        doc.features.last_mut().unwrap().component = imported;
+        doc.feature_mut(sketch).unwrap().component = imported;
+        doc.occurrences.iter_mut().find(|o| o.component == imported).unwrap().transform[2][3] = offset;
+        let mut kind = doc.features.last().unwrap().kind.clone();
+        if let FeatureKind::Extrude { operation: op, .. } = &mut kind {
+            *op = operation;
+        }
+        let cut = doc.add_feature(kind, None).unwrap();
+        doc.feature_mut(cut).unwrap().component = part;
+        let mut model = Model::new();
+        model.evaluate(&doc);
+        let error = model.result(cut).unwrap().error.as_deref().unwrap();
+        assert!(error.contains("component 'Part1'"), "offset {offset}: {error}");
+        assert!(error.contains("'Body1' in component 'Imported STEP'"), "offset {offset}: {error}");
+        assert!(error.contains("activate that component or pick the body as a target"), "offset {offset}: {error}");
+        assert_eq!(model.state().bodies.len(), 1);
+        assert!(rel(measure(&model.state().bodies[0].body).unwrap().volume, 24000.0) < 1e-9);
+    }
+}
+
+#[test]
+fn empty_boolean_targets_without_overlap_keep_plain_message() {
+    for operation in [Operation::Cut, Operation::Intersect] {
+        let (mut doc, _) = plate_doc();
+        let part = doc.add_component(Some("Part1"), 0).unwrap();
+        let cut = doc
+            .add_feature(
+                FeatureKind::Box {
+                    corner: point_expr(Vec3::new(100.0, 100.0, 100.0)),
+                    length: "1".into(),
+                    width: "1".into(),
+                    height: "1".into(),
+                    operation,
+                },
+                None,
+            )
+            .unwrap();
+        doc.feature_mut(cut).unwrap().component = part;
+        let mut model = Model::new();
+        model.evaluate(&doc);
+        assert_eq!(model.result(cut).unwrap().error.as_deref(), Some("there is no body to cut or intersect"));
+    }
 }

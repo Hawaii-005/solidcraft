@@ -26,6 +26,7 @@
 use egui::Pos2;
 use serde_json::{Map, Value, json};
 use solidcraft_engine::Sel;
+use solidcraft_engine::doc::Document;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
 use solidcraft_engine::geom::{Vec2, Vec3};
 use solidcraft_engine::sketch::PatternAlignment;
@@ -75,6 +76,11 @@ const SYMMETRIC: usize = 2;
 /// Whether an offset mode index is Symmetric (which hides Flip and offsets both ways).
 pub(crate) fn offset_symmetric(mode: usize) -> bool {
     mode == SYMMETRIC
+}
+
+/// Whether an offset mode index is Two Sides (Distance and an independent Distance 2).
+pub(crate) fn offset_two_sides(mode: usize) -> bool {
+    mode == TWO_SIDES
 }
 
 /// A sketch modify tool window's values.
@@ -190,14 +196,25 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     };
     let k = match id {
         "sketch.scale" => Mod::Scale { factor: "2".into() },
-        "sketch.offset" => Mod::Offset { distance: "2 mm".into(), distance2: "2 mm".into(), mode: 0, chain: true, flip: false },
+        "sketch.offset" => Mod::Offset {
+            distance: crate::dialogs::length_default(&app.session, "2"),
+            distance2: crate::dialogs::length_default(&app.session, "2"),
+            mode: 0,
+            chain: true,
+            flip: false,
+        },
         "sketch.mirror" => Mod::Mirror,
-        "sketch.move" => Mod::Move { x: "0 mm".into(), y: "0 mm".into(), angle: "0 deg".into(), copy: false },
+        "sketch.move" => Mod::Move {
+            x: crate::dialogs::length_default(&app.session, "0"),
+            y: crate::dialogs::length_default(&app.session, "0"),
+            angle: "0 deg".into(),
+            copy: false,
+        },
         "sketch.pattern.rectangular" => Mod::PatternRect {
             count: "3".into(),
-            spacing: "20 mm".into(),
+            spacing: crate::dialogs::length_default(&app.session, "20"),
             count2: "1".into(),
-            spacing2: "20 mm".into(),
+            spacing2: crate::dialogs::length_default(&app.session, "20"),
             alignment: PatternAlignment::Right,
             alignment2: PatternAlignment::Right,
             reversed: false,
@@ -222,7 +239,7 @@ pub fn candidate(d: &Dialog, session: &solidcraft_engine::Session, hit: &Hit) ->
     let active = session.active_sketch?;
     match hit {
         Hit::SketchCurve { sketch, .. } | Hit::SketchPoint { sketch, .. } if *sketch != active => None,
-        _ => d.active_input()?.accepts(hit, |_, _| false),
+        _ => d.active_input()?.accepts(hit, Some(active), |_, _| false),
     }
 }
 
@@ -234,18 +251,19 @@ pub fn edit_pattern(app: &mut SolveApp, id: &str) -> bool {
     let state = app.session.world_state();
     let Some(sk) = state.sketch(sid).map(|s| &s.sketch) else { return false };
     let Some(pattern) = sk.patterns.iter().find(|p| p.id == id) else { return false };
+    let input = |key: &str, fallback: String| pattern.expressions.get(key).cloned().unwrap_or(fallback);
     let kind = match &pattern.kind {
         SketchPatternKind::Circular { count, angle, alignment, reversed, .. } => Mod::PatternCirc {
-            count: count.to_string(),
-            angle: format!("{angle} deg"),
+            count: pattern.count_expression.clone().unwrap_or_else(|| input("count", count.to_string())),
+            angle: input("angle", format!("{angle} deg")),
             alignment: if *alignment == PatternAlignment::Left { PatternAlignment::Right } else { *alignment },
             reversed: *reversed ^ (*alignment == PatternAlignment::Left),
         },
         SketchPatternKind::Rectangular { count, spacing, count2, spacing2, alignment, alignment2, reversed, reversed2, .. } => Mod::PatternRect {
-            count: count.to_string(),
-            spacing: format!("{spacing} mm"),
-            count2: count2.to_string(),
-            spacing2: format!("{spacing2} mm"),
+            count: input("count", count.to_string()),
+            spacing: input("spacing", format!("{spacing} mm")),
+            count2: input("count2", count2.to_string()),
+            spacing2: input("spacing2", format!("{spacing2} mm")),
             alignment: if *alignment == PatternAlignment::Left { PatternAlignment::Right } else { *alignment },
             alignment2: if *alignment2 == PatternAlignment::Left { PatternAlignment::Right } else { *alignment2 },
             reversed: *reversed ^ (*alignment == PatternAlignment::Left),
@@ -254,11 +272,14 @@ pub fn edit_pattern(app: &mut SolveApp, id: &str) -> bool {
     };
     let mut dialog = Dialog::new(Kind::SketchModify(kind.clone()), inputs(&kind));
     if let Some(input) = dialog.inputs.first_mut() {
-        input.items = pattern
-            .entities
-            .iter()
-            .map(|id| if sk.curve_index(id).is_some() { Sel::SketchCurve { id: id.clone() } } else { Sel::SketchPoint { id: id.clone() } })
-            .collect();
+        input.items =
+            pattern
+                .entities
+                .iter()
+                .map(|id| {
+                    if sk.curve_index(id).is_some() { Sel::SketchCurve { id: id.clone(), sketch: None } } else { Sel::SketchPoint { id: id.clone() } }
+                })
+                .collect();
     }
     match &pattern.kind {
         SketchPatternKind::Circular { center, .. } => {
@@ -273,7 +294,7 @@ pub fn edit_pattern(app: &mut SolveApp, id: &str) -> bool {
                 if let Some(id) = id
                     && let Some(input) = dialog.inputs.get_mut(index)
                 {
-                    input.items = vec![Sel::SketchCurve { id: id.clone() }];
+                    input.items = vec![Sel::SketchCurve { id: id.clone(), sketch: None }];
                 }
             }
         }
@@ -330,6 +351,20 @@ fn number(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     ui_kit::row(ui, label, |ui| ui_kit::field(ui, value))
 }
 
+/// A pattern quantity row with step arrows. They keep the count from `min` up to `max`
+/// copies, evaluated against the design's parameters as `whole` evaluates it on OK.
+fn quantity(ui: &mut egui::Ui, doc: &Document, label: &str, value: &mut String, min: i64, max: i64) -> bool {
+    let eval = |text: &str| doc.eval(text.trim(), ValueKind::Unitless).ok();
+    ui_kit::count_row(ui, label, value, &ui_kit::Count { min, max: max.max(min), eval: &eval })
+}
+
+/// How many copies the other direction of a rectangular pattern leaves this one, so that
+/// both together stay within `MAX_COPIES`. All of them while the other count is not a number.
+fn copies_left(doc: &Document, other: &str) -> i64 {
+    let other = doc.eval(other.trim(), ValueKind::Unitless).ok().filter(|v| v.is_finite() && *v >= 1.0).map_or(1.0, f64::round);
+    (MAX_COPIES / other).floor() as i64
+}
+
 fn icons(ui: &mut egui::Ui, label: &str, labels: &[&'static str], icons: &[&'static str], selected: &mut usize) {
     ui_kit::row(ui, label, |ui| {
         let choices: Vec<_> =
@@ -356,7 +391,8 @@ fn pattern_hint(ui: &mut egui::Ui) {
 }
 
 /// Dense rows after the selection inputs; true when an expression field accepts Enter.
-pub fn rows(ui: &mut egui::Ui, k: &mut Mod) -> bool {
+/// `doc` evaluates the pattern counts the step arrows change.
+pub fn rows(ui: &mut egui::Ui, k: &mut Mod, doc: &Document) -> bool {
     let mut enter = false;
     match k {
         Mod::Scale { factor } => enter |= number(ui, "Factor", factor),
@@ -381,12 +417,13 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Mod) -> bool {
             ui_kit::options(ui, "move_options", &mut [("Create Copy", copy)]);
         }
         Mod::PatternRect { count, spacing, count2, spacing2, alignment: a, alignment2, reversed, reversed2 } => {
-            for (key, title, count, spacing, align, reverse, quantity, distance, align_label) in [
-                ("direction1", "Direction 1", count, spacing, a, reversed, "Quantity", "Spacing", "Alignment"),
-                ("direction2", "Direction 2", count2, spacing2, alignment2, reversed2, "Quantity 2", "Spacing 2", "Alignment 2"),
+            let (left1, left2) = (copies_left(doc, count2), copies_left(doc, count));
+            for (key, title, count, spacing, align, reverse, label, distance, align_label, left) in [
+                ("direction1", "Direction 1", count, spacing, a, reversed, "Quantity", "Spacing", "Alignment", left1),
+                ("direction2", "Direction 2", count2, spacing2, alignment2, reversed2, "Quantity 2", "Spacing 2", "Alignment 2", left2),
             ] {
                 ui_kit::section(ui, key, title, true, |ui| {
-                    enter |= number(ui, quantity, count);
+                    enter |= quantity(ui, doc, label, count, 1, left);
                     enter |= number(ui, distance, spacing);
                     alignment(ui, align_label, align, reverse);
                 });
@@ -394,7 +431,7 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Mod) -> bool {
             pattern_hint(ui);
         }
         Mod::PatternCirc { count, angle, alignment: a, reversed } => {
-            enter |= number(ui, "Quantity", count);
+            enter |= quantity(ui, doc, "Quantity", count, 2, MAX_COPIES as i64);
             enter |= number(ui, "Total angle", angle);
             alignment(ui, "Alignment", a, reversed);
             pattern_hint(ui);
@@ -523,7 +560,7 @@ fn entity_ids(session: &solidcraft_engine::Session, inputs: &[SelInput], i: usiz
     items(inputs, i)
         .iter()
         .filter_map(|x| match x {
-            Sel::SketchCurve { id } => Some(id.clone()),
+            Sel::SketchCurve { id, .. } => Some(id.clone()),
             _ => point_id(session, x).map(str::to_string),
         })
         .collect()
@@ -531,7 +568,7 @@ fn entity_ids(session: &solidcraft_engine::Session, inputs: &[SelInput], i: usiz
 
 /// Sketch curve ids picked in input `i`.
 fn curve_ids(inputs: &[SelInput], i: usize) -> Vec<String> {
-    items(inputs, i).iter().filter_map(|x| if let Sel::SketchCurve { id } = x { Some(id.clone()) } else { None }).collect()
+    items(inputs, i).iter().filter_map(|x| if let Sel::SketchCurve { id, .. } = x { Some(id.clone()) } else { None }).collect()
 }
 
 /// A typed scale factor as the command wants it: the field evaluated against the document's
@@ -554,7 +591,7 @@ fn value(app: &SolveApp, text: &str, kind: ValueKind, label: &str) -> Result<f64
         return Ok(0.0);
     }
     let doc = &app.session.doc;
-    let v = doc.eval(&doc.with_design_unit(text, kind), kind).map_err(|e| format!("{label}: {e}"))?;
+    let v = crate::length_input::eval(doc, text, kind).map_err(|e| format!("{label}: {e}"))?;
     if !v.is_finite() {
         return Err(format!("{label} must be a number"));
     }
@@ -566,21 +603,14 @@ fn value(app: &SolveApp, text: &str, kind: ValueKind, label: &str) -> Result<f64
 /// as a typed sketch value does everywhere else.
 fn signed_length(app: &SolveApp, label: &str, text: &str, flip: bool) -> Result<f64, String> {
     let doc = &app.session.doc;
-    let v = doc.eval(&doc.with_design_unit(text.trim(), ValueKind::Length), ValueKind::Length).map_err(|e| format!("{label}: {e}"))?;
+    let v = crate::length_input::eval(doc, text.trim(), ValueKind::Length).map_err(|e| format!("{label}: {e}"))?;
     if !v.is_finite() || v.abs() <= 1e-9 {
         return Err(format!("{label} must be a non-zero number"));
     }
     Ok(if flip { -v } else { v })
 }
 
-/// A typed count as the command wants it: the field evaluated against the document's
-/// parameters, then a whole number the engine accepts.
-///
-/// The sketch patterns read `count` and `angle` with `num`, which takes a JSON number and
-/// nothing else. An expression string would be refused outright for `count`, and silently
-/// replaced by the 360 degree default for `angle`. That silent substitution is the defect
-/// upstream #218 reports for `solid.pattern.circular`'s axis origin. The window therefore
-/// evaluates every value here and sends numbers.
+/// Validate a typed count before sending its expression to the command.
 fn whole(app: &SolveApp, label: &str, text: &str) -> Result<u64, String> {
     let v = app.session.doc.eval(text.trim(), ValueKind::Unitless).map_err(|e| format!("{label}: {e}"))?;
     if !v.is_finite() || !(1.0..=MAX_COPIES).contains(&v) || (v - v.round()).abs() > 1e-9 {
@@ -594,7 +624,7 @@ fn whole(app: &SolveApp, label: &str, text: &str) -> Result<u64, String> {
 /// zero, which a Move window wants and a pattern spacing does not.
 fn length(app: &SolveApp, label: &str, text: &str) -> Result<f64, String> {
     let doc = &app.session.doc;
-    let v = doc.eval(&doc.with_design_unit(text.trim(), ValueKind::Length), ValueKind::Length).map_err(|e| format!("{label}: {e}"))?;
+    let v = crate::length_input::eval(doc, text.trim(), ValueKind::Length).map_err(|e| format!("{label}: {e}"))?;
     if !v.is_finite() {
         return Err(format!("{label} must be a number"));
     }
@@ -605,7 +635,7 @@ fn line_ids(inputs: &[SelInput], i: usize) -> Vec<String> {
     items(inputs, i)
         .iter()
         .filter_map(|x| match x {
-            Sel::SketchCurve { id } => Some(id.clone()),
+            Sel::SketchCurve { id, .. } => Some(id.clone()),
             _ => None,
         })
         .collect()
@@ -623,7 +653,7 @@ fn corner_ids(app: &SolveApp, inputs: &[SelInput], i: usize) -> Vec<String> {
 /// a radius or a chamfer leg, so this one is its own.
 fn corner_size(app: &SolveApp, label: &str, text: &str, kind: ValueKind) -> Result<f64, String> {
     let doc = &app.session.doc;
-    let v = doc.eval(&doc.with_design_unit(text.trim(), kind), kind).map_err(|e| format!("{label}: {e}"))?;
+    let v = crate::length_input::eval(doc, text.trim(), kind).map_err(|e| format!("{label}: {e}"))?;
     if !v.is_finite() || v <= 1e-9 {
         return Err(format!("{label} must be a positive number"));
     }
@@ -665,7 +695,8 @@ fn picked_point(session: &solidcraft_engine::Session, inputs: &[SelInput], i: us
 }
 
 /// The command a sketch modify dialog makes. Scale, Move, and patterns send evaluated
-/// numbers. Offset and Fillet retain expressions in persistent driving dimensions.
+/// numbers, except circular Quantity, which keeps its authored expression. Offset and Fillet
+/// retain expressions in persistent driving dimensions.
 pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String, Value>) -> Result<Vec<(String, Value)>, String> {
     if inputs.iter().flat_map(|input| &input.items).any(|sel| matches!(sel, Sel::SketchPoint { .. }) && point_id(&app.session, sel).is_none()) {
         return Err("Select points of the sketch being edited".into());
@@ -710,7 +741,7 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             // The AXES mask also takes an origin axis, which is not a curve of this sketch and
             // cannot be a mirror line.
             let line = match items(inputs, 1).first() {
-                Some(Sel::SketchCurve { id }) => id.clone(),
+                Some(Sel::SketchCurve { id, .. }) => id.clone(),
                 Some(_) => return Err("The mirror line must be a straight curve of this sketch, not an origin axis".into()),
                 None => return Err("Select the mirror line".into()),
             };
@@ -754,7 +785,7 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             if n1.saturating_mul(n2) > MAX_COPIES as u64 {
                 return Err(format!("Quantity and Quantity 2 together must make at most {MAX_COPIES:.0} instances"));
             }
-            let mut p = json!({"entities": entities, "count": n1, "spacing": s1, "count2": n2, "spacing2": s2, "alignment": alignment, "alignment2": alignment2, "reversed": reversed, "reversed2": reversed2});
+            let mut p = json!({"entities": entities, "count": count, "spacing": spacing, "count2": count2, "spacing2": spacing2, "alignment": alignment, "alignment2": alignment2, "reversed": reversed, "reversed2": reversed2});
             // A picked direction that has no component in the sketch plane is reported rather
             // than quietly replaced by the default.
             for (index, vector_key, line_key) in [(1, "dir", "direction"), (2, "dir2", "direction2")] {
@@ -762,7 +793,7 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                     let d = sketch_dir(app, sel).ok_or("The direction must be an axis or a straight sketch curve that lies in the sketch plane")?;
                     p[vector_key] = json!([d.x, d.y]);
                     p[line_key] = match sel {
-                        Sel::SketchCurve { id } => json!(id),
+                        Sel::SketchCurve { id, .. } => json!(id),
                         _ => Value::Null,
                     };
                 } else {
@@ -789,10 +820,10 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             if n < 2 {
                 return Err("Quantity must be at least 2".into());
             }
-            let a = total_angle(app, "Total angle", angle)?;
+            total_angle(app, "Total angle", angle)?;
             (
                 "sketch.pattern.circular",
-                json!({"entities": entities, "center": center, "count": n, "angle": a, "alignment": alignment, "reversed": reversed}),
+                json!({"entities": entities, "center": center, "count": count, "angle": angle, "alignment": alignment, "reversed": reversed}),
             )
         }
         Mod::Corner { chamfer: false, size, .. } => {
@@ -800,7 +831,7 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             let lines = line_ids(inputs, 0);
             // The engine keeps its millimetre API; bare UI values use the design unit.
             // Keep expressions intact so the radius remains a driving dimension.
-            let radius = app.session.doc.with_design_unit(size.trim(), ValueKind::Length);
+            let radius = crate::length_input::expression(&app.session.doc, size, ValueKind::Length);
             match (corners.is_empty(), lines.as_slice()) {
                 (true, []) => return Err("select the corners to round first".into()),
                 (false, []) => ("sketch.fillet", json!({"points": corners, "radius": radius})),

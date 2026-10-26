@@ -1,4 +1,5 @@
 //! Menus share one popup surface and one row painter. Command dispatch stays with callers.
+use crate::ui_kit::{Container, Surface};
 use crate::{context_menu::Item, fonts::RichTextExt as _, icons, theme::Tokens};
 use egui::{Color32, FontId, Rect, Response, Sense, Stroke, Ui, pos2, vec2};
 
@@ -6,10 +7,25 @@ pub(crate) struct Menu;
 
 impl Menu {
     pub(crate) fn context<R>(response: &Response, add: impl FnOnce(&mut Ui) -> R) -> Option<egui::InnerResponse<R>> {
-        egui::Popup::context_menu(response).frame(Self::frame()).show(add)
+        Container::new(&response.ctx, Surface::Popup).context_menu(response).frame(Self::frame()).show(add)
     }
 
     pub(crate) fn button<R>(ui: &mut Ui, label: impl Into<egui::WidgetText>, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<Option<R>> {
+        Self::button_with(
+            ui,
+            |ui, nested| {
+                let button = egui::Button::new(label.into());
+                ui.add(if nested { button.right_text(egui::menu::SubMenuButton::RIGHT_ARROW) } else { button })
+            },
+            add,
+        )
+    }
+
+    pub(crate) fn item_button<R>(ui: &mut Ui, item: &MenuItem<'_>, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<Option<R>> {
+        Self::button_with(ui, |ui, _| item.show(ui), add)
+    }
+
+    fn button_with<R>(ui: &mut Ui, button: impl FnOnce(&mut Ui, bool) -> Response, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<Option<R>> {
         let previous = ui.style().clone();
         let frame = Self::frame();
         let style = ui.style_mut();
@@ -19,8 +35,7 @@ impl Menu {
         style.visuals.window_fill = frame.fill;
         style.visuals.window_stroke = frame.stroke;
         let nested = egui::menu::is_in_menu(ui);
-        let button = egui::Button::new(label.into());
-        let response = ui.add(if nested { button.right_text(egui::menu::SubMenuButton::RIGHT_ARROW) } else { button });
+        let response = button(ui, nested);
         let popup_id = if nested { egui::menu::SubMenu::id_from_widget_id(response.id) } else { egui::Popup::default_response_id(&response) };
         let was_open = ui.ctx().read_response(popup_id).is_some();
         let gate_id = popup_id.with("opening_click");
@@ -37,10 +52,12 @@ impl Menu {
             ui.spacing_mut().item_spacing.y = 0.0;
             // The opening gesture belongs to the parent even when a narrow popup overlaps it.
             ui.ctx().data_mut(|d| d.insert_temp(gate_id, first_click && !released));
-            ui.add_enabled_ui(!opening_press, add).inner
+            let result = ui.add_enabled_ui(!opening_press, add).inner;
+            Container::finish_content(ui, frame);
+            result
         };
         let popup = if nested {
-            let submenu = egui::menu::SubMenu::new();
+            let submenu = Container::new(ui.ctx(), Surface::Popup).submenu();
             let submenu = if opening_press {
                 submenu.config(egui::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
             } else {
@@ -48,7 +65,7 @@ impl Menu {
             };
             submenu.show(ui, &response, content)
         } else {
-            egui::Popup::menu(&response).frame(frame).show(content)
+            Container::new(ui.ctx(), Surface::Popup).menu(&response).frame(frame).show(content)
         };
         let response = egui::InnerResponse { response, inner: popup.map(|r| r.inner) };
         ui.set_style(previous);
@@ -56,34 +73,27 @@ impl Menu {
     }
 
     pub(crate) fn frame() -> egui::Frame {
-        let t = Tokens::get();
-        egui::Frame::NONE
-            .fill(t.dialog_body)
-            .stroke(Stroke::new(1.0, t.dialog_border))
-            .corner_radius(t.radius_xl)
-            .inner_margin(egui::Margin::symmetric(t.space_6 as i8, t.space_6 as i8))
-            .shadow(egui::Shadow {
-                offset: [0, t.space_14 as i8],
-                blur: (t.space_24 + t.space_12) as u8,
-                spread: 0,
-                color: t.app_bar.gamma_multiply(0.18),
-            })
+        super::Container::menu_frame()
+    }
+
+    pub(crate) fn show_frame<R>(ui: &mut Ui, frame: egui::Frame, add: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+        let bounds = ui.max_rect();
+        Container::new(ui.ctx(), Surface::Popup).show_frame(ui, frame, bounds, add)
     }
 
     pub(crate) fn show<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
-        Self::frame()
-            .show(ui, |ui| {
-                ui.set_width((width - Tokens::get().space_6 * 2.0 - 2.0).max(0.0));
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.with_layout(egui::Layout::top_down(egui::Align::Min), add).inner
-            })
-            .inner
+        Self::show_frame(ui, Self::frame(), |ui| {
+            ui.set_width((width - Tokens::get().space_6 * 2.0 - 2.0).max(0.0));
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), add).inner
+        })
+        .inner
     }
 
     pub(crate) fn separator(ui: &mut Ui) {
         let t = Tokens::get();
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), t.space_10 + 1.0), Sense::hover());
-        ui.painter().hline(r.x_range(), r.center().y, Stroke::new(1.0, t.dialog_rule));
+        ui.painter().hline(r.x_range(), r.center().y, t.tertiary_border(t.dialog_rule));
     }
 
     pub(crate) fn heading(ui: &mut Ui, label: &str) {
@@ -123,7 +133,7 @@ impl Menu {
         let width = crate::context_menu::LIST_W;
         let x = if row.right() + width <= screen.right() { row.right() } else { (row.left() - width).max(screen.left()) };
         let at = pos2(x, row.top().min((screen.bottom() - height).max(screen.top())));
-        crate::frame::area(id).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| Self::show(ui, width, add))
+        Container::new(ctx, Surface::Popup).area(id).fixed_pos(at).order(egui::Order::Foreground).show(ctx, |ui| Self::show(ui, width, add))
     }
 }
 
@@ -197,7 +207,7 @@ impl<'a> MenuItem<'a> {
                 super::checks::paint_check_glyph(&painter, icon, false, t.form_primary);
             }
         } else if let Some(color) = self.swatch {
-            painter.rect(icon, t.radius_sm, color, Stroke::new(1.0, t.control_border), egui::StrokeKind::Inside);
+            painter.rect(icon, t.radius_sm, color, t.control_border_stroke(t.control_border), egui::StrokeKind::Inside);
         } else if !self.icon.is_empty() {
             if self.danger {
                 icons::paint_danger(&painter, icon, self.icon, 1.0);
@@ -240,7 +250,7 @@ pub(crate) fn workspace_menu(ui: &mut egui::Ui, items: &[Item], key_row: Option<
     let t = Tokens::get();
     let width = t.form_card_width + t.form_label_width * 2.0 + t.space_24 + t.space_16 + t.space_6;
     let mut picked = None;
-    Menu::frame().inner_margin(t.space_8 + 1.0).show(ui, |ui| {
+    Menu::show_frame(ui, Menu::frame().inner_margin(t.space_8 + 1.0), |ui| {
         ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 0.0;
         ui.add_space(t.space_4);
@@ -278,18 +288,18 @@ pub(crate) fn workspace_menu(ui: &mut egui::Ui, items: &[Item], key_row: Option<
                     crate::scenario::publish_target(&handle, r);
                 }
                 if current || (item.enabled && (resp.hovered() || key_row == Some(k))) {
-                    ui.painter().rect_filled(r, 5.0, soft);
+                    ui.painter().rect_filled(r, t.control_radius.saturating_sub(1), soft);
                 }
                 ui.painter().rect_filled(
                     Rect::from_min_max(r.min + vec2(t.space_2, t.space_6 + 1.0), pos2(r.left() + 6.0, r.bottom() - 7.0)),
-                    2.0,
+                    t.radius_sm / 2,
                     accent,
                 );
                 let tile = Rect::from_center_size(
                     pos2(r.left() + 40.0, r.center().y),
                     vec2(t.space_24 + t.space_16 + t.space_4, t.space_24 + t.space_16 + t.space_4),
                 );
-                ui.painter().rect_filled(tile, 9.0, if planned { t.panel_header } else { soft });
+                ui.painter().rect_filled(tile, t.radius_xl.saturating_sub(1), if planned { t.panel_header } else { soft });
                 if !item.icon.is_empty() {
                     icons::paint_icon(ui.painter(), tile.shrink(t.space_6 + 1.0), &item.icon, if item.enabled { 1.0 } else { 0.35 });
                 }
@@ -317,7 +327,7 @@ pub(crate) fn workspace_menu(ui: &mut egui::Ui, items: &[Item], key_row: Option<
                     if current { t.on_accent } else { accent },
                 );
                 let badge_rect = Rect::from_min_size(pos2(badge_x, y - 8.0), badge.size() + vec2(t.space_12, t.space_3));
-                ui.painter().rect_filled(badge_rect, 8.0, if current { accent } else { soft });
+                ui.painter().rect_filled(badge_rect, t.radius_lg, if current { accent } else { soft });
                 ui.painter().galley(badge_rect.min + vec2(t.space_6, t.space_3 / 2.0), badge, accent);
                 let line = |content: String, y: f32| {
                     let mut job =
@@ -363,6 +373,7 @@ pub(crate) fn rename_menu(ui: &mut Ui, value: &mut String, focused: &mut bool) -
             Menu::heading(ui, "Rename");
             let id = egui::Id::new("sc_rename_text");
             let response = ui.add(super::fields::text_input(egui::TextEdit::singleline(value).id(id)).desired_width(ui.available_width()));
+            t.input_bevel(ui, &response);
             crate::scenario::publish_target("rename:name", response.rect);
             if !*focused {
                 if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
@@ -375,7 +386,8 @@ pub(crate) fn rename_menu(ui: &mut Ui, value: &mut String, focused: &mut bool) -
                 response.request_focus();
                 *focused = true;
             }
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            // Leaving the box with Tab keeps the new name as Enter does; only Escape cancels (#3313).
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab))) {
                 done = Some(true);
             }
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {

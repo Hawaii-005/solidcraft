@@ -97,7 +97,7 @@ fn install(ctx: &egui::Context, fonts: FontDefinitions) {
 }
 
 /// Install only the bundled definitions (also used by the offscreen scenario shell).
-pub(crate) fn setup_bundled_fonts(ctx: &egui::Context) {
+pub fn setup_bundled_fonts(ctx: &egui::Context) {
     install(ctx, base_font_definitions());
 }
 
@@ -234,12 +234,6 @@ fn promote_font_to_front(fonts: &mut FontDefinitions, name: &str) {
             list.insert(first, item);
         }
     }
-}
-
-/// Install font bytes as fallback for every interface family, retaining its bundled weights.
-/// Returns true if the font was parsed and installed successfully.
-pub fn install_cjk_font(ctx: &egui::Context, bytes: Vec<u8>) -> bool {
-    install_cjk_font_for(ctx, bytes, "ja")
 }
 
 /// Install the downloaded font with the CJK UI's shared mixed-script baseline.
@@ -561,12 +555,22 @@ fn scan_dir_for_font_where(dir: &std::path::Path, depth_remaining: usize, matche
     None
 }
 
-/// Find a CJK fallback font on the local system or in CRAFT_FONTS_DIR.
+/// The font folders named by `SOLIDCRAFT_FONT_DIRS` (a path list), or else by the single folder
+/// in `CRAFT_FONTS_DIR` (the craft-fonts pack).
+#[cfg(not(target_arch = "wasm32"))]
+fn font_override_dirs(dirs: Option<std::ffi::OsString>, pack: Option<std::ffi::OsString>) -> Vec<std::path::PathBuf> {
+    match (dirs, pack) {
+        (Some(dirs), _) => std::env::split_paths(&dirs).collect(),
+        (None, Some(pack)) => vec![std::path::PathBuf::from(pack)],
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Find a CJK fallback font on the local system or in SOLIDCRAFT_FONT_DIRS / CRAFT_FONTS_DIR.
 #[cfg(not(target_arch = "wasm32"))]
 fn find_system_cjk_font() -> Option<Vec<u8>> {
-    // 1. Check optional craft-fonts pack directory if specified.
-    if let Ok(craft_dir) = std::env::var("CRAFT_FONTS_DIR") {
-        let dir = std::path::Path::new(&craft_dir);
+    // 1. Check the font folders the user named.
+    for dir in font_override_dirs(std::env::var_os("SOLIDCRAFT_FONT_DIRS"), std::env::var_os("CRAFT_FONTS_DIR")) {
         let names = ["BIZUDPGothic-Regular.ttf", "BIZ-UDGothicR.ttc", "NotoSansCJK-Regular.ttc", "NotoSansJP-Regular.ttf"];
         for name in names {
             if let Some(bytes) = try_read_font(&dir.join(name)) {
@@ -621,7 +625,12 @@ fn find_system_cjk_font() -> Option<Vec<u8>> {
 
     #[cfg(target_os = "linux")]
     {
-        let search_dirs = [std::path::PathBuf::from("/usr/share/fonts"), std::path::PathBuf::from("/usr/local/share/fonts")];
+        let search_dirs = [
+            std::path::PathBuf::from("/usr/share/fonts"),
+            std::path::PathBuf::from("/usr/local/share/fonts"),
+            std::path::PathBuf::from("/run/host/fonts"),
+            std::path::PathBuf::from("/run/host/user-fonts"),
+        ];
         for dir in &search_dirs {
             if let Some(bytes) = scan_dir_for_font(dir, 3, is_cjk_font_name) {
                 return Some(bytes);
@@ -659,10 +668,75 @@ pub fn fallback_order(language: &str) -> [&'static str; 4] {
 /// when one is chosen (see [`ui_font`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn setup_fonts_for(ctx: &egui::Context, language: &str, ui_font: &str) {
-    let cjk = find_system_cjk_font();
-    let chinese = find_system_chinese_font().filter(|bytes| cjk.as_ref() != Some(bytes));
-    let hangul = HANGUL_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
-    let thai = THAI_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
+    install_fonts(ctx, language, ui_font, Some(system_fallbacks()));
+}
+
+/// The system fallback faces, searched for once and kept: reading them takes long on a system
+/// with large CJK fonts, so the app starts that search on a thread and draws its first frame
+/// with the bundled faces (see [`load_system_fonts_in_background`]).
+#[cfg(not(target_arch = "wasm32"))]
+struct SystemFonts {
+    cjk: Option<Vec<u8>>,
+    chinese: Option<Vec<u8>>,
+    hangul: Option<Vec<u8>>,
+    thai: Option<Vec<u8>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static SYSTEM_FONTS: std::sync::OnceLock<SystemFonts> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn system_fallbacks() -> &'static SystemFonts {
+    SYSTEM_FONTS.get_or_init(|| {
+        let cjk = find_system_cjk_font();
+        let chinese = find_system_chinese_font().filter(|bytes| cjk.as_ref() != Some(bytes));
+        let hangul = HANGUL_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
+        let thai = THAI_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
+        SystemFonts { cjk, chinese, hangul, thai }
+    })
+}
+
+/// Whether the system fallback faces have been searched for.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn system_fonts_ready() -> bool {
+    SYSTEM_FONTS.get().is_some()
+}
+
+/// Search for the system fallback faces on a thread and repaint when they are found.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_system_fonts_in_background(ctx: &egui::Context) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    if SYSTEM_FONTS.get().is_some() {
+        return;
+    }
+    let mut first = false;
+    STARTED.call_once(|| first = true);
+    if !first {
+        return;
+    }
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new().name("system-fonts".into()).spawn(move || {
+        system_fallbacks();
+        ctx.request_repaint();
+    });
+    // Without a thread the first frame waits for them, as it always did.
+    if spawned.is_err() {
+        system_fallbacks();
+    }
+}
+
+/// [`setup_fonts_for`] with the system fallbacks that are there already, never waiting for the search.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn setup_fonts_without_waiting(ctx: &egui::Context, language: &str, ui_font: &str) {
+    install_fonts(ctx, language, ui_font, SYSTEM_FONTS.get());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_fonts(ctx: &egui::Context, language: &str, ui_font: &str, system: Option<&SystemFonts>) {
+    let (cjk, chinese, hangul, thai) = match system {
+        Some(f) => (f.cjk.clone(), f.chinese.clone(), f.hangul.clone(), f.thai.clone()),
+        None => (None, None, None, None),
+    };
     let mut fonts = base_font_definitions();
     if let Some(font) = self::ui_font(ui_font) {
         fonts = with_ui_font(fonts, font);
@@ -750,6 +824,8 @@ fn chinese_font_dirs() -> Vec<std::path::PathBuf> {
     {
         dirs.push(std::path::PathBuf::from("/usr/share/fonts"));
         dirs.push(std::path::PathBuf::from("/usr/local/share/fonts"));
+        dirs.push(std::path::PathBuf::from("/run/host/fonts"));
+        dirs.push(std::path::PathBuf::from("/run/host/user-fonts"));
         if let Ok(home) = std::env::var("HOME") {
             dirs.push(std::path::PathBuf::from(&home).join(".local/share/fonts"));
             dirs.push(std::path::PathBuf::from(home).join(".fonts"));
@@ -769,6 +845,19 @@ fn find_chinese_font_in(dirs: &[std::path::PathBuf]) -> Option<Vec<u8>> {
 
 /// Web installs the bundled faces synchronously; Japanese is fetched by the shell on demand.
 /// Preserve that downloaded face when preferences change later in the session.
+#[cfg(target_arch = "wasm32")]
+pub fn load_system_fonts_in_background(_ctx: &egui::Context) {}
+
+#[cfg(target_arch = "wasm32")]
+pub fn system_fonts_ready() -> bool {
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn setup_fonts_without_waiting(ctx: &egui::Context, language: &str, ui_font: &str) {
+    setup_fonts_for(ctx, language, ui_font);
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn setup_fonts_for(ctx: &egui::Context, language: &str, ui_font: &str) {
     let previous = ctx.data(|d| d.get_temp::<FontDefinitions>(installed_fonts_id()));
@@ -811,6 +900,38 @@ pub(crate) fn test_context() -> egui::Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SOLIDCRAFT_FONT_DIRS` wins and may list several folders; `CRAFT_FONTS_DIR` is the fallback.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cjk_font_folders_from_the_environment() -> Result<(), std::env::JoinPathsError> {
+        use std::path::PathBuf;
+        let list = std::env::join_paths(["/a", "/b"])?;
+        assert_eq!(font_override_dirs(Some(list), Some("/pack".into())), vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(font_override_dirs(None, Some("/pack".into())), vec![PathBuf::from("/pack")]);
+        assert!(font_override_dirs(None, None).is_empty());
+        #[cfg(target_os = "linux")]
+        for dir in ["/run/host/fonts", "/run/host/user-fonts"] {
+            assert!(chinese_font_dirs().contains(&PathBuf::from(dir)), "missing {dir}");
+        }
+        Ok(())
+    }
+
+    /// The system faces are searched for on a thread; installing fonts before they are found does
+    /// not wait for the search and still gives the bundled faces.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn system_fonts_load_in_the_background_and_installing_does_not_wait() {
+        let ctx = egui::Context::default();
+        setup_fonts_without_waiting(&ctx, "en", "");
+        assert!(ctx.data(|d| d.get_temp::<FontDefinitions>(installed_fonts_id())).is_some());
+        load_system_fonts_in_background(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !system_fonts_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(system_fonts_ready());
+    }
 
     /// Whether a face of the Proportional family has `c`. Checked in the font data:
     /// `Fonts::has_glyph` misses a glyph in the face that also gives the replacement glyph.
@@ -915,9 +1036,10 @@ mod tests {
         let chosen = solidcraft_engine::sketch::DEFAULT_FONT_FAMILY;
         install(&ctx, web_font_definitions(chosen, None));
         // Both installations happen before the first frame, like a fast cached web fetch.
-        assert!(install_cjk_font(
+        assert!(install_cjk_font_for(
             &ctx,
-            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/biz-udp-gothic/BIZUDPGothic-Regular.ttf")).to_vec()
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/biz-udp-gothic/BIZUDPGothic-Regular.ttf")).to_vec(),
+            "ja",
         ));
         let installed = ctx.data(|d| d.get_temp::<FontDefinitions>(installed_fonts_id())).unwrap();
         for family in sans_families() {

@@ -8,8 +8,9 @@
 //!   row the next launch starts in safe mode by itself.
 //! - **Safe mode** (`--safe-mode` or `SOLIDCRAFT_SAFE_MODE=1`): default settings (the saved ones
 //!   are left untouched), no recovery offer, the software renderer and CPU meshing.
-//! - **No usable graphics device**: one retry on the software renderer
-//!   (`SOLIDCRAFT_RENDERER=cpu`), then a message box saying what failed and what to try.
+//! - **A renderer that cannot start**: on Windows, try the remaining graphics APIs in order,
+//!   then the software renderer (`SOLIDCRAFT_RENDERER=cpu`). An explicit `WGPU_BACKEND` fails
+//!   cleanly without switching. Exhausted retries show a message box with the error.
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,25 @@ pub const RENDERER_ENV: &str = "SOLIDCRAFT_RENDERER";
 /// Consecutive launches that died before the window was up, after which safe mode starts.
 pub const FAILED_STARTS_FOR_SAFE_MODE: u32 = 2;
 const MARKER: &str = "starting";
+
+/// Explicit application-settings isolation for side-by-side builds and native UI
+/// acceptance. A supplied invalid path refuses startup rather than falling back
+/// to the user's ordinary settings. No directory is read or created here.
+pub fn settings_directory(override_path: Option<&std::ffi::OsStr>, default: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    match override_path {
+        None => Ok(default),
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            if raw.is_empty() || !path.is_absolute() {
+                return Err("SOLIDCRAFT_SETTINGS_DIR must be a nonempty absolute directory path".into());
+            }
+            if path.exists() && !path.is_dir() {
+                return Err("SOLIDCRAFT_SETTINGS_DIR names a file, not a directory".into());
+            }
+            Ok(Some(path))
+        }
+    }
+}
 
 /// Whether an environment value switches something on.
 pub fn env_on(v: Option<&str>) -> bool {
@@ -110,6 +130,48 @@ pub fn pick_cpu_adapter(adapters: &[eframe::wgpu::Adapter], surface: Option<&efr
         })
 }
 
+/// Adapter properties used to choose a card without opening a device.
+#[derive(Clone, Debug)]
+pub struct AdapterChoice {
+    pub name: String,
+    pub compatible: bool,
+}
+
+/// Choose only surface-compatible adapters. Names saved in preferences are exact; the
+/// environment override follows wgpu's case-insensitive substring convention.
+/// No match leaves selection to the normal wgpu request.
+pub fn choose_adapter(adapters: &[AdapterChoice], environment: Option<&str>, preference: Option<&str>) -> Option<usize> {
+    // wgpu's environment helper panics on a missing name; an override must remain recoverable.
+    let compatible = || adapters.iter().enumerate().filter(|(_, a)| a.compatible);
+    if let Some(name) = environment.filter(|s| !s.is_empty()) {
+        let name = name.to_lowercase();
+        if let Some((index, _)) = compatible().find(|(_, a)| a.name.to_lowercase().contains(&name)) {
+            return Some(index);
+        }
+    }
+    if let Some(name) = preference.filter(|s| !s.is_empty())
+        && let Some((index, _)) = compatible().find(|(_, a)| a.name == name)
+    {
+        return Some(index);
+    }
+    None
+}
+
+/// Leave Automatic on wgpu's normal request path; named choices may defer to it too.
+pub fn configure_adapter(setup: &mut eframe::egui_wgpu::WgpuSetupCreateNew, cpu: bool, environment: Option<String>, preference: Option<String>) {
+    if cpu {
+        setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| pick_cpu_adapter(adapters, surface).map(Some)));
+    } else if environment.as_deref().is_some_and(|s| !s.is_empty()) || preference.as_deref().is_some_and(|s| !s.is_empty()) {
+        setup.native_adapter_selector = Some(std::sync::Arc::new(move |adapters, surface| {
+            let choices: Vec<_> = adapters
+                .iter()
+                .map(|a| AdapterChoice { name: a.get_info().name, compatible: surface.is_none_or(|s| a.is_surface_supported(s)) })
+                .collect();
+            Ok(choose_adapter(&choices, environment.as_deref(), preference.as_deref()).and_then(|i| adapters.get(i)).cloned())
+        }));
+    }
+}
+
 /// `WGPU_BACKEND`: when set, wgpu picks the backends from it and the order below is not used.
 pub const WGPU_BACKEND_ENV: &str = "WGPU_BACKEND";
 
@@ -157,6 +219,34 @@ pub fn choose_backends(
     Some(WINDOWS_ORDER.into_iter().find(|b| has_hardware(*b)).unwrap_or(Backends::DX12))
 }
 
+/// Internal, process-local retry choice; never written to the graphics preference.
+pub const RETRY_BACKEND_ENV: &str = "SOLIDCRAFT_STARTUP_BACKEND";
+/// Why this launch is using a fallback, carried to the new process for status and Preferences.
+pub const FALLBACK_NOTE_ENV: &str = "SOLIDCRAFT_GRAPHICS_FALLBACK";
+
+/// A handled startup failure tries each remaining Windows API once, then software rendering.
+/// An explicit environment choice is final, including when software rendering was requested.
+pub fn fallback_backend(windows: bool, explicit: bool, cpu: bool, failed: eframe::wgpu::Backends) -> Option<&'static str> {
+    if explicit || cpu {
+        return None;
+    }
+    if windows {
+        let last = WINDOWS_ORDER.iter().rposition(|backend| failed.intersects(*backend));
+        if let Some(next) = last.and_then(|i| WINDOWS_ORDER.get(i + 1)) {
+            return Some(if *next == eframe::wgpu::Backends::VULKAN { "vulkan" } else { "gl" });
+        }
+    }
+    Some("cpu")
+}
+
+/// Keep driver diagnostics on one bounded line, including across the finite retry chain.
+pub fn fallback_note(previous: &str, failed: eframe::wgpu::Backends, next: &str, error: &str) -> String {
+    let previous: String = previous.chars().take(2048).collect();
+    let error: String = error.chars().take(1024).collect();
+    let line = format!("{previous} Graphics fallback: {failed:?} failed ({error}); trying {next}.");
+    line.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(4096).collect()
+}
+
 /// The device feature for a 32-bit float depth buffer with a stencil (reversed depth, #1434).
 pub const FLOAT_DEPTH_STENCIL: eframe::wgpu::Features = eframe::wgpu::Features::DEPTH32FLOAT_STENCIL8;
 
@@ -189,6 +279,29 @@ pub fn has_hardware_adapter(backends: eframe::wgpu::Backends) -> bool {
     adapters.iter().any(|a| a.get_info().device_type != eframe::wgpu::DeviceType::Cpu)
 }
 
+/// The environment variable that switches wgpu's indirect-call validation on or off.
+pub const INDIRECT_VALIDATION_ENV: &str = "WGPU_VALIDATION_INDIRECT_CALL";
+
+/// The instance flags for the window. wgpu's indirect-call validation compiles a compute shader
+/// when the device is created, and on Intel Macs (macOS 12 with Intel Iris graphics, #3024,
+/// #3080, #4605) the Metal compiler refuses it: the device is lost and the window never opens.
+/// So on an Intel Mac the validation is left off, unless the user turned it on or off with
+/// `WGPU_VALIDATION_INDIRECT_CALL` themselves.
+pub fn window_instance_flags(flags: eframe::wgpu::InstanceFlags, intel_mac: bool, env: Option<&str>) -> eframe::wgpu::InstanceFlags {
+    if intel_mac && env.map(str::trim).is_none_or(str::is_empty) { flags - eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL } else { flags }
+}
+
+/// Windows with OpenGL: the window keeps the system title bar (#2063). The window without OS
+/// decorations keeps its caption style while having no frame, and some OpenGL drivers (older
+/// Intel HD/UHD) then show the picture a caption's height lower than the window, so it no longer
+/// lines up with the pointer. Direct3D 12 and Vulkan draw it in place and keep the application bar
+/// as the title bar. `backends` are the ones wgpu starts: OpenGL alone is decided before the
+/// window opens.
+pub fn system_title_bar(windows: bool, backends: eframe::wgpu::Backends) -> bool {
+    use eframe::wgpu::Backends;
+    windows && backends.contains(Backends::GL) && !backends.intersects(Backends::DX12 | Backends::VULKAN)
+}
+
 /// The message shown when no window could be opened at all.
 pub fn no_window_message(error: &str, settings: Option<&Path>) -> String {
     let folder = settings.map(|d| d.display().to_string()).unwrap_or_else(|| "the SolidCraft settings folder".into());
@@ -207,11 +320,79 @@ pub fn no_window_message(error: &str, settings: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
+    fn cards() -> Vec<AdapterChoice> {
+        ["Integrated", "Discrete small", "Discrete large"].into_iter().map(|name| AdapterChoice { name: name.into(), compatible: true }).collect()
+    }
+
+    #[test]
+    fn adapter_names_environment_override_and_missing_card_fallback() {
+        let cards = cards();
+        assert_eq!(choose_adapter(&cards, None, Some("Discrete small")), Some(1));
+        assert_eq!(choose_adapter(&cards, Some("LARGE"), Some("Discrete small")), Some(2));
+        assert_eq!(choose_adapter(&cards, None, Some("removed")), None);
+        assert_eq!(choose_adapter(&cards, Some("missing"), Some("Discrete small")), Some(1));
+        assert_eq!(choose_adapter(&cards, Some(""), Some("Discrete small")), Some(1));
+        assert_eq!(choose_adapter(&cards, None, Some("Discrete")), None, "saved names are exact");
+    }
+
+    #[test]
+    fn automatic_adapter_leaves_selection_to_wgpu() {
+        let mut cards = cards();
+        assert_eq!(choose_adapter(&cards, None, None), None);
+        assert_eq!(choose_adapter(&cards, Some(""), Some("")), None);
+        cards[2].compatible = false;
+        assert_eq!(choose_adapter(&cards, Some("large"), Some("Discrete large")), None);
+        assert_eq!(choose_adapter(&cards, Some("small"), None), Some(1));
+        assert_eq!(choose_adapter(&[], None, None), None);
+    }
+
+    #[test]
+    fn automatic_adapter_preserves_the_previous_request_configuration() {
+        use eframe::egui_wgpu::WgpuSetupCreateNew;
+        let previous = WgpuSetupCreateNew::without_display_handle();
+        for preference in [None, Some(String::new())] {
+            let mut setup = WgpuSetupCreateNew::without_display_handle();
+            configure_adapter(&mut setup, false, None, preference);
+            assert!(setup.native_adapter_selector.is_none(), "Automatic must use the normal wgpu request");
+            assert_eq!(setup.power_preference, previous.power_preference);
+            assert_eq!(setup.instance_descriptor.backends, previous.instance_descriptor.backends);
+        }
+        let mut setup = WgpuSetupCreateNew::without_display_handle();
+        configure_adapter(&mut setup, false, Some("missing".into()), Some("removed".into()));
+        assert!(setup.native_adapter_selector.unwrap()(&[], None).unwrap().is_none(), "missing names must use the normal request too");
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("solidcraft-startup-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn isolated_settings_are_explicit_absolute_and_never_fall_back() {
+        let default = std::env::temp_dir().join("ordinary-settings");
+        assert_eq!(settings_directory(None, Some(default.clone())).unwrap(), Some(default.clone()));
+        let selected = std::env::temp_dir().join("solidcraft-isolated-settings-fixture");
+        assert_eq!(settings_directory(Some(selected.as_os_str()), Some(default.clone())).unwrap(), Some(selected));
+        for raw in ["", "relative/settings", "../ordinary"] {
+            assert!(settings_directory(Some(std::ffi::OsStr::new(raw)), Some(default.clone())).is_err());
+        }
+        let file = std::env::current_exe().unwrap();
+        assert!(settings_directory(Some(file.as_os_str()), Some(default)).is_err());
+    }
+
+    #[test]
+    fn intel_macs_start_without_indirect_call_validation() {
+        use eframe::wgpu::InstanceFlags as F;
+        let on = F::VALIDATION | F::VALIDATION_INDIRECT_CALL;
+        assert_eq!(window_instance_flags(on, true, None), F::VALIDATION);
+        assert_eq!(window_instance_flags(on, true, Some("  ")), F::VALIDATION);
+        // The user's own choice stands, on or off.
+        assert_eq!(window_instance_flags(on, true, Some("1")), on);
+        assert_eq!(window_instance_flags(F::VALIDATION, true, Some("0")), F::VALIDATION);
+        // Every other machine keeps what it had.
+        assert_eq!(window_instance_flags(on, false, None), on);
     }
 
     #[test]
@@ -288,6 +469,54 @@ mod tests {
         // `auto` and blanks are the default order.
         assert_eq!(choose_backends(true, false, false, Some(" auto "), probe(&[Backends::DX12])), Some(Backends::DX12));
         assert_eq!(choose_backends(true, false, false, Some(""), probe(&[Backends::GL])), Some(Backends::GL));
+    }
+
+    #[test]
+    fn failed_windows_backends_fall_back_in_order_and_stop_after_software() {
+        use eframe::wgpu::Backends as B;
+        assert_eq!(fallback_backend(true, false, false, B::DX12), Some("vulkan"));
+        assert_eq!(fallback_backend(true, false, false, B::VULKAN), Some("gl"));
+        assert_eq!(fallback_backend(true, false, false, B::GL), Some("cpu"));
+        assert_eq!(fallback_backend(true, false, true, B::DX12), None);
+        assert_eq!(fallback_backend(true, false, false, B::DX12 | B::VULKAN), Some("gl"));
+        assert_eq!(fallback_backend(false, false, false, B::VULKAN), Some("cpu"));
+        let note = fallback_note("", B::DX12, "vulkan", "egui_pipeline\n0x80070057");
+        assert!(note.contains("egui_pipeline 0x80070057") && note.contains("vulkan") && !note.contains('\n'));
+        let long = fallback_note(&"x".repeat(5000), B::VULKAN, "gl", &"y".repeat(5000));
+        assert!(long.chars().count() <= 4096 && long.ends_with("trying gl."));
+    }
+
+    #[test]
+    fn explicit_backend_failure_never_switches_api_or_retries_software() {
+        use eframe::wgpu::Backends as B;
+        for windows in [false, true] {
+            for cpu in [false, true] {
+                for backend in [B::DX12, B::VULKAN, B::GL, B::all()] {
+                    assert_eq!(fallback_backend(windows, true, cpu, backend), None);
+                    let mut probed = false;
+                    assert_eq!(
+                        choose_backends(windows, true, cpu, Some("vulkan"), |_| {
+                            probed = true;
+                            false
+                        }),
+                        None
+                    );
+                    assert!(!probed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_opengl_on_windows_gets_the_system_title_bar() {
+        use eframe::wgpu::Backends;
+        assert!(system_title_bar(true, Backends::GL));
+        for b in [Backends::DX12, Backends::VULKAN, Backends::DX12 | Backends::GL, Backends::VULKAN | Backends::GL, Backends::all()] {
+            assert!(!system_title_bar(true, b), "{b:?}");
+        }
+        for b in [Backends::GL, Backends::VULKAN, Backends::METAL] {
+            assert!(!system_title_bar(false, b), "{b:?}");
+        }
     }
 
     #[test]

@@ -11,13 +11,15 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.draw.dimensioned";
     let create = str_(p, "command").ok_or_else(|| bad(cmd, "`command` must name a supported sketch creator"))?;
     let roles: &[&str] = match create {
-        "sketch.line" => &["length", "angle"],
+        "sketch.line" | "sketch.line.midpoint" => &["length", "angle"],
         "sketch.rectangle.two_point" | "sketch.rectangle.center" | "sketch.rectangle.three_point" | "sketch.rectangle.rounded" => {
             &["width", "height"]
         }
         "sketch.circle.center" | "sketch.circle.two_point" | "sketch.circle.three_point" => &["radius", "diameter"],
         "sketch.arc.center_point" => &["radius", "sweep"],
-        "sketch.slot.center_to_center" | "sketch.slot.overall" => &["length", "width"],
+        "sketch.slot.center_to_center" | "sketch.slot.overall" | "sketch.slot.center_point" => &["length", "width"],
+        "sketch.slot.arc_center" => &["radius", "sweep", "width"],
+        "sketch.slot.arc_three_point" => &["width"],
         "sketch.polygon.inscribed" | "sketch.polygon.circumscribed" | "sketch.polygon.edge" => &["radius"],
         _ => return Err(bad(cmd, "unsupported sketch creator")),
     };
@@ -48,6 +50,9 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
         }
         if role == "sweep" && !(evaluated.abs() > 1e-9 && evaluated.abs() < std::f64::consts::TAU - 1e-9) {
             return Err(bad(cmd, "sweep must be nonzero and less than a full turn"));
+        }
+        if role == "sweep" && create == "sketch.slot.arc_center" && evaluated <= 0.0 {
+            return Err(bad(cmd, "arc slot sweep must be greater than zero and less than a full turn"));
         }
         if role == "sweep" {
             params["sweep"] = json!(evaluated.to_degrees());
@@ -82,8 +87,8 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
     let mut added = serde_json::Map::new();
     for (role, value) in dimensions {
         let (entities, ty) = match (create, role.as_str()) {
-            ("sketch.line", "length") => (vec![curve(0)?], "length"),
-            ("sketch.line", "angle") => (vec![curve(0)?], "angle"),
+            ("sketch.line" | "sketch.line.midpoint", "length") => (vec![curve(0)?], "length"),
+            ("sketch.line" | "sketch.line.midpoint", "angle") => (vec![curve(0)?], "angle"),
             // A rounded rectangle's sides stop at the arcs: its size is between opposite sides.
             ("sketch.rectangle.rounded", "width" | "height") => {
                 let [a, b] = if role == "width" { ["left", "right"] } else { ["bottom", "top"] };
@@ -94,9 +99,13 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
             (c, "width" | "height") if c.starts_with("sketch.rectangle.") => (vec![curve(usize::from(role == "height"))?], "length"),
             (c, "radius" | "diameter") if c.starts_with("sketch.circle.") => (vec![curve(0)?], role.as_str()),
             ("sketch.arc.center_point", "radius" | "sweep") => (vec![curve(0)?], role.as_str()),
-            ("sketch.slot.center_to_center", "length") => (vec![curve(0)?], "length"),
+            ("sketch.slot.center_to_center" | "sketch.slot.center_point", "length") => (vec![curve(0)?], "length"),
             ("sketch.slot.overall", "length") => (vec![curve(1)?, curve(3)?], "overall_length"),
-            ("sketch.slot.center_to_center" | "sketch.slot.overall", "width") => (vec![curve(1)?], "diameter"),
+            (c, "width") if c.starts_with("sketch.slot.") => (vec![curve(1)?], "diameter"),
+            ("sketch.slot.arc_center", "radius" | "sweep") => {
+                let centre = out.get("centre_arc").filter(|v| v.is_string()).cloned().ok_or_else(|| bad(cmd, "slot centre arc missing"))?;
+                (vec![centre], role.as_str())
+            }
             (c, "radius") if c.starts_with("sketch.polygon.") => {
                 let support =
                     out.get("support_circle").filter(|v| v.is_string()).cloned().ok_or_else(|| bad(cmd, "polygon support circle missing"))?;

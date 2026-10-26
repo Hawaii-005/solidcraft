@@ -141,7 +141,7 @@ fn in_quad(p: Pos2, q: &Ring<Pos2>) -> bool {
 }
 
 /// Where the view ray through `pos` meets the plane through `o` with normal `n`.
-fn on_plane(proj: &Proj, pos: Pos2, o: Vec3, n: Vec3) -> Option<Vec3> {
+pub(crate) fn on_plane(proj: &Proj, pos: Pos2, o: Vec3, n: Vec3) -> Option<Vec3> {
     let (ro, rd) = proj.ray(pos);
     let den = rd.dot(n);
     if den.abs() < 1e-9 {
@@ -228,6 +228,11 @@ fn mm_per_px(proj: &Proj, c: Vec3) -> Option<f64> {
     (px > 1e-9).then(|| 1.0 / px)
 }
 
+/// Radius shared by the triad rings and the selected-axis Rotate handle.
+pub(crate) fn ring_radius(proj: &Proj, centre: Vec3) -> Option<f64> {
+    Some(mm_per_px(proj, centre)? * LEN_PX * RING)
+}
+
 fn snap(v: f64, step: f64, free: bool) -> f64 {
     if free || step <= 0.0 { v } else { (v / step).round() * step }
 }
@@ -259,7 +264,7 @@ pub fn show(ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, id: egui::I
     let hovered = if state.is_none() { pointer.filter(|_| ui.rect_contains_pointer(proj.rect)).and_then(|p| hit(&sh, p)) } else { None };
     let active = state.map(|s| s.handle).or(hovered);
     let hot = |h: Handle| active == Some(h);
-    let col = |h: Handle, i: usize| if hot(h) { tk.accent } else { tk.gizmo[i.min(2)] };
+    let col = |h: Handle, i: usize| if hot(h) { tk.accent } else { tk.axes()[i.min(2)] };
     for (i, pts) in &sh.rings {
         painter.add(Shape::line(pts.clone(), Stroke::new(if hot(Handle::Ring(*i)) { 3.0 } else { 1.8 }, col(Handle::Ring(*i), *i))));
     }

@@ -420,18 +420,31 @@ fn hook(info: &std::panic::PanicHookInfo<'_>) -> bool {
     let sig = signature(&location, &message);
     let recovered = solidcraft_kernel::guarded();
     let in_command = IN_COMMAND.with(Cell::get) > 0;
-    // Already reported (this run or before): count it, nothing else.
-    let repeat = match state.known.lock() {
-        Ok(mut k) => match k.get_mut(&sig) {
-            Some(e) => {
+    let quiet = recovered || in_command;
+    // Already reported (this run or before): count it, nothing else. A panic outside commands
+    // can end the app before `end_session` writes the counts, so its count goes to the report
+    // now, and the journal says it was reported (or the next start reports an unclean exit).
+    let known = state.known.lock().map(|mut k| {
+        k.get_mut(&sig).map(|e| {
+            if quiet {
                 e.0 += 1;
-                true
             }
-            None => false,
-        },
+            e.1.clone()
+        })
+    });
+    let repeat = match known {
+        Ok(Some(id)) => {
+            if !quiet {
+                bump(&state.dir, &id, 1);
+                if let Ok(mut j) = state.journal.try_lock() {
+                    j.record(&json!({ "reported": id }));
+                }
+            }
+            true
+        }
+        Ok(None) => false,
         Err(_) => true,
     };
-    let quiet = recovered || in_command;
     if repeat {
         IN_HOOK.store(false, Ordering::SeqCst);
         return quiet;
@@ -494,18 +507,45 @@ pub(crate) fn command_begin(s: &Session, id: &str, params: &Value) {
     let ptr = std::sync::Arc::as_ptr(&s.doc) as usize;
     if ptr != j.last_doc {
         // The design changed outside commands (opened, a new tab, a dialog): what is it now?
-        let base = if s.is_dirty() {
-            json!("unknown")
-        } else if let Some(p) = &s.path {
-            json!({ "file": p })
-        } else if s.doc.features.is_empty() {
-            json!("new")
-        } else {
-            json!("unknown")
-        };
+        j.rebase(&journal_base(s), ptr);
+    }
+    j.run(id, params);
+}
+
+fn journal_base(s: &Session) -> Value {
+    if s.is_dirty() {
+        json!("unknown")
+    } else if let Some(path) = &s.path {
+        json!({ "file": path })
+    } else if s.doc.features.is_empty() {
+        json!("new")
+    } else {
+        json!("unknown")
+    }
+}
+
+/// Record a successful isolated command only after its entire transaction is accepted.
+pub(crate) fn accepted_command(
+    s: &Session,
+    before: &std::sync::Arc<Document>,
+    after: &std::sync::Arc<Document>,
+    id: &str,
+    params: &Value,
+    changed: bool,
+) {
+    let Some(state) = STATE.get() else { return };
+    if !s.crash_journal {
+        return;
+    }
+    let Ok(mut j) = state.journal.lock() else { return };
+    let ptr = std::sync::Arc::as_ptr(before) as usize;
+    if ptr != j.last_doc {
+        let base = if std::sync::Arc::ptr_eq(&s.doc, before) { journal_base(s) } else { json!("unknown") };
         j.rebase(&base, ptr);
     }
     j.run(id, params);
+    j.done(&Ok(()), changed);
+    j.last_doc = std::sync::Arc::as_ptr(after) as usize;
 }
 
 /// A top-level command ended: the journal records how, and panics caught inside it are reported

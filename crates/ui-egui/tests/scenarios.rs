@@ -44,9 +44,10 @@ fn angle_dimension_both_interactive_workflows() {
             {"call":"ui.view","params":{"view":"top"}}
         ]))
         .unwrap();
+        // Pick the lines away from MID snaps so this remains an angular workflow.
         let picks = json!([
-            {"click":{"sketch":[20,0]}},
-            {"click":{"sketch":[15,15]},"shift":true}
+            {"click":{"sketch":[10,0]}},
+            {"click":{"sketch":[10,10]},"shift":true}
         ]);
         if preselect {
             h.run(&picks).unwrap();
@@ -153,7 +154,7 @@ fn home_tab_and_file_recent_open_designs() {
         {"click":{"handle":"tab:home"}},
         {"click":{"handle":"home:recent:0"}},
         {"until":{"file_busy":false}},
-        {"expect":{"home":false,"bodies":1,"documents":2}},
+        {"expect":{"home":false,"bodies":1,"documents":1}},
         {"click":{"handle":"appbar:folder"}},
         {"widget":"Open Recent"}
     ]))
@@ -161,7 +162,7 @@ fn home_tab_and_file_recent_open_designs() {
     h.run(&json!([
         {"widget":path},
         {"until":{"file_busy":false}},
-        {"expect":{"home":false,"bodies":1,"documents":3}}
+        {"expect":{"home":false,"bodies":1,"documents":1}}
     ]))
     .unwrap();
 }

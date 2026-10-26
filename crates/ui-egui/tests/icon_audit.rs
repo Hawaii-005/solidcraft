@@ -97,6 +97,27 @@ fn ribbon(h: &mut Harness, requested: &mut BTreeMap<String, bool>) {
     }
 }
 
+fn assistant(h: &mut Harness, requested: &mut BTreeMap<String, bool>) {
+    use solidcraft_ui_egui::agent_chat::{Item, backend::ToolStatus};
+    h.call("ui.agent_chat", json!({"features":true,"open":true,"picker":false,"width":440}));
+    h.app.agent_chat.items = vec![
+        Item::User { text: "Round the plate edges".into(), image: false, pictures: vec![], context: Default::default(), files: vec![] },
+        Item::Tool {
+            id: "audit".into(),
+            title: "solid.fillet".into(),
+            kind: "other".into(),
+            status: Some(ToolStatus::Failed),
+            output: Some("Use a smaller radius".into()),
+        },
+        Item::Approval { id: 1, title: "Export plate.step".into(), tool: "export".into(), answer: None },
+    ];
+    h.frames(3);
+    collect(h, "Assistant composer, tool and approval", requested);
+    h.app.agent_chat.items.clear();
+    h.call("ui.agent_chat", json!({"open":false}));
+    h.frames(2);
+}
+
 fn panels(h: &mut Harness, requested: &mut BTreeMap<String, bool>) {
     for command in solidcraft_engine::command_specs() {
         let panel = solidcraft_ui_egui::dialogs::Dialog::for_command(&h.app, command.id).is_some()
@@ -147,8 +168,15 @@ fn requested_menu_icons_have_artwork_and_match_manifest() {
     h.frames(3);
     let mut requested = BTreeMap::new();
     collect(&mut h, "initial browser and timeline", &mut requested);
+    assistant(&mut h, &mut requested);
 
     ribbon(&mut h, &mut requested);
+    h.app.start("inspect.colored_components");
+    h.frames(2);
+    click(&mut h, "panel:INSPECT:CHECK");
+    collect(&mut h, "component colors enabled", &mut requested);
+    escape(&mut h);
+    h.app.start("inspect.colored_components");
     click(&mut h, "appbar:file");
     assert!(h.widget("Export Current View as DXF…").is_some(), "painted File rows retain accessible action labels");
     collect(&mut h, "File", &mut requested);
@@ -210,6 +238,10 @@ fn requested_menu_icons_have_artwork_and_match_manifest() {
         history.frames(3);
         context_rows(&mut history, "timeline:", &mut requested);
     }
+    // The seam has its own checked display menu, independent of feature and folder rows.
+    history.step(&json!({"click":{"handle":"history:names"},"button":"right"})).unwrap();
+    collect(&mut history, "history seam", &mut requested);
+    escape(&mut history);
     let features = history.app.session.doc.features.iter().take(2).map(|f| f.id).collect::<Vec<_>>();
     let group = history.app.run("timeline.group", json!({"features":features,"name":"Audit history folder"})).unwrap()["group"].as_u64().unwrap();
     history.frames(3);
@@ -217,13 +249,13 @@ fn requested_menu_icons_have_artwork_and_match_manifest() {
     history.app.tree.picked_timeline_groups.clear();
     history.app.run("select.set", json!({"items":features.iter().map(|id| json!({"type":"feature","id":id})).collect::<Vec<_>>()})).unwrap();
     history.frames(3);
-    history.step(&json!({"widget":"2 selected"})).unwrap();
+    history.step(&json!({"click":{"handle":"timeline:History A"},"button":"right"})).unwrap();
     collect(&mut history, "history feature selection", &mut requested);
     escape(&mut history);
     history.app.run("select.clear", json!({})).unwrap();
     history.app.tree.picked_timeline_groups = vec![group];
     history.frames(3);
-    history.step(&json!({"widget":"1 selected"})).unwrap();
+    history.step(&json!({"click":{"handle":"timeline-folder:Audit history folder"},"button":"right"})).unwrap();
     collect(&mut history, "history folder selection", &mut requested);
     escape(&mut history);
     history.app.tree.picked_timeline_groups.clear();
@@ -344,6 +376,13 @@ fn requested_menu_icons_have_artwork_and_match_manifest() {
     let path = geometry.dir.join("audit.solidcraft");
     geometry.app.run("file.save", json!({"path":path})).unwrap();
     geometry.app.home.recent = vec![path.to_string_lossy().into_owned()];
+    geometry.app.recoverable.push(solidcraft_engine::recovery::Entry {
+        id: "icon-audit".into(),
+        path: Some("audit.solidcraft".into()),
+        name: "Audit design".into(),
+        saved_at: 0,
+        features: 1,
+    });
     geometry.app.home.open = true;
     geometry.frames(3);
     context_rows(&mut geometry, "home:recent:", &mut requested);
@@ -401,7 +440,8 @@ fn requested_menu_icons_have_artwork_and_match_manifest() {
     if std::env::var("UPDATE_ICON_MANIFEST").as_deref() == Ok("1") {
         std::fs::write(&path, &manifest).unwrap();
     } else {
-        let expected = std::fs::read_to_string(&path).unwrap_or_default();
+        // A Windows checkout (core.autocrlf) gives the file CRLF line endings (#4932).
+        let expected = std::fs::read_to_string(&path).unwrap_or_default().replace("\r\n", "\n");
         assert_eq!(
             expected, manifest,
             "Runtime icon discovery changed. Regenerate with UPDATE_ICON_MANIFEST=1 cargo test -p solidcraft-ui-egui --test icon_audit"
@@ -449,7 +489,7 @@ fn offset_mode_artwork_review() {
             );
             let mut x = column as i32 * 200 + 8;
             for px in [64, 24, 16] {
-                let look = icon_svg::Look { dark, accent: resolved.accent, vision: ColorVision::Off };
+                let look = icon_svg::Look::themed(dark, resolved.accent, ColorVision::Off);
                 let pm = icon_svg::render(icon_svg::doc_for(resolved.master, px).unwrap(), look, px).unwrap();
                 sheet.draw_pixmap(x, row as i32 * 88 + 8, pm.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
                 x += px as i32 + 16;

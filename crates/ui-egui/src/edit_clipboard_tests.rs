@@ -48,6 +48,66 @@ fn start(h: &Harness, id: &str) -> Vec2 {
     sk.point(c.kind.point_ids()[0]).unwrap()
 }
 
+fn clipboard_frame(h: &mut Harness, ctx: &egui::Context, events: Vec<egui::Event>) {
+    let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| super::handle(&mut h.app, ui.ctx()));
+}
+
+fn middle_button(pressed: bool) -> egui::Event {
+    egui::Event::PointerButton { pos: egui::pos2(500.0, 500.0), button: egui::PointerButton::Middle, pressed, modifiers: egui::Modifiers::NONE }
+}
+
+#[test]
+fn middle_button_press_and_hold_do_not_paste() {
+    let (mut h, _) = rectangle();
+    assert!(super::copy(&mut h.app));
+    let before = curves(&h);
+    let undo = h.app.session.undo.len();
+    let ctx = egui::Context::default();
+    clipboard_frame(&mut h, &ctx, vec![middle_button(true), egui::Event::Paste("primary selection".into())]);
+    assert_eq!(curves(&h), before, "middle-button press must only navigate");
+    clipboard_frame(&mut h, &ctx, vec![egui::Event::Paste("primary selection".into())]);
+    assert_eq!(curves(&h), before, "holding the middle button must only navigate");
+    assert_eq!(h.app.session.undo.len(), undo);
+}
+
+#[test]
+fn middle_button_release_and_single_frame_click_do_not_paste() {
+    for single_frame in [false, true] {
+        let (mut h, _) = rectangle();
+        assert!(super::copy(&mut h.app));
+        let before = curves(&h);
+        let undo = h.app.session.undo.len();
+        let ctx = egui::Context::default();
+        let mut events = vec![middle_button(true)];
+        if !single_frame {
+            clipboard_frame(&mut h, &ctx, std::mem::take(&mut events));
+        }
+        events.extend([middle_button(false), egui::Event::Paste("primary selection".into())]);
+        clipboard_frame(&mut h, &ctx, events);
+        assert_eq!(curves(&h), before, "middle-button release must not paste (single frame: {single_frame})");
+        assert_eq!(h.app.session.undo.len(), undo);
+    }
+}
+
+#[test]
+fn keyboard_paste_still_works_with_and_without_middle_button() {
+    for modifiers in [egui::Modifiers::CTRL | egui::Modifiers::COMMAND, egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND] {
+        let (mut h, _) = rectangle();
+        assert!(super::copy(&mut h.app));
+        let before = curves(&h).len();
+        let ctx = egui::Context::default();
+        clipboard_frame(
+            &mut h,
+            &ctx,
+            vec![middle_button(true), egui::Event::Key { key: egui::Key::V, physical_key: None, pressed: true, repeat: false, modifiers }],
+        );
+        assert_eq!(curves(&h).len(), before + 4, "explicit keyboard paste works while navigating");
+        clipboard_frame(&mut h, &ctx, vec![middle_button(false)]);
+        clipboard_frame(&mut h, &ctx, vec![egui::Event::Paste("keyboard clipboard".into())]);
+        assert_eq!(curves(&h).len(), before + 8, "keyboard paste events work after navigation ends");
+    }
+}
+
 #[test]
 fn ctrl_c_ctrl_v_pastes_the_sketch_selection_at_the_cursor_selected_in_one_undo_step() {
     let (mut h, rect) = rectangle();
@@ -68,7 +128,7 @@ fn ctrl_c_ctrl_v_pastes_the_sketch_selection_at_the_cursor_selected_in_one_undo_
     assert!(start(&h, &rect[0]).dist(Vec2::ZERO) < 1e-9);
     // Selected, ready to move.
     let selected: Vec<String> =
-        h.app.session.selection.iter().filter_map(|s| if let Sel::SketchCurve { id } = s { Some(id.clone()) } else { None }).collect();
+        h.app.session.selection.iter().filter_map(|s| if let Sel::SketchCurve { id, .. } = s { Some(id.clone()) } else { None }).collect();
     assert_eq!(selected, pasted);
     // One undo step.
     assert_eq!(h.app.session.undo.len(), undo + 1);
@@ -187,7 +247,6 @@ fn contribution_saved_part(file: &ContributionPart) -> crate::SolveApp {
 fn contribution_linked_design_clipboard_crosses_tabs_reuses_links_and_undoes_once() {
     let file = ContributionPart::new();
     let mut app = contribution_saved_part(&file);
-    assert!(super::can_copy(&app));
     assert!(super::copy(&mut app));
     crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
     assert!(super::can_paste(&app));
@@ -278,7 +337,7 @@ fn contribution_linked_paste_uses_the_pointer_and_pending_numeric_move() {
 fn contribution_paste_pointer_uses_parent_coordinates_and_safe_fallbacks() {
     use solidcraft_engine::{doc, geom::Vec3};
     let mut h = crate::scenario::Harness::new();
-    let parent = h.app.run("component.create", json!({"name":"Parent"})).unwrap();
+    let parent = h.app.run("component.create", json!({"name":"Parent","grounded":false})).unwrap();
     h.app
         .run("occurrence.move", json!({"occurrence":parent["occurrence"],"translate":[20,30,10],"axis":[1,0,0],"angle":"45 deg","capture":true}))
         .unwrap();

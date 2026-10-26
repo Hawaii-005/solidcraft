@@ -4,7 +4,7 @@ use egui::RichText;
 use serde_json::{Value, json};
 use solidcraft_engine::Sel;
 use solidcraft_engine::doc::face_anchor::plane_face_anchor;
-use solidcraft_engine::doc::{EmbossFace, FaceAttachmentStatus, FeatureKind, mat_inverse};
+use solidcraft_engine::doc::{EmbossFace, FaceAttachmentStatus, FeatureKind, PlaneRef, mat_inverse};
 use solidcraft_engine::geom::{Plane, Vec3};
 
 use crate::SolveApp;
@@ -100,6 +100,25 @@ pub fn face_plane(app: &SolveApp, selection: &Sel) -> Option<Value> {
     }
 }
 
+/// What a sketch's plane is, for the Redefine Sketch Plane panel: `XY`, a construction plane's
+/// name, or the plane it's offset from, turned from or flipped from (#5103).
+pub(crate) fn plane_description(plane: &PlaneRef) -> String {
+    fn describe(plane: &PlaneRef, depth: usize) -> String {
+        let base = |b: &PlaneRef| if depth < 8 { describe(b, depth + 1) } else { crate::i18n::tr("sketch_panel.plane_fixed").to_owned() };
+        match plane {
+            PlaneRef::Origin { name } => crate::i18n::format("sketch_panel.plane_origin", &[("plane", name)]),
+            PlaneRef::Construction { name } => name.to_string(),
+            PlaneRef::Offset { base: b, distance } => {
+                crate::i18n::format("sketch_panel.plane_offset", &[("plane", &base(b)), ("distance", distance)])
+            }
+            PlaneRef::AtAngle { base: b, angle, .. } => crate::i18n::format("sketch_panel.plane_angle", &[("plane", &base(b)), ("angle", angle)]),
+            PlaneRef::Flipped { base: b, .. } => crate::i18n::format("sketch_panel.plane_flipped", &[("plane", &base(b))]),
+            _ => crate::i18n::tr("sketch_panel.plane_fixed").to_owned(),
+        }
+    }
+    describe(plane, 0)
+}
+
 fn face_label(app: &SolveApp, selection: &Sel) -> String {
     let Sel::Face { body, .. } = selection else { return String::new() };
     let placed = app.session.placed_document();
@@ -136,7 +155,7 @@ pub fn panel(app: &mut SolveApp, ctx: &egui::Context) {
     let mut apply = false;
     let mut cancel = false;
     let t = Tokens::get();
-    let viewport = crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect()));
+    let viewport = crate::agent_chat::tool_space(app, crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect())));
     if !viewport.is_finite() || !viewport.is_positive() {
         app.tree.redefine_draft = Some(draft);
         return;
@@ -149,13 +168,14 @@ pub fn panel(app: &mut SolveApp, ctx: &egui::Context) {
     let top = crate::shell::panel_top(app, viewport, viewport.bottom(), side);
     let docked = egui::pos2(side.anchor_x(viewport), top);
     let moved = crate::frame::dock_offset(ctx, "sc_redefine");
-    let anchor = crate::frame::offset_anchor(docked, moved, viewport, side);
+    let drag_bounds = crate::shell::tool_drag_rect(app, viewport);
+    let anchor = crate::frame::offset_anchor(docked, moved, drag_bounds, side);
     let frame = ui_kit::Panel::feature_frame(ctx, app.ui.layout, side);
     let spec = solidcraft_engine::find_command("sketch.redefine");
     let command = spec.as_ref().map_or("", |s| crate::i18n::tr_label(s.label));
     let title = crate::i18n::format("sketch_panel.redefine_title", &[("command", command), ("name", name)]);
-    let panel = ui_kit::Panel::new(&title, egui::Id::new("sc_redefine"), anchor, viewport, side, frame);
-    let response = panel.window().show(ctx, |ui| {
+    let panel = ui_kit::Panel::new(&title, egui::Id::new("sc_redefine"), anchor, drag_bounds, side, frame);
+    let response = panel.window(ctx).show(ctx, |ui| {
         let (closed, action) = panel.feature(
             ui,
             ui_kit::FeatureOptions {
@@ -203,6 +223,13 @@ pub fn panel(app: &mut SolveApp, ctx: &egui::Context) {
                         *plane
                     }
                     FaceAttachmentStatus::Fixed { plane } => {
+                        // Name the plane it's on now: an origin or construction plane (#5103).
+                        if let Some(FeatureKind::Sketch { plane: on, .. }) = app.session.doc.feature(sketch).map(|f| &f.kind) {
+                            let now = plane_description(on);
+                            ui_kit::row(ui, "Current plane", |ui| {
+                                ui.label(now);
+                            });
+                        }
                         ui.label(crate::i18n::tr_label("Sketch plane has no body-face attachment."));
                         *plane
                     }

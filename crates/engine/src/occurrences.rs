@@ -32,6 +32,25 @@ pub(crate) struct VisibilityCache {
     bodies: std::collections::BTreeSet<String>,
 }
 
+/// [`Session::occurrence_bodies`] answers for one document, evaluated model and set of pending
+/// moves. The document and model are kept alive with the answers, so neither a new document nor
+/// a later allocation at the same address can reuse them.
+pub(crate) struct OccurrenceBodiesCache {
+    doc: std::sync::Arc<solidcraft_doc::Document>,
+    model: std::sync::Arc<solidcraft_doc::ModelState>,
+    pending_moves: std::collections::BTreeMap<u64, Mat>,
+    bodies: std::collections::HashMap<(Vec<u64>, bool), std::sync::Arc<[String]>>,
+}
+
+/// How many placements' answers [`OccurrenceBodiesCache`] keeps before it starts again.
+const OCCURRENCE_BODIES_CACHED: usize = 256;
+
+impl OccurrenceBodiesCache {
+    fn matches(&self, session: &Session, model: &std::sync::Arc<solidcraft_doc::ModelState>) -> bool {
+        std::sync::Arc::ptr_eq(&self.doc, &session.doc) && std::sync::Arc::ptr_eq(&self.model, model) && self.pending_moves == session.pending_moves
+    }
+}
+
 /// [`Session::body_removed_later`] for one revision, sketch and history marker.
 pub(crate) struct RemovedLaterCache {
     revision: u64,
@@ -41,6 +60,71 @@ pub(crate) struct RemovedLaterCache {
 }
 
 impl Session {
+    /// Hidden names follow the same body and exact occurrence path through a rename. Undo
+    /// history restores visibility separately. Never parse display labels:
+    /// ambiguous labels and names containing slashes use the document's canonical naming.
+    pub(crate) fn remap_hidden_bodies(
+        &mut self,
+        previous: &solidcraft_doc::Document,
+        state: &solidcraft_doc::ModelState,
+        rename: Option<(&str, &str)>,
+    ) {
+        if self.visibility.hidden_bodies.is_empty() {
+            return;
+        }
+        if rename.is_none() {
+            if previous.occurrences == self.doc.occurrences {
+                return;
+            }
+            let old_names: std::collections::BTreeMap<_, _> = previous.occurrences.iter().map(|o| (o.id, &o.name)).collect();
+            if !self.doc.occurrences.iter().any(|o| old_names.get(&o.id).is_some_and(|name| **name != o.name)) {
+                return;
+            }
+        }
+        let mut renamed = state.clone();
+        if let Some((old, new)) = rename {
+            for body in renamed.bodies.iter_mut().filter(|body| body.name == old) {
+                body.name = new.to_string();
+            }
+        }
+        let hidden: std::collections::BTreeSet<_> = self.visibility.hidden_bodies.iter().map(String::as_str).collect();
+        let mut names = std::collections::BTreeMap::new();
+        for (component, path, _) in previous.placements() {
+            for body in state.bodies.iter().filter(|body| previous.model_body_component(body) == component) {
+                let old = previous.world_body_name(state, &body.name, component, &path);
+                if hidden.contains(old.as_str()) {
+                    let source = rename.filter(|(old, _)| *old == body.name).map_or(body.name.as_str(), |(_, new)| new);
+                    names.insert(old, self.doc.world_body_name(&renamed, source, component, &path));
+                }
+            }
+        }
+        for hidden in &mut self.visibility.hidden_bodies {
+            if let Some(new) = names.get(hidden) {
+                hidden.clone_from(new);
+            }
+        }
+    }
+
+    /// Visibility keeps construction names, while undo history keeps feature ids. Follow the
+    /// same axis or point into the new document on rename, undo and redo (#4419).
+    pub(crate) fn follow_axis_point_renames(&mut self, previous: &solidcraft_doc::Document) {
+        if self.visibility.hidden_origin.is_empty() {
+            return;
+        }
+        let names: std::collections::HashMap<_, _> = self.doc.features.iter().map(|f| (f.id, &f.name)).collect();
+        let renamed: std::collections::HashMap<_, _> = previous
+            .features
+            .iter()
+            .filter(|f| matches!(f.kind, FeatureKind::ConstructionAxis { .. } | FeatureKind::ConstructionPoint { .. }))
+            .filter_map(|f| names.get(&f.id).filter(|name| **name != &f.name).map(|name| (f.name.as_str(), *name)))
+            .collect();
+        for name in &mut self.visibility.hidden_origin {
+            if let Some(new) = renamed.get(name.as_str()) {
+                name.clone_from(new);
+            }
+        }
+    }
+
     /// Document with uncaptured occurrence positions applied, without changing saved geometry.
     pub fn placed_document(&self) -> std::borrow::Cow<'_, solidcraft_doc::Document> {
         if self.pending_moves.is_empty() {
@@ -121,6 +205,38 @@ impl Session {
 
     /// Bounded descendant expansion. Never return an incomplete selection or bounds list.
     pub fn occurrence_bodies(&self, path: &[u64], descendants: bool) -> Result<Vec<String>> {
+        Ok(self.occurrence_bodies_shared(path, descendants)?.to_vec())
+    }
+
+    /// [`Self::occurrence_bodies`], shared and remembered until the document, the evaluated
+    /// model or the pending moves change: a nested placement's subtree is walked once, not on
+    /// every frame that lights it (a browser row under the pointer, the active placement; #3892).
+    pub fn occurrence_bodies_shared(&self, path: &[u64], descendants: bool) -> Result<std::sync::Arc<[String]>> {
+        let model = self.model.state();
+        let key = (path.to_vec(), descendants);
+        if let Ok(cache) = self.occurrence_bodies_cache.lock()
+            && let Some(bodies) = cache.as_ref().filter(|c| c.matches(self, &model)).and_then(|c| c.bodies.get(&key))
+        {
+            return Ok(bodies.clone());
+        }
+        let bodies: std::sync::Arc<[String]> = self.expand_occurrence_bodies(path, descendants)?.into();
+        if let Ok(mut cache) = self.occurrence_bodies_cache.lock() {
+            if cache.as_ref().is_none_or(|c| !c.matches(self, &model) || c.bodies.len() >= OCCURRENCE_BODIES_CACHED) {
+                *cache = Some(OccurrenceBodiesCache {
+                    doc: self.doc.clone(),
+                    model,
+                    pending_moves: self.pending_moves.clone(),
+                    bodies: std::collections::HashMap::new(),
+                });
+            }
+            if let Some(cache) = cache.as_mut() {
+                cache.bodies.insert(key, bodies.clone());
+            }
+        }
+        Ok(bodies)
+    }
+
+    fn expand_occurrence_bodies(&self, path: &[u64], descendants: bool) -> Result<Vec<String>> {
         let mut stack = vec![self.occurrence_placement(path)?];
         let mut out = Vec::new();
         let mut count = 0;
@@ -316,7 +432,10 @@ impl Session {
         let mut plane = plane;
         loop {
             match plane {
-                PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => plane = base,
+                PlaneRef::Offset { base, .. }
+                | PlaneRef::ThroughPoint { base, .. }
+                | PlaneRef::AtAngle { base, .. }
+                | PlaneRef::Flipped { base, .. } => plane = base,
                 // A face attachment that names no exact source: which body it sits on is unknown,
                 // so none is taken from the view.
                 PlaneRef::Face { anchor: None, .. } => return none,

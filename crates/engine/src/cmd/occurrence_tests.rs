@@ -6,11 +6,99 @@ fn run(s: &mut Session, command: &str, p: Value) -> Value {
     s.execute(command, &p).unwrap()
 }
 fn created(s: &mut Session, name: &str) -> (u64, u64) {
-    let c = run(s, "component.create", json!({"name": name}));
+    let c = run(s, "component.create", json!({"name": name, "grounded": false}));
     (c["component"].as_u64().unwrap(), c["occurrence"].as_u64().unwrap())
 }
 fn near(value: &Value, expected: f64) {
     assert!((value.as_f64().unwrap() - expected).abs() < 1e-6, "{value} != {expected}");
+}
+
+#[test]
+fn component_create_rejects_bodies_without_changing_design() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":10,"width":10,"height":10,"body_name":"Body1"}));
+    let doc = s.doc.clone();
+    let active_path = s.active_occurrence_path.clone();
+    let error = s.execute("component.create", &json!({"name":"Part","bodies":["Body1"]})).unwrap_err();
+    assert!(matches!(&error, crate::EngineError::BadParams { cmd, .. } if cmd == "component.create"));
+    let msg = error.to_string();
+    for expected in ["bodies", "name, parent, parent_path, activate", "component.move_bodies", "component.from_bodies"] {
+        assert!(msg.contains(expected), "{msg}");
+    }
+    assert_eq!(s.doc, doc);
+    assert_eq!(s.active_component, 0);
+    assert_eq!(s.active_occurrence_path, active_path);
+    assert_eq!(s.doc.model_body_component(s.model.state().body("Body1").unwrap()), 0);
+}
+
+#[test]
+fn component_create_rejects_unknown_keys_and_accepts_documented_keys() {
+    let mut s = Session::default();
+    let (parent, occurrence) = created(&mut s, "Parent");
+    let params = json!({"name":"Child","parent":parent,"parent_path":[occurrence],"activate":false});
+    let mut invalid = params.clone();
+    invalid["activte"] = json!(true);
+    let doc = s.doc.clone();
+    let error = s.execute("component.create", &invalid).unwrap_err().to_string();
+    assert!(error.contains("activte"), "{error}");
+    assert!(error.contains("name, parent, parent_path, activate"), "{error}");
+    assert_eq!(s.doc, doc);
+    assert_eq!(s.active_component, parent);
+    assert_eq!(s.active_occurrence_path, Some(vec![occurrence]));
+    let child = run(&mut s, "component.create", params);
+    assert_eq!(child["name"], "Child");
+    assert_eq!(child["parent"], parent);
+    assert_eq!(s.active_component, parent);
+    assert_eq!(s.active_occurrence_path, Some(vec![occurrence]));
+}
+
+#[test]
+fn body_and_component_renames_keep_hidden_copies_through_history() {
+    let mut s = Session::default();
+    let (component, first) = created(&mut s, "Knob");
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Knob"}));
+    let second = run(&mut s, "occurrence.copy", json!({"component": component, "translate": [20, 0, 0]}))["occurrence"].as_u64().unwrap();
+    let name = |s: &Session, path: &[u64]| s.occurrence_placement(path).unwrap().bodies[0].world.clone();
+    let hidden = name(&s, &[second]);
+    run(&mut s, "browser.visibility", json!({"items": [hidden], "visible": false}));
+    for (command, params) in [
+        ("body.rename", json!({"body": "Knob", "name": "Grip"})),
+        ("component.rename", json!({"component": component, "name": "Dial"})),
+        ("edit.undo", json!({})),
+        ("edit.undo", json!({})),
+        ("edit.redo", json!({})),
+        ("edit.redo", json!({})),
+    ] {
+        run(&mut s, command, params);
+        assert!(s.body_visible(&name(&s, &[first])), "{command}: the first copy stays visible");
+        assert!(!s.body_visible(&name(&s, &[second])), "{command}: the hidden copy stays hidden");
+        assert_eq!(s.visibility.hidden_bodies, [name(&s, &[second])], "no stale names after {command}");
+    }
+}
+
+#[test]
+fn renaming_a_parent_preserves_hidden_nested_copies_with_ambiguous_labels() {
+    let mut s = Session::default();
+    let (parent, first_parent) = created(&mut s, "Assembly");
+    let (_, child) = created(&mut s, "Knob");
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Knob"}));
+    let second_parent = run(&mut s, "occurrence.copy", json!({"component": parent, "translate": [20, 0, 0]}))["occurrence"].as_u64().unwrap();
+    let name = |s: &Session, path: &[u64]| s.occurrence_placement(path).unwrap().bodies[0].world.clone();
+    let hidden = name(&s, &[second_parent, child]);
+    run(&mut s, "browser.visibility", json!({"items": [hidden], "visible": false}));
+    for (command, params) in [
+        ("component.rename", json!({"component": parent, "name": "Assembly/Other"})),
+        ("body.rename", json!({"body": "Knob", "name": "Grip (@occ[custom])"})),
+        ("edit.undo", json!({})),
+        ("edit.undo", json!({})),
+        ("edit.redo", json!({})),
+        ("edit.redo", json!({})),
+    ] {
+        run(&mut s, command, params);
+        assert!(s.body_visible(&name(&s, &[first_parent, child])), "{command}");
+        assert!(!s.body_visible(&name(&s, &[second_parent, child])), "{command}");
+        assert_eq!(s.visibility.hidden_bodies, [name(&s, &[second_parent, child])]);
+    }
 }
 
 #[test]
@@ -451,10 +539,10 @@ fn temp_design(tag: &str, ext: &str) -> (std::path::PathBuf, String) {
 }
 
 /// #531: hiding a placement and a body is saved with the design and comes back when it opens.
-/// It is not an undo step (undoing a later feature leaves it hidden), but the design then has
-/// unsaved changes, and showing it again is saved the same way.
+/// Each hide is an undo step of its own (#2219, so undoing a later feature still leaves it
+/// hidden), the design then has unsaved changes, and showing it again is saved the same way.
 #[test]
-fn hidden_placements_and_bodies_are_saved_with_the_design_but_not_undone() {
+fn hidden_placements_and_bodies_are_saved_with_the_design() {
     let (dir, path) = temp_design("saved", "solidcraft");
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"length":4,"width":4,"height":4,"body_name":"Base"}));
@@ -468,7 +556,7 @@ fn hidden_placements_and_bodies_are_saved_with_the_design_but_not_undone() {
     let undo = s.undo.len();
     run(&mut s, "browser.visibility", json!({"visible":false,"paths":[[second]]}));
     run(&mut s, "browser.visibility", json!({"visible":false,"items":["Base"]}));
-    assert_eq!(s.undo.len(), undo, "hiding is not an undo step");
+    assert_eq!(s.undo.len(), undo + 2, "each hide is one undo step");
     assert!(s.is_dirty(), "hiding leaves the design with unsaved changes");
     run(&mut s, "solid.box", json!({"length":1,"width":1,"height":1,"corner":[50,0,0],"operation":"new","body_name":"Later"}));
     run(&mut s, "edit.undo", json!({}));
@@ -556,6 +644,42 @@ fn a_linked_design_brings_its_bodies_in_and_follows_edits_to_the_part_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #5679: a linked part's bodies come from its design file, so a cut or join from the top level
+/// on a sketch on its face is refused with the reason, and the plate stays as the file has it.
+#[test]
+fn a_cut_or_join_from_the_top_level_into_a_linked_part_is_refused() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-linked-cut-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let part = dir.join("plate.solidcraft");
+    saved_box_design(&part, 30.0);
+    let mut s = Session::default();
+    run(&mut s, INSERT_DESIGN, json!({"path": part, "translate": [50, 0, 0]}));
+    let _ = std::fs::remove_dir_all(&dir);
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "sketch.create", json!({"plane": {"face": [55, 10, 30]}, "project_edges": false}));
+    let plane = s
+        .doc
+        .features
+        .iter()
+        .rev()
+        .find_map(|f| match &f.kind {
+            solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { plane, .. }, .. } => Some(*plane),
+            _ => None,
+        })
+        .unwrap();
+    let c = plane.to_local(solidcraft_geom::Vec3::new(55.0, 10.0, 30.0));
+    run(&mut s, "sketch.circle.center", json!({"center": [c.x, c.y], "radius": 2}));
+    run(&mut s, "sketch.finish", json!({}));
+    let features = s.doc.features.len();
+    for (operation, distance) in [("cut", -5), ("join", 5)] {
+        let refused = s.execute("solid.extrude", &json!({"distance": distance, "operation": operation})).unwrap_err().to_string();
+        assert!(refused.contains("`Plate`") && refused.contains("linked to a design file"), "{operation}: {refused}");
+    }
+    assert_eq!(s.doc.features.len(), features);
+    let volume = run(&mut s, "inspect.measure", json!({"bodies": ["Plate"]}))["total"]["volume_mm3"].clone();
+    near(&volume, 6000.0);
+}
+
 /// The compact list counts what a component holds and leaves out identity transforms; the full
 /// list stays as it was.
 #[test]
@@ -579,6 +703,37 @@ fn compact_component_list_counts_and_skips_identity_transforms() {
     assert_eq!(root["children"], json!([first, second]), "{root}");
     // Body names on request.
     assert_eq!(block(&run(&mut s, "component.list", json!({"compact": true, "bodies": true})))["bodies"], json!(["Cube"]));
+}
+
+/// Each component lists only what it holds, in timeline order: its bodies, features and
+/// sketches, its own occurrences and the occurrences inside it, through nested components.
+#[test]
+fn component_list_gives_each_component_only_its_own_contents() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "name": "Base", "body_name": "Base"}));
+    let (arm, arm_first) = created(&mut s, "Arm");
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Arm sketch"}));
+    run(&mut s, "solid.box", json!({"corner": [0, 20, 0], "length": 2, "width": 2, "height": 2, "name": "Lug", "body_name": "Lug"}));
+    let pin = run(&mut s, "component.create", json!({"name": "Pin", "parent": arm, "parent_path": [arm_first]}));
+    let (pin, pin_first) = (pin["component"].as_u64().unwrap(), pin["occurrence"].as_u64().unwrap());
+    run(&mut s, "solid.box", json!({"corner": [0, 40, 0], "length": 1, "width": 1, "height": 1, "name": "Shank", "body_name": "Shank"}));
+    run(&mut s, "solid.box", json!({"corner": [0, 50, 0], "length": 1, "width": 1, "height": 1, "name": "Head", "body_name": "Head"}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let arm_second = run(&mut s, "occurrence.copy", json!({"component": arm, "translate": [30, 0, 0]}))["occurrence"].as_u64().unwrap();
+    let list = run(&mut s, "component.list", json!({}));
+    let of = |id: u64| list["components"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone();
+    let ids = |v: &Value| v.as_array().unwrap().iter().map(|o| o["id"].as_u64().unwrap()).collect::<Vec<_>>();
+    let (root, arm_node, pin_node) = (of(0), of(arm), of(pin));
+    assert_eq!((&root["bodies"], &root["features"], &root["sketches"]), (&json!(["Base"]), &json!(["Base"]), &json!([])), "{root}");
+    assert_eq!(ids(&root["children"]), vec![arm_first, arm_second], "{root}");
+    assert_eq!(
+        (&arm_node["bodies"], &arm_node["features"], &arm_node["sketches"]),
+        (&json!(["Lug"]), &json!(["Lug"]), &json!(["Arm sketch"])),
+        "{arm_node}"
+    );
+    assert_eq!((ids(&arm_node["occurrences"]), ids(&arm_node["children"])), (vec![arm_first, arm_second], vec![pin_first]), "{arm_node}");
+    assert_eq!((&pin_node["bodies"], &pin_node["features"]), (&json!(["Shank", "Head"]), &json!(["Shank", "Head"])), "{pin_node}");
+    assert_eq!((ids(&pin_node["occurrences"]), ids(&pin_node["children"])), (vec![pin_first], vec![]), "{pin_node}");
 }
 
 /// A script's 3x4 placement matrix (rotation rows, then the translation column) moves an
@@ -617,9 +772,9 @@ fn matrix_move_turns_a_quarter_and_moves() {
 }
 
 /// #3223, #2872: a STEP assembly whose part sits two levels down, each level placed, opened and
-/// stood up. With the imported root active, as Open leaves it, a circle sketched on the part's
-/// top face cuts it through, reads as a Cut dragged in and a Join dragged out, and joins it in
-/// one piece instead of starting a body of the root's own.
+/// stood up. With the imported root active, as Open leaves it, or the top level, a circle sketched
+/// on the part's top face cuts it through, reads as a Cut dragged in and a Join dragged out, and
+/// joins it in one piece instead of starting a body of the active component's own.
 #[test]
 fn a_stood_up_nested_step_part_is_cut_and_joined_from_its_face() {
     let dir = std::env::temp_dir().join(format!("solidcraft-nested-stood-{}", std::process::id()));
@@ -635,40 +790,52 @@ fn a_stood_up_nested_step_part_is_cut_and_joined_from_its_face() {
     let top = solidcraft_doc::apply_point(&src.doc.component_transform(part), solidcraft_geom::Vec3::new(20.0, 12.0, 10.0));
     run(&mut src, "file.export", json!({"path": path, "format": "step"}));
 
-    let mut s = Session::default();
-    run(&mut s, "doc.open", json!({"path": path, "up": "y"}));
-    let _ = std::fs::remove_dir_all(&dir);
-    let at = solidcraft_doc::apply_point(&s.doc.component_transform(s.active_component), top);
-    run(&mut s, "sketch.create", json!({"plane": {"face": [at.x, at.y, at.z]}, "project_edges": false}));
-    let centre = s
-        .doc
-        .features
-        .iter()
-        .rev()
-        .find_map(|f| match &f.kind {
-            solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { plane, .. }, .. } => Some(plane.to_local(top)),
-            _ => None,
-        })
-        .unwrap();
-    run(&mut s, "sketch.circle.center", json!({"center": [centre.x, centre.y], "radius": 3}));
-    run(&mut s, "sketch.finish", json!({}));
-    assert_eq!(crate::auto_operation(&s, &json!({"distance": -5})), Some("cut"));
-    assert_eq!(crate::auto_operation(&s, &json!({"distance": 5})), Some("join"));
-    let volume = |s: &mut Session| run(s, "inspect.measure", json!({"bodies": ["NestedBlock"]}))["total"]["volume_mm3"].as_f64().unwrap();
-    let block = 40.0 * 24.0 * 10.0;
-    let hole = std::f64::consts::PI * 3.0 * 3.0;
+    // #5679: the same from the top level, where the part is two moved and turned levels down
+    // (#5678 was this cut silently doing nothing; `auto` read it as a new body).
+    for top_level in [false, true] {
+        let mut s = Session::default();
+        run(&mut s, "doc.open", json!({"path": path, "up": "y"}));
+        let at = solidcraft_doc::apply_point(&s.doc.component_transform(s.active_component), top);
+        if top_level {
+            run(&mut s, "component.activate", json!({"component": "root"}));
+        }
+        // The sketch is in the active component's frame: the imported root's, or the world's.
+        let local = if top_level { at } else { top };
+        run(&mut s, "sketch.create", json!({"plane": {"face": [at.x, at.y, at.z]}, "project_edges": false}));
+        let centre = s
+            .doc
+            .features
+            .iter()
+            .rev()
+            .find_map(|f| match &f.kind {
+                solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { plane, .. }, .. } => Some(plane.to_local(local)),
+                _ => None,
+            })
+            .unwrap();
+        run(&mut s, "sketch.circle.center", json!({"center": [centre.x, centre.y], "radius": 3}));
+        run(&mut s, "sketch.finish", json!({}));
+        assert_eq!(crate::auto_operation(&s, &json!({"distance": -5})), Some("cut"), "top level {top_level}");
+        assert_eq!(crate::auto_operation(&s, &json!({"distance": 5})), Some("join"), "top level {top_level}");
+        let volume = |s: &mut Session| run(s, "inspect.measure", json!({"bodies": ["NestedBlock"]}))["total"]["volume_mm3"].as_f64().unwrap();
+        let block = 40.0 * 24.0 * 10.0;
+        let hole = std::f64::consts::PI * 3.0 * 3.0;
 
-    // The circle is measured as faceted: within a thousandth of what it removes or adds.
-    for operation in ["cut", "auto"] {
-        run(&mut s, "solid.extrude", json!({"distance": -20, "operation": operation}));
-        assert!((block - volume(&mut s) - hole * 10.0).abs() < 1e-3 * hole * 10.0, "{operation}: {}", volume(&mut s));
-        run(&mut s, "edit.undo", json!({}));
+        // The circle is measured as faceted: within a thousandth of what it removes or adds.
+        for operation in ["cut", "auto"] {
+            run(&mut s, "solid.extrude", json!({"distance": -20, "operation": operation}));
+            assert!((block - volume(&mut s) - hole * 10.0).abs() < 1e-3 * hole * 10.0, "{top_level} {operation}: {}", volume(&mut s));
+            run(&mut s, "edit.undo", json!({}));
+        }
+        for operation in ["join", "auto"] {
+            run(&mut s, "solid.extrude", json!({"distance": 5, "operation": operation}));
+            let st = s.model.state();
+            assert_eq!(st.bodies.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["NestedBlock"], "{top_level} {operation}");
+            assert_eq!(st.body("NestedBlock").map(|b| b.body.shell_count()), Some(1), "{top_level} {operation}");
+            assert!((volume(&mut s) - block - hole * 5.0).abs() < 1e-3 * hole * 5.0, "{top_level} {operation}: {}", volume(&mut s));
+            run(&mut s, "edit.undo", json!({}));
+        }
     }
-    run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "join"}));
-    let st = s.model.state();
-    assert_eq!(st.bodies.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["NestedBlock"]);
-    assert_eq!(st.body("NestedBlock").map(|b| b.body.shell_count()), Some(1));
-    assert!((volume(&mut s) - block - hole * 5.0).abs() < 1e-3 * hole * 5.0, "join: {}", volume(&mut s));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A rotation that is one only up to rounding is orthonormalised; a scale, a shear or a mirror
@@ -788,4 +955,130 @@ fn joins_into_a_moved_occurrence_meet_the_tool_where_it_is_shown() {
     run(&mut s, "solid.extrude", json!({"through_all": true, "operation": "cut", "targets": ["C"]}));
     let want = 10.0 * 10.0 * 10.0 - 4.0 * 4.0 * 10.0;
     assert!((volume(&s, "C") - want).abs() < 1e-6 * want, "C: {} vs {want}", volume(&s, "C"));
+}
+
+#[test]
+fn component_delete_removes_joints_to_its_occurrences_and_undo_restores_them() {
+    let mut s = Session::default();
+    for (name, corner) in [("Arm", [20, -2, -2]), ("Kept", [-2, 20, -2])] {
+        run(&mut s, "component.activate", json!({"component": 0}));
+        created(&mut s, name);
+        run(&mut s, "solid.box", json!({"length": 4, "width": 4, "height": 4, "corner": corner}));
+    }
+    run(
+        &mut s,
+        "joint.create",
+        json!({"type": "revolute", "a": {"occurrence": 0, "point": [0,0,0]}, "b": {"occurrence": "Arm", "point": [0,0,0]}, "name": "Pivot"}),
+    );
+    run(
+        &mut s,
+        "joint.create",
+        json!({"type": "rigid", "a": {"occurrence": 0, "point": [0,0,0]}, "b": {"occurrence": "Kept", "point": [0,0,0]}, "name": "Held"}),
+    );
+    let arm = s.doc.find_component("Arm").unwrap();
+    let before = s.doc.clone();
+
+    let reply = run(&mut s, "component.delete", json!({"component": "Arm"}));
+    let features: Vec<u64> = before.features.iter().filter(|f| f.component == arm).map(|f| f.id).collect();
+    assert_eq!(reply, json!({"deleted": [arm], "features": features}));
+    let joints: Vec<&str> = s.doc.assembly.joints.iter().map(|j| j.name.as_str()).collect();
+    assert_eq!(joints, ["Held"]);
+    run(&mut s, "joint.list", json!({}));
+
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc, before);
+}
+
+/// The stood-up nested STEP part of `a_stood_up_nested_step_part_is_cut_and_joined_from_its_face`,
+/// opened with its imported root active, and a sketch on the part's top face. Returns the
+/// session, the sketch, the middle of the top face in the root's frame, the face's outward
+/// normal and that middle in the sketch's coordinates.
+fn nested_part_face_sketch() -> (Session, u64, solidcraft_geom::Vec3, solidcraft_geom::Vec3, solidcraft_geom::Vec2) {
+    let dir = std::env::temp_dir().join(format!("solidcraft-nested-scope-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nested.step");
+    let mut src = Session::default();
+    let (_, carrier) = created(&mut src, "Carrier");
+    let (part, nested) = created(&mut src, "Nested Part");
+    run(&mut src, "solid.box", json!({"length": 40, "width": 24, "height": 10, "body_name": "NestedBlock"}));
+    run(&mut src, "occurrence.move", json!({"occurrence": carrier, "translate": [12, 7, 5], "axis": [0, 0, 1], "angle": "30 deg"}));
+    run(&mut src, "occurrence.move", json!({"occurrence": nested, "translate": [3, 11, 2], "axis": [0, 1, 0], "angle": "20 deg"}));
+    let top = solidcraft_doc::apply_point(&src.doc.component_transform(part), solidcraft_geom::Vec3::new(20.0, 12.0, 10.0));
+    run(&mut src, "file.export", json!({"path": path, "format": "step"}));
+    let mut s = Session::default();
+    run(&mut s, "doc.open", json!({"path": path, "up": "y"}));
+    let _ = std::fs::remove_dir_all(&dir);
+    let at = solidcraft_doc::apply_point(&s.doc.component_transform(s.active_component), top);
+    let sketch = run(&mut s, "sketch.create", json!({"plane": {"face": [at.x, at.y, at.z]}, "project_edges": false}))["sketch"].as_u64().unwrap();
+    let Some(solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { plane, .. }, .. }) =
+        s.doc.feature(sketch).map(|f| &f.kind)
+    else {
+        panic!("a sketch on the face")
+    };
+    let (normal, centre) = (plane.normal(), plane.to_local(top));
+    (s, sketch, top, normal, centre)
+}
+
+/// After a feature from the nested part's face: still one body, in one piece, `change` mm³
+/// bigger than the 40 × 24 × 10 block (within a thousandth: round profiles are faceted).
+fn assert_block_changed_by(s: &mut Session, change: f64) {
+    let st = s.model.state();
+    assert_eq!(st.bodies.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["NestedBlock"]);
+    assert_eq!(st.body("NestedBlock").map(|b| b.body.shell_count()), Some(1));
+    let volume = run(s, "inspect.measure", json!({"bodies": ["NestedBlock"]}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((volume - 9600.0 - change).abs() < 1e-3 * change.abs(), "{volume}");
+}
+
+/// #3223 for Revolve: a ring revolved about a line on the nested part's face, with the imported
+/// root active, joins the part (the half above the face) instead of starting a body of its own.
+#[test]
+fn a_revolve_from_a_nested_step_parts_face_joins_it() {
+    let (mut s, _, _, _, c) = nested_part_face_sketch();
+    let axis = run(&mut s, "sketch.line", json!({"points": [[c.x, c.y - 5.0], [c.x, c.y + 5.0]]}))["curves"][0].as_str().unwrap().to_string();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [c.x + 1.0, c.y - 2.0], "p1": [c.x + 3.0, c.y + 2.0]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.revolve", json!({"axis": axis, "angle": "360 deg", "operation": "join"}));
+    assert_block_changed_by(&mut s, std::f64::consts::PI * (9.0 - 1.0) * 4.0 / 2.0);
+}
+
+/// #3223 for Loft: a loft from a circle on the nested part's face to one 5 mm above joins it.
+#[test]
+fn a_loft_from_a_nested_step_parts_face_joins_it() {
+    let (mut s, sketch, top, _, c) = nested_part_face_sketch();
+    run(&mut s, "sketch.circle.center", json!({"center": [c.x, c.y], "radius": 3}));
+    run(&mut s, "sketch.finish", json!({}));
+    let at = solidcraft_doc::apply_point(&s.doc.component_transform(s.active_component), top);
+    let high =
+        run(&mut s, "sketch.create", json!({"plane": {"face": [at.x, at.y, at.z]}, "offset": 5, "project_edges": false}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.circle.center", json!({"center": [c.x, c.y], "radius": 3}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.loft", json!({"sections": [{"sketch": sketch}, {"sketch": high}], "operation": "join"}));
+    assert_block_changed_by(&mut s, std::f64::consts::PI * 9.0 * 5.0);
+}
+
+/// #3223 for Sweep: a circle on the nested part's face swept 5 mm out along its normal joins it.
+#[test]
+fn a_sweep_from_a_nested_step_parts_face_joins_it() {
+    let (mut s, sketch, top, n, c) = nested_part_face_sketch();
+    run(&mut s, "sketch.circle.center", json!({"center": [c.x, c.y], "radius": 3}));
+    run(&mut s, "sketch.finish", json!({}));
+    let root = s.doc.component_transform(s.active_component);
+    let (a, b) = (solidcraft_doc::apply_point(&root, top), solidcraft_doc::apply_point(&root, top + n * 5.0));
+    let path = run(&mut s, "sketch.create", json!({"plane": "XY"}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.options", json!({"sketch_3d": true}));
+    let wire = run(&mut s, "sketch.line3d", json!({"points": [[a.x, a.y, a.z], [b.x, b.y, b.z]]}))["curves"][0].as_str().unwrap().to_string();
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.sweep", json!({"sketch": sketch, "path_sketch": path, "path": [wire], "operation": "join"}));
+    assert_block_changed_by(&mut s, std::f64::consts::PI * 9.0 * 5.0);
+}
+
+/// #3223 for Hole: a hole at a point sketched on the nested part's face, with the imported root
+/// active, drills the part instead of finding no body to cut.
+#[test]
+fn a_hole_at_a_point_on_a_nested_step_parts_face_drills_it() {
+    let (mut s, sketch, _, _, c) = nested_part_face_sketch();
+    run(&mut s, "sketch.point", json!({"point": [c.x, c.y]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.hole", json!({"sketch": sketch, "diameter": 4, "depth": 5}));
+    assert_block_changed_by(&mut s, -std::f64::consts::PI * 4.0 * 5.0);
 }

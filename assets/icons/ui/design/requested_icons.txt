@@ -57,6 +57,8 @@ circle_tt	false
 circle_ttt	false
 close	false
 coil	false
+colored_components	false
+colored_components_off	false
 combine	false
 compare	false
 component	false
@@ -104,6 +106,7 @@ flange	false
 flat	false
 fold	false
 folder	false
+frame_member	false
 gear	false
 graph	false
 ground	false
@@ -147,6 +150,7 @@ origin	false
 pan	false
 params	false
 paste	false
+path_flange	false
 pattern_circ	false
 pattern_path	false
 pattern_rect	false
@@ -203,12 +207,15 @@ scale	false
 screw	false
 section	false
 select	false
+send	false
 settings	false
 sheet_rules	false
 shell	false
+shield	false
 silhouette	false
 sketch	false
 sketch_break	false
+sketch_cancel	false
 sketch_chamfer	false
 sketch_chamfer_angle	false
 sketch_chamfer_equal	false
@@ -237,8 +244,10 @@ split_face	false
 spun	false
 star	false
 status_error	false
+status_recovery	false
 style	false
 suppress	false
+surface	false
 surface_blend	false
 surface_boundary	false
 surface_extend	false

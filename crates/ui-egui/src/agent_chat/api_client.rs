@@ -1,9 +1,10 @@
-//! The API backend (desktop only): a model behind an OpenAI-compatible chat completions endpoint
-//! (Ollama, LM Studio, OpenAI, any URL the user gives). SolidCraft runs the tool loop itself, with
-//! the same tools the ACP agents get: it starts the same MCP server (`solidcraft-cli mcp
-//! --connect` to the chat's own endpoint) and is its client, so every tool call passes the same
-//! gate, limits and folder checks. The key, when there is one, comes from the system keychain for
-//! this connection only.
+//! The API backend (desktop only): a model behind an endpoint SolidCraft talks to itself, either
+//! OpenAI-compatible (Ollama, LM Studio, OpenAI, any URL the user gives) or Anthropic-compatible
+//! (the Anthropic Messages API, or an endpoint that speaks it). SolidCraft runs the tool loop
+//! itself, with the same tools the ACP agents get: it starts the same MCP server (`solidcraft-cli
+//! mcp --connect` to the chat's own endpoint) and is its client, so every tool call passes the
+//! same gate, limits and folder checks. The key, when there is one, comes from the system keychain
+//! for this connection only.
 //!
 //! The loop runs on a thread of its own: a model request can take a while.
 
@@ -15,37 +16,55 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::acp::ModelInfo;
+use super::agents::Protocol;
 use super::backend::{ChatBackend, Event, HttpFn, HttpRequest, PromptPart, StartContext, ToolStatus};
 use super::process::{AgentProcess, FromAgent, ProcessHandle};
 
-/// Model requests for one message, at most (each answer with tool calls is one).
-pub const MAX_REQUESTS_PER_TURN: usize = 24;
 /// Longest tool result handed back to the model.
 const MAX_TOOL_TEXT: usize = 20_000;
 /// Messages kept in the conversation (the system note stays).
 const MAX_HISTORY: usize = 240;
-/// How long one model request may take.
-const REQUEST_TIMEOUT_S: u64 = 300;
-/// How long one tool call may take (it may wait for the user's Allow).
+/// Pictures of the view kept in the conversation. The whole history goes with every request
+/// (up to `MAX_REQUESTS_PER_TURN` per message), so older views are swapped for a short note:
+/// otherwise each attached view makes every later request bigger, until the endpoint refuses it.
+const MAX_HISTORY_IMAGES: usize = 2;
+/// What an older view becomes in the history.
+const DROPPED_VIEW_NOTE: &str = "[an earlier picture of the view, removed to keep the request small]";
+/// How long one tool call may take (it may wait for the user's Allow, declined after four
+/// minutes). It does not depend on the endpoint's request timeout: a tool call is SolidCraft's own
+/// work and the user's answer, never a wait for the model, so a longer request timeout does not
+/// need a longer tool timeout.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(330);
 /// How often a waiting request or tool call looks at the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(40);
+/// The Anthropic Messages API requires `max_tokens`; it caps one answer, which is plenty for a
+/// chat reply and for the tool calls in it.
+const ANTHROPIC_MAX_TOKENS: u64 = 8192;
+/// The API version sent to Anthropic-compatible endpoints. It is the version every such endpoint
+/// knows: DeepSeek ignores it, Qwen does not require it, and the Claude API still accepts it.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// The connection test's own timeout: it asks for a token or two, not a whole answer.
+const TEST_TIMEOUT_S: u64 = 60;
 
 /// Tools the model is not offered.
 const HIDDEN_TOOLS: &[&str] = &["crash_reports"];
 
 pub struct ApiConfig {
     pub name: String,
+    pub protocol: Protocol,
     pub base_url: String,
     pub model: String,
     pub key: Option<String>,
     pub http: HttpFn,
+    /// How long one model request may take, in seconds (the endpoint's setting).
+    pub request_timeout_s: u64,
 }
 
 enum Cmd {
     Prompt(Vec<PromptPart>),
     NewChat,
     SetModel(String),
+    SetRequestTimeout(u64),
 }
 
 pub struct ApiBackend {
@@ -95,6 +114,7 @@ impl ApiBackend {
                 mcp,
                 next: 0,
                 tools: Vec::new(),
+                tool_names: Vec::new(),
                 history: Vec::new(),
                 events: ev_tx,
                 wake,
@@ -123,6 +143,11 @@ impl ChatBackend for ApiBackend {
     fn set_model(&mut self, model: &str) {
         if let Some(c) = &self.cmds {
             let _ = c.send(Cmd::SetModel(model.to_string()));
+        }
+    }
+    fn set_request_timeout(&mut self, secs: u64) {
+        if let Some(c) = &self.cmds {
+            let _ = c.send(Cmd::SetRequestTimeout(secs));
         }
     }
     fn new_session(&mut self) {
@@ -182,8 +207,11 @@ struct Worker {
     cfg: ApiConfig,
     mcp: Option<AgentProcess>,
     next: u64,
-    /// The MCP tools as OpenAI function tools.
+    /// The MCP tools in the endpoint's own shape (function tools, or `input_schema` tools).
     tools: Vec<Value>,
+    /// The tools' names, whichever shape `tools` has.
+    tool_names: Vec<String>,
+    /// The conversation in the endpoint's shape, without the system note (sent separately).
     history: Vec<Value>,
     events: Sender<Event>,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -202,10 +230,10 @@ impl Worker {
         if let Err(e) = self.start_mcp() {
             self.emit(Event::Error(e));
         }
-        self.history.push(json!({"role": "system", "content": super::acp::SYSTEM_NOTE}));
+        self.emit(Event::ToolsAvailable(!self.tools.is_empty()));
         self.emit(Event::Ready { agent: format!("{} · {}", self.cfg.name, self.cfg.model), images: true });
         // The endpoint's models for the picker; an endpoint that does not list them shows none.
-        if let Ok(list) = model_list(&self.cfg.http, &self.cfg.base_url, self.cfg.key.as_deref()) {
+        if let Ok(list) = self.model_list() {
             let mut available = list;
             if !self.cfg.model.is_empty() && !available.iter().any(|m| m.id == self.cfg.model) {
                 available.insert(0, ModelInfo { id: self.cfg.model.clone(), name: self.cfg.model.clone(), description: String::new() });
@@ -218,8 +246,9 @@ impl Worker {
             match cmd {
                 Cmd::Prompt(parts) => self.turn(parts),
                 Cmd::SetModel(m) => self.cfg.model = m,
+                Cmd::SetRequestTimeout(secs) => self.cfg.request_timeout_s = secs,
                 Cmd::NewChat => {
-                    self.history.truncate(1);
+                    self.history.clear();
                     self.cancel.store(false, Ordering::Relaxed);
                     self.emit(Event::Ready { agent: format!("{} · {}", self.cfg.name, self.cfg.model), images: true });
                 }
@@ -227,6 +256,14 @@ impl Worker {
         }
         if let Some(mut m) = self.mcp.take() {
             m.shutdown(false);
+        }
+    }
+
+    /// The endpoint's models, in the shape its protocol lists them.
+    fn model_list(&self) -> Result<Vec<ModelInfo>, String> {
+        match self.cfg.protocol {
+            Protocol::OpenAi => model_list(&self.cfg.http, &self.cfg.base_url, self.cfg.key.as_deref()),
+            Protocol::Anthropic => anthropic_model_list(&self.cfg.http, &self.cfg.base_url, self.cfg.key.as_deref()),
         }
     }
 
@@ -274,20 +311,20 @@ impl Worker {
             m.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
         }
         let list = self.mcp_call("tools/list", json!({}))?;
-        self.tools = openai_tools(&list);
+        self.tools = match self.cfg.protocol {
+            Protocol::OpenAi => openai_tools(&list),
+            Protocol::Anthropic => anthropic_tools(&list),
+        };
+        self.tool_names = tool_names(&list);
         Ok(())
     }
 
     fn turn(&mut self, parts: Vec<PromptPart>) {
-        self.history.push(user_message(&parts));
-        // Keep the system note; drop the oldest messages, never leaving a reply first.
-        while self.history.len() > MAX_HISTORY {
-            self.history.remove(1);
-        }
-        while self.history.len() > 2 && self.history.get(1).is_some_and(|m| m["role"] != "user") {
-            self.history.remove(1);
-        }
-        for _ in 0..MAX_REQUESTS_PER_TURN {
+        self.history.push(user_message(self.cfg.protocol, &parts));
+        drop_old_views(&mut self.history, MAX_HISTORY_IMAGES);
+        self.trim_history();
+        // No cap on requests: Stop sets `cancel`, checked at the top of every round.
+        loop {
             // The history as of here is complete (every tool call answered): a cancelled request
             // goes back to it, so no half-finished round is left to confuse the next message.
             let sound = self.history.len();
@@ -313,27 +350,21 @@ impl Worker {
                     return;
                 }
             };
-            let msg = reply.pointer("/choices/0/message").cloned().unwrap_or(Value::Null);
-            if let Some(text) = msg.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                self.emit(Event::Text { thought: false, text: text.to_string() });
+            for (thought, text) in reply.text {
+                self.emit(Event::Text { thought, text });
             }
-            let calls: Vec<Value> = msg.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
-            let mut kept = json!({"role": "assistant", "content": msg.get("content").cloned().unwrap_or(Value::Null)});
-            if !calls.is_empty() {
-                kept["tool_calls"] = Value::Array(calls.clone());
-            }
-            self.history.push(kept);
-            if calls.is_empty() {
+            self.history.push(reply.assistant);
+            if reply.calls.is_empty() {
                 self.emit(Event::TurnEnded { reason: String::new() });
                 return;
             }
-            for (i, c) in calls.iter().enumerate().take(32) {
-                let id = c.get("id").and_then(Value::as_str).map_or_else(|| format!("call-{i}"), str::to_string);
-                let name = c.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_string();
-                let parsed = tool_arguments(c.pointer("/function/arguments"));
-                let args = parsed.clone().unwrap_or_else(|_| json!({}));
-                let title = tool_title(&name, &args);
-                let tool_id = format!("{id}-{}", self.next);
+            // Anthropic takes every result of a round in one user message; OpenAI takes one
+            // `tool` message per call.
+            let mut results = Vec::new();
+            for c in reply.calls.iter().take(32) {
+                let args = c.arguments.clone().unwrap_or_else(|_| json!({}));
+                let title = tool_title(&c.name, &args);
+                let tool_id = format!("{}-{}", c.id, self.next);
                 self.emit(Event::Tool {
                     id: tool_id.clone(),
                     title: Some(title),
@@ -343,15 +374,13 @@ impl Worker {
                 });
                 let (text, failed) = if self.cancel.load(Ordering::Relaxed) {
                     ("cancelled by the user".to_string(), true)
-                } else if let Err(e) = &parsed {
+                } else if let Err(e) = &c.arguments {
                     // A call whose arguments do not parse is answered, never run with `{}`.
                     (format!("Not run: {e}"), true)
-                } else if HIDDEN_TOOLS.contains(&name.as_str())
-                    || !self.tools.iter().any(|t| t.pointer("/function/name").and_then(Value::as_str) == Some(name.as_str()))
-                {
-                    (format!("unknown tool `{name}`"), true)
+                } else if !self.tool_names.iter().any(|n| n == &c.name) {
+                    (format!("unknown tool `{}`", c.name), true)
                 } else {
-                    match self.mcp_call("tools/call", json!({"name": name, "arguments": args})) {
+                    match self.mcp_call("tools/call", json!({"name": c.name, "arguments": args})) {
                         Ok(r) => tool_text(&r),
                         Err(e) => (e, true),
                     }
@@ -364,69 +393,143 @@ impl Worker {
                     status: Some(if failed { ToolStatus::Failed } else { ToolStatus::Completed }),
                     output: Some(shown),
                 });
-                self.history.push(json!({"role": "tool", "tool_call_id": id, "content": text}));
+                match self.cfg.protocol {
+                    Protocol::OpenAi => self.history.push(json!({"role": "tool", "tool_call_id": c.id, "content": text})),
+                    Protocol::Anthropic => {
+                        results.push(json!({"type": "tool_result", "tool_use_id": c.id, "content": text, "is_error": failed}));
+                    }
+                }
+            }
+            if self.cfg.protocol == Protocol::Anthropic && !results.is_empty() {
+                self.history.push(json!({"role": "user", "content": results}));
             }
         }
-        self.emit(Event::Text { thought: false, text: format!("\n({})", crate::i18n::tr("ui.ai_request_limit")) });
-        self.emit(Event::TurnEnded { reason: "max_turn_requests".into() });
     }
 
-    fn request(&self) -> Result<Value, String> {
-        let mut body = json!({"model": self.cfg.model, "messages": self.history});
-        if !self.tools.is_empty() {
-            body["tools"] = Value::Array(self.tools.clone());
-            if self.no_reasoning.get() {
-                body["reasoning_effort"] = json!("none");
-            }
+    /// Keep the conversation bounded and starting at a user message, so neither protocol sees a
+    /// reply or a tool result without the message it answers.
+    fn trim_history(&mut self) {
+        while self.history.len() > MAX_HISTORY {
+            self.history.remove(0);
         }
+        while self.history.first().is_some_and(|m| !starts_a_turn(m)) {
+            self.history.remove(0);
+        }
+    }
+
+    fn request(&self) -> Result<Reply, String> {
+        let mut body = self.body();
         let (status, v) = self.post(&body)?;
         // Some OpenAI models refuse function tools on this endpoint unless the reasoning effort is
         // "none" (HTTP 400 naming `reasoning_effort`): ask again once with it, and keep it for the
-        // next requests.
-        let refused = status == 400 && !self.tools.is_empty() && !self.no_reasoning.get() && http_error(status, &v).contains("reasoning_effort");
+        // next requests. Anthropic has no such parameter.
+        let refused = self.cfg.protocol == Protocol::OpenAi
+            && status == 400
+            && !self.tools.is_empty()
+            && !self.no_reasoning.get()
+            && http_error(status, &v).contains("reasoning_effort");
         if refused {
             self.no_reasoning.set(true);
             body["reasoning_effort"] = json!("none");
             let (status, v) = self.post(&body)?;
-            return if status == 200 { Ok(v) } else { Err(http_error(status, &v)) };
+            return if status == 200 { Ok(reply(self.cfg.protocol, &v)) } else { Err(http_error(status, &v)) };
         }
         if status != 200 {
             return Err(http_error(status, &v));
         }
-        Ok(v)
+        Ok(reply(self.cfg.protocol, &v))
+    }
+
+    /// The request body in the endpoint's shape: the system note is a message for OpenAI and a
+    /// top-level field for Anthropic.
+    fn body(&self) -> Value {
+        match self.cfg.protocol {
+            Protocol::OpenAi => {
+                let mut messages = Vec::with_capacity(self.history.len() + 1);
+                messages.push(json!({"role": "system", "content": super::acp::SYSTEM_NOTE}));
+                messages.extend(self.history.iter().cloned());
+                let mut body = json!({"model": self.cfg.model, "messages": messages});
+                if !self.tools.is_empty() {
+                    body["tools"] = Value::Array(self.tools.clone());
+                    if self.no_reasoning.get() {
+                        body["reasoning_effort"] = json!("none");
+                    }
+                }
+                body
+            }
+            Protocol::Anthropic => {
+                let mut body = json!({
+                    "model": self.cfg.model,
+                    "max_tokens": ANTHROPIC_MAX_TOKENS,
+                    "system": super::acp::SYSTEM_NOTE,
+                    "messages": &self.history,
+                });
+                if !self.tools.is_empty() {
+                    body["tools"] = Value::Array(self.tools.clone());
+                }
+                body
+            }
+        }
     }
 
     fn post(&self, body: &Value) -> Result<(u16, Value), String> {
         let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-        if let Some(k) = &self.cfg.key {
-            headers.push(("Authorization".into(), format!("Bearer {k}")));
-        }
-        let req = HttpRequest {
-            method: "POST",
-            url: format!("{}/chat/completions", self.cfg.base_url),
-            headers,
-            body: Some(body.to_string().into_bytes()),
-            timeout_s: REQUEST_TIMEOUT_S,
+        let url = match self.cfg.protocol {
+            Protocol::OpenAi => format!("{}/chat/completions", self.cfg.base_url),
+            Protocol::Anthropic => {
+                headers.push(("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()));
+                endpoint(&self.cfg.base_url, "messages")
+            }
         };
+        if let Some(k) = &self.cfg.key {
+            match self.cfg.protocol {
+                Protocol::OpenAi => headers.push(("Authorization".into(), format!("Bearer {k}"))),
+                Protocol::Anthropic => headers.push(("x-api-key".into(), k.clone())),
+            }
+        }
+        let req = HttpRequest { method: "POST", url, headers, body: Some(body.to_string().into_bytes()), timeout_s: self.limit_s() };
         // The request runs on a thread of its own so that Stop does not wait for the model: a
         // cancelled one is abandoned (the host's own timeout ends it) and its answer dropped.
         let (tx, rx) = channel();
         let http = self.cfg.http.clone();
+        let started = std::time::Instant::now();
         std::thread::spawn(move || {
             let _ = tx.send(http(&req));
         });
+        // The host ends the request at the limit; a few seconds more is the backstop for one
+        // that does not.
+        let backstop = Duration::from_secs(self.limit_s().saturating_add(5));
         let (status, bytes) = loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err("cancelled by the user".into());
             }
             match rx.recv_timeout(CANCEL_POLL) {
-                Ok(r) => break r?,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(r) => break r.map_err(|e| request_error(e, started.elapsed(), self.limit_s()))?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if started.elapsed() < backstop => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(timed_out(self.limit_s())),
                 Err(_) => return Err("the request ended without an answer".into()),
             }
         };
         Ok((status, serde_json::from_slice(&bytes).unwrap_or(Value::Null)))
     }
+}
+
+impl Worker {
+    /// The endpoint's request timeout, in range.
+    fn limit_s(&self) -> u64 {
+        self.cfg.request_timeout_s.clamp(super::agents::MIN_REQUEST_TIMEOUT_S, super::agents::MAX_REQUEST_TIMEOUT_S)
+    }
+}
+
+/// What the chat says when a request ran out of time: the limit, and where to raise it.
+pub fn timed_out(limit_s: u64) -> String {
+    crate::i18n::format("ui.ai_request_timed_out", &[("seconds", &limit_s.to_string())])
+}
+
+/// A failed request as people read it: one that ran into the endpoint's request timeout (the
+/// host says so, or it failed at the limit) says the limit and where to raise it.
+pub fn request_error(error: String, elapsed: Duration, limit_s: u64) -> String {
+    if error.starts_with("timeout: global") || elapsed >= Duration::from_secs(limit_s) { timed_out(limit_s) } else { error }
 }
 
 /// An endpoint's refusal as people read it.
@@ -437,6 +540,7 @@ pub fn http_error(status: u16, body: &Value) -> String {
         401 | 403 => crate::i18n::tr("ui.ai_http_key"),
         404 => crate::i18n::tr("ui.ai_http_not_found"),
         429 => crate::i18n::tr("ui.ai_http_busy"),
+        413 => crate::i18n::tr("ui.ai_http_too_large"),
         _ => "",
     };
     format!(
@@ -465,8 +569,8 @@ fn tool_arguments(raw: Option<&Value>) -> Result<Value, String> {
     }
 }
 
-/// The message for what the user typed (and the view, as a data URL).
-fn user_message(parts: &[PromptPart]) -> Value {
+/// The message for what the user typed (and the view, as the endpoint's own content blocks).
+fn user_message(protocol: Protocol, parts: &[PromptPart]) -> Value {
     let images = parts.iter().any(|p| matches!(p, PromptPart::Image { .. }));
     if !images {
         let text: Vec<&str> = parts.iter().filter_map(|p| if let PromptPart::Text(t) = p { Some(t.as_str()) } else { None }).collect();
@@ -474,14 +578,146 @@ fn user_message(parts: &[PromptPart]) -> Value {
     }
     let content: Vec<Value> = parts
         .iter()
-        .filter_map(|p| match p {
-            PromptPart::Text(t) => Some(json!({"type": "text", "text": t})),
-            PromptPart::Image { mime, base64 } => Some(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{base64}")}})),
-            // This endpoint takes no documents (the chat doesn't send any); the message names the file.
-            PromptPart::Document { .. } => None,
+        .filter_map(|p| match (protocol, p) {
+            (_, PromptPart::Text(t)) => Some(json!({"type": "text", "text": t})),
+            (Protocol::OpenAi, PromptPart::Image { mime, base64 }) => {
+                Some(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{base64}")}}))
+            }
+            (Protocol::Anthropic, PromptPart::Image { mime, base64 }) => {
+                Some(json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64}}))
+            }
+            // These endpoints take no documents (the chat doesn't send any); the message names the file.
+            (_, PromptPart::Document { .. }) => None,
         })
         .collect();
     json!({"role": "user", "content": content})
+}
+
+/// Whether a history message starts a turn: a user message that is not only tool results.
+fn starts_a_turn(message: &Value) -> bool {
+    message["role"] == "user" && !message["content"].as_array().is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+}
+
+/// One tool call the endpoint asked for.
+#[derive(Debug)]
+struct Call {
+    id: String,
+    name: String,
+    /// The arguments as an object, or why they cannot be used.
+    arguments: Result<Value, String>,
+}
+
+/// An answer from the endpoint, in the protocol's shape.
+#[derive(Debug)]
+struct Reply {
+    /// Text to show: `(thought, text)` in the order it came.
+    text: Vec<(bool, String)>,
+    calls: Vec<Call>,
+    /// The assistant message to keep in the history, in the endpoint's own shape. Tool calls are
+    /// capped to the ones the loop answers, so every call kept here gets a result.
+    assistant: Value,
+}
+
+/// The answer in the endpoint's shape.
+fn reply(protocol: Protocol, body: &Value) -> Reply {
+    match protocol {
+        Protocol::OpenAi => openai_reply(body),
+        Protocol::Anthropic => anthropic_reply(body),
+    }
+}
+
+fn openai_reply(body: &Value) -> Reply {
+    let message = body.pointer("/choices/0/message").cloned().unwrap_or(Value::Null);
+    let text = message.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()).map(|t| vec![(false, t.to_string())]).unwrap_or_default();
+    // No more than the loop answers: every call kept here must get a `tool` message.
+    let raw: Vec<Value> = message.get("tool_calls").and_then(Value::as_array).map(|a| a.iter().take(32).cloned().collect()).unwrap_or_default();
+    let calls = raw
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Call {
+            id: c.get("id").and_then(Value::as_str).map_or_else(|| format!("call-{i}"), str::to_string),
+            name: c.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_string(),
+            arguments: tool_arguments(c.pointer("/function/arguments")),
+        })
+        .collect();
+    let mut assistant = json!({"role": "assistant", "content": message.get("content").cloned().unwrap_or(Value::Null)});
+    if !raw.is_empty() {
+        assistant["tool_calls"] = Value::Array(raw);
+    }
+    Reply { text, calls, assistant }
+}
+
+fn anthropic_reply(body: &Value) -> Reply {
+    let content = body.get("content").cloned().unwrap_or(Value::Null);
+    let mut text = Vec::new();
+    let mut calls = Vec::new();
+    let assistant = match &content {
+        Value::Array(blocks) => {
+            // Keep the answer as it came (thinking blocks and signatures included), but leave out
+            // tool calls beyond the loop's cap so every `tool_use` kept gets its `tool_result`.
+            let mut kept = Vec::new();
+            for (i, block) in blocks.iter().take(128).enumerate() {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+                            text.push((false, t.to_string()));
+                        }
+                        kept.push(block.clone());
+                    }
+                    Some("thinking") => {
+                        let thought = block.get("thinking").or_else(|| block.get("text"));
+                        if let Some(t) = thought.and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
+                            text.push((true, t.to_string()));
+                        }
+                        kept.push(block.clone());
+                    }
+                    Some("tool_use") if calls.len() < 32 => {
+                        calls.push(Call {
+                            id: block.get("id").and_then(Value::as_str).map_or_else(|| format!("toolu-{i}"), str::to_string),
+                            name: block.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                            arguments: match block.get("input") {
+                                None | Some(Value::Null) => Ok(json!({})),
+                                Some(v @ Value::Object(_)) => Ok(v.clone()),
+                                Some(_) => Err("the tool arguments must be a JSON object".into()),
+                            },
+                        });
+                        kept.push(block.clone());
+                    }
+                    Some("tool_use") => {}
+                    _ => kept.push(block.clone()),
+                }
+            }
+            json!({"role": "assistant", "content": kept})
+        }
+        // An endpoint that answers with plain text instead of content blocks.
+        Value::String(s) => {
+            if !s.trim().is_empty() {
+                text.push((false, s.clone()));
+            }
+            json!({"role": "assistant", "content": content.clone()})
+        }
+        _ => json!({"role": "assistant", "content": content.clone()}),
+    };
+    Reply { text, calls, assistant }
+}
+
+/// Keeps the newest `keep` pictures of the view in the history and swaps every older one for a
+/// short note, so the model still knows a view was shown. Text is never touched. Pictures come
+/// as OpenAI `image_url` parts or Anthropic `image` blocks, depending on the endpoint.
+fn drop_old_views(history: &mut [Value], keep: usize) {
+    let mut seen = 0;
+    for msg in history.iter_mut().rev() {
+        let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        for part in content.iter_mut().rev() {
+            if !matches!(part.get("type").and_then(Value::as_str), Some("image_url" | "image")) {
+                continue;
+            }
+            seen += 1;
+            if seen > keep {
+                *part = json!({"type": "text", "text": DROPPED_VIEW_NOTE});
+            }
+        }
+    }
 }
 
 /// MCP `tools/list` as OpenAI function tools (the hidden ones left out).
@@ -506,6 +742,116 @@ pub fn openai_tools(list: &Value) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// MCP `tools/list` as Anthropic tools (the hidden ones left out).
+pub fn anthropic_tools(list: &Value) -> Vec<Value> {
+    list.get("tools")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .take(128)
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?;
+                    if HIDDEN_TOOLS.contains(&name) {
+                        return None;
+                    }
+                    let schema = t.get("inputSchema").cloned().filter(Value::is_object).unwrap_or(json!({"type": "object", "properties": {}}));
+                    Some(json!({
+                        "name": name,
+                        "description": t.get("description").and_then(Value::as_str).unwrap_or(""),
+                        "input_schema": schema,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The offered tools' names, whichever shape the endpoint takes.
+fn tool_names(list: &Value) -> Vec<String> {
+    list.get("tools")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .take(128)
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?;
+                    (!HIDDEN_TOOLS.contains(&name)).then(|| name.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `{base}/v1/{path}`, whether the user's base URL ends in `/v1` or in the endpoint root the
+/// provider's documentation gives (Anthropic's `https://api.anthropic.com`, DeepSeek's
+/// `https://api.deepseek.com/anthropic`).
+fn endpoint(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/v1") { format!("{base}/{path}") } else { format!("{base}/v1/{path}") }
+}
+
+/// Headers for an Anthropic-compatible request: the version, and the key when there is one (which
+/// only goes over HTTPS or to this computer).
+fn anthropic_headers(base_url: &str, key: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let mut headers = vec![("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string())];
+    if let Some(k) = key {
+        if !super::agents::key_safe_for(base_url) {
+            return Err(crate::i18n::tr("ui.ai_key_needs_https").to_string());
+        }
+        headers.push(("x-api-key".to_string(), k.to_string()));
+    }
+    Ok(headers)
+}
+
+/// The endpoint's models for the picker. The Messages API has no models endpoint at every
+/// compatible provider (Qwen's has none), so a failure here simply leaves the picker empty.
+pub fn anthropic_model_list(http: &HttpFn, base_url: &str, key: Option<&str>) -> Result<Vec<ModelInfo>, String> {
+    let req = HttpRequest { method: "GET", url: endpoint(base_url, "models"), headers: anthropic_headers(base_url, key)?, body: None, timeout_s: 15 };
+    let (status, bytes) = http(&req)?;
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if status != 200 {
+        return Err(http_error(status, &v));
+    }
+    Ok(v.get("data")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .take(500)
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(Value::as_str)?.to_string();
+                    let name = m.get("display_name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| id.clone());
+                    Some(ModelInfo { id, name, description: String::new() })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Test an Anthropic-compatible endpoint: send the smallest message there is, so the check covers
+/// the path, the key and the model even where there is no models endpoint to ask.
+pub fn test_anthropic_endpoint(http: &HttpFn, base_url: &str, key: Option<&str>, model: &str) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err(crate::i18n::tr("ui.ai_need_model").to_string());
+    }
+    let mut headers = anthropic_headers(base_url, key)?;
+    headers.push(("Content-Type".to_string(), "application/json".to_string()));
+    let body = json!({"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "Hello"}]});
+    let req = HttpRequest {
+        method: "POST",
+        url: endpoint(base_url, "messages"),
+        headers,
+        body: Some(body.to_string().into_bytes()),
+        timeout_s: TEST_TIMEOUT_S,
+    };
+    let (status, bytes) = http(&req)?;
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if status != 200 {
+        return Err(http_error(status, &v));
+    }
+    Ok(crate::i18n::format("ui.ai_test_answered", &[("model", model)]))
 }
 
 /// A tool call's result as text for the model, and whether it failed.
@@ -613,9 +959,91 @@ mod tests {
 
     #[test]
     fn pictures_go_as_data_urls_and_text_alone_as_a_string() {
-        assert_eq!(user_message(&[PromptPart::Text("hi".into())])["content"], "hi");
-        let m = user_message(&[PromptPart::Text("hi".into()), PromptPart::Image { mime: "image/png".into(), base64: "AA==".into() }]);
+        assert_eq!(user_message(Protocol::OpenAi, &[PromptPart::Text("hi".into())])["content"], "hi");
+        let m =
+            user_message(Protocol::OpenAi, &[PromptPart::Text("hi".into()), PromptPart::Image { mime: "image/png".into(), base64: "AA==".into() }]);
         assert_eq!(m["content"][1]["image_url"]["url"], "data:image/png;base64,AA==");
+        let a = user_message(
+            Protocol::Anthropic,
+            &[PromptPart::Text("hi".into()), PromptPart::Image { mime: "image/png".into(), base64: "AA==".into() }],
+        );
+        assert_eq!(a["content"][1]["type"], "image");
+        assert_eq!(a["content"][1]["source"]["media_type"], "image/png");
+        assert_eq!(a["content"][1]["source"]["data"], "AA==");
+    }
+
+    fn view(n: u8) -> Value {
+        user_message(
+            Protocol::OpenAi,
+            &[PromptPart::Text(format!("look {n}")), PromptPart::Image { mime: "image/png".into(), base64: format!("V{n}") }],
+        )
+    }
+
+    fn pictures(history: &[Value]) -> Vec<String> {
+        history
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .filter_map(|p| p.pointer("/image_url/url").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn only_the_newest_views_stay_in_the_history_and_older_ones_become_a_note() {
+        let mut h = vec![json!({"role": "system", "content": "note"}), view(1), json!({"role": "assistant", "content": "ok"}), view(2)];
+        drop_old_views(&mut h, 2);
+        assert_eq!(pictures(&h).len(), 2, "two views fit, nothing is dropped");
+
+        h.push(json!({"role": "user", "content": "plain text"}));
+        h.push(view(3));
+        drop_old_views(&mut h, 2);
+        assert_eq!(pictures(&h), vec!["data:image/png;base64,V2", "data:image/png;base64,V3"]);
+        // The oldest view is a note now; the words sent with it, and every other message, stay.
+        assert_eq!(h[1]["content"][0]["text"], "look 1");
+        assert_eq!(h[1]["content"][1], json!({"type": "text", "text": DROPPED_VIEW_NOTE}));
+        assert_eq!(h[0]["content"], "note");
+        assert_eq!(h[4]["content"], "plain text");
+    }
+
+    #[test]
+    fn a_long_chat_with_a_view_per_message_does_not_grow_without_end() {
+        let mut h = vec![json!({"role": "system", "content": "note"})];
+        let big = "A".repeat(200_000);
+        for _ in 0..40 {
+            h.push(user_message(
+                Protocol::OpenAi,
+                &[PromptPart::Text("again".into()), PromptPart::Image { mime: "image/png".into(), base64: big.clone() }],
+            ));
+            drop_old_views(&mut h, MAX_HISTORY_IMAGES);
+            h.push(json!({"role": "assistant", "content": "done"}));
+        }
+        let size = json!({"messages": h}).to_string().len();
+        assert_eq!(pictures(&h).len(), MAX_HISTORY_IMAGES);
+        assert!(size < (MAX_HISTORY_IMAGES + 1) * big.len(), "request body is {size} bytes");
+    }
+
+    #[test]
+    fn anthropic_views_are_dropped_the_same_way() {
+        let view = |n: u8| {
+            user_message(
+                Protocol::Anthropic,
+                &[PromptPart::Text(format!("look {n}")), PromptPart::Image { mime: "image/png".into(), base64: format!("V{n}") }],
+            )
+        };
+        let mut h = vec![view(1), json!({"role": "assistant", "content": "ok"}), view(2), view(3)];
+        drop_old_views(&mut h, 2);
+        let kept: Vec<&str> =
+            h.iter().filter_map(|m| m["content"].as_array()).flatten().filter_map(|p| p.pointer("/source/data").and_then(Value::as_str)).collect();
+        assert_eq!(kept, vec!["V2", "V3"]);
+        assert_eq!(h[0]["content"][0]["text"], "look 1");
+        assert_eq!(h[0]["content"][1], json!({"type": "text", "text": DROPPED_VIEW_NOTE}));
+    }
+
+    #[test]
+    fn a_too_large_request_says_so() {
+        let e = http_error(413, &json!({"error": {"message": "Request body is too large."}}));
+        assert!(e.starts_with("HTTP 413: "), "{e}");
+        assert!(e.ends_with("(Request body is too large.)"), "{e}");
     }
 
     /// A scripted endpoint: one answer with a tool call, then a plain answer. The loop runs the
@@ -636,7 +1064,15 @@ mod tests {
             let a = answers.lock().unwrap().pop().unwrap_or(json!({}));
             Ok((200, a.to_string().into_bytes()))
         });
-        let cfg = ApiConfig { name: "Test".into(), base_url: "http://localhost:1/v1".into(), model: "m".into(), key: None, http };
+        let cfg = ApiConfig {
+            name: "Test".into(),
+            protocol: Protocol::OpenAi,
+            base_url: "http://localhost:1/v1".into(),
+            model: "m".into(),
+            key: None,
+            http,
+            request_timeout_s: 300,
+        };
         let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
         let mut b = ApiBackend::start(cfg, ctx).unwrap();
         b.prompt(&[PromptPart::Text("measure it".into())]);
@@ -646,7 +1082,8 @@ mod tests {
             events.extend(b.poll());
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(matches!(events.first(), Some(Event::Ready { .. })), "{events:?}");
+        assert_eq!(events.first(), Some(&Event::ToolsAvailable(false)));
+        assert!(events.iter().any(|e| matches!(e, Event::Ready { .. })), "{events:?}");
         assert!(events.iter().any(|e| matches!(e, Event::Tool { status: Some(ToolStatus::Failed), .. })), "{events:?}");
         assert!(events.iter().any(|e| matches!(e, Event::Text { text, .. } if text == "Done.")), "{events:?}");
         assert!(matches!(events.last(), Some(Event::TurnEnded { reason }) if reason.is_empty()), "{events:?}");
@@ -682,7 +1119,15 @@ mod tests {
             }
             Ok((200, json!({"choices": [{"message": {"role": "assistant", "content": "Steered."}}]}).to_string().into_bytes()))
         });
-        let cfg = ApiConfig { name: "Test".into(), base_url: "http://localhost:1/v1".into(), model: "m".into(), key: None, http };
+        let cfg = ApiConfig {
+            name: "Test".into(),
+            protocol: Protocol::OpenAi,
+            base_url: "http://localhost:1/v1".into(),
+            model: "m".into(),
+            key: None,
+            http,
+            request_timeout_s: 300,
+        };
         let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
         let mut b = ApiBackend::start(cfg, ctx).unwrap();
         let wait = |b: &mut ApiBackend, events: &mut Vec<Event>| {
@@ -729,7 +1174,15 @@ mod tests {
             log.lock().unwrap().push(serde_json::from_slice(r.body.as_deref().unwrap_or(b"null")).unwrap());
             Ok((200, json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}).to_string().into_bytes()))
         });
-        let cfg = ApiConfig { name: "Test".into(), base_url: "http://localhost:1/v1".into(), model: "m".into(), key: None, http };
+        let cfg = ApiConfig {
+            name: "Test".into(),
+            protocol: Protocol::OpenAi,
+            base_url: "http://localhost:1/v1".into(),
+            model: "m".into(),
+            key: None,
+            http,
+            request_timeout_s: 300,
+        };
         let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
         let mut b = ApiBackend::start(cfg, ctx).unwrap();
         let run = |b: &mut ApiBackend, f: &dyn Fn(&mut ApiBackend), want: usize| {
@@ -767,7 +1220,15 @@ mod tests {
             log.lock().unwrap().push(serde_json::from_slice(r.body.as_deref().unwrap_or(b"null")).unwrap());
             Ok((200, json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]}).to_string().into_bytes()))
         });
-        let cfg = ApiConfig { name: "Test".into(), base_url: "http://localhost:1/v1".into(), model: "local".into(), key: None, http };
+        let cfg = ApiConfig {
+            name: "Test".into(),
+            protocol: Protocol::OpenAi,
+            base_url: "http://localhost:1/v1".into(),
+            model: "local".into(),
+            key: None,
+            http,
+            request_timeout_s: 300,
+        };
         let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
         let mut b = ApiBackend::start(cfg, ctx).unwrap();
         let mut events = Vec::new();
@@ -816,7 +1277,15 @@ mod tests {
             log.lock().unwrap().push(serde_json::from_slice(r.body.as_deref().unwrap_or(b"null")).unwrap());
             Ok((200, answers.lock().unwrap().pop().unwrap_or(json!({})).to_string().into_bytes()))
         });
-        let cfg = ApiConfig { name: "Test".into(), base_url: "http://localhost:1/v1".into(), model: "m".into(), key: None, http };
+        let cfg = ApiConfig {
+            name: "Test".into(),
+            protocol: Protocol::OpenAi,
+            base_url: "http://localhost:1/v1".into(),
+            model: "m".into(),
+            key: None,
+            http,
+            request_timeout_s: 300,
+        };
         let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
         let mut b = ApiBackend::start(cfg, ctx).unwrap();
         b.prompt(&[PromptPart::Text("go".into())]);
@@ -842,7 +1311,15 @@ mod tests {
     fn keys_never_go_over_plain_http_to_another_computer() {
         let http: HttpFn = Arc::new(|_: &HttpRequest| Ok((200, b"{}".to_vec())));
         assert!(test_endpoint(&http, "http://10.0.0.2:11434/v1", Some("k"), "m").is_err());
-        let cfg = ApiConfig { name: "x".into(), base_url: "http://10.0.0.2/v1".into(), model: "m".into(), key: Some("k".into()), http };
+        let cfg = ApiConfig {
+            name: "x".into(),
+            protocol: Protocol::OpenAi,
+            base_url: "http://10.0.0.2/v1".into(),
+            model: "m".into(),
+            key: Some("k".into()),
+            http,
+            request_timeout_s: 300,
+        };
         let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
         assert!(ApiBackend::start(cfg, ctx).is_err());
     }
@@ -858,13 +1335,22 @@ mod tests {
             let (status, v) = answers.lock().unwrap().pop().expect("no request beyond the script");
             Ok((status, v.to_string().into_bytes()))
         });
-        let cfg = ApiConfig { name: "Test".into(), base_url: "http://localhost:1/v1".into(), model: "m".into(), key: Some("sk-secret".into()), http };
+        let cfg = ApiConfig {
+            name: "Test".into(),
+            protocol: Protocol::OpenAi,
+            base_url: "http://localhost:1/v1".into(),
+            model: "m".into(),
+            key: Some("sk-secret".into()),
+            http,
+            request_timeout_s: 300,
+        };
         let (events, _rx) = channel();
         let w = Worker {
             cfg,
             mcp: None,
             next: 0,
             tools: vec![json!({"type": "function", "function": {"name": "measure"}})],
+            tool_names: vec!["measure".into()],
             history: vec![json!({"role": "user", "content": "hi"})],
             events,
             wake: Arc::new(|| {}),
@@ -884,8 +1370,8 @@ mod tests {
     fn a_refusal_of_tools_with_reasoning_effort_is_replayed_once_with_none() {
         let ok = json!({"choices": [{"message": {"role": "assistant", "content": "Done."}}]});
         let (w, seen) = scripted_worker(vec![refusal(), (200, ok.clone()), (200, ok.clone())]);
-        assert_eq!(w.request().unwrap(), ok);
-        assert_eq!(w.request().unwrap(), ok);
+        assert_eq!(w.request().unwrap().assistant, ok["choices"][0]["message"]);
+        assert_eq!(w.request().unwrap().assistant, ok["choices"][0]["message"]);
         let sent = seen.lock().unwrap();
         assert_eq!(sent.len(), 3);
         assert!(sent[0].get("reasoning_effort").is_none());
@@ -904,5 +1390,129 @@ mod tests {
         let (w, seen) = scripted_worker(vec![(400, json!({"error": {"message": "context length exceeded"}}))]);
         assert!(w.request().unwrap_err().contains("context length"));
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mcp_tools_become_anthropic_tools_without_crash_reports() {
+        let list = json!({"tools": [
+            {"name": "batch", "description": "Run commands", "inputSchema": {"type": "object", "properties": {"commands": {"type": "array"}}}},
+            {"name": "crash_reports", "description": "x", "inputSchema": {"type": "object"}},
+            {"name": "measure"},
+        ]});
+        let t = anthropic_tools(&list);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0]["name"], "batch");
+        assert_eq!(t[0]["input_schema"]["properties"]["commands"]["type"], "array");
+        assert_eq!(t[1]["input_schema"]["type"], "object");
+        assert_eq!(tool_names(&list), ["batch", "measure"]);
+    }
+
+    #[test]
+    fn anthropic_answers_read_text_thought_and_tool_calls() {
+        let r = anthropic_reply(&json!({"content": [
+            {"type": "thinking", "thinking": "checking", "signature": "s"},
+            {"type": "text", "text": "Measuring."},
+            {"type": "tool_use", "id": "t1", "name": "measure", "input": {"body": "b"}},
+        ]}));
+        assert_eq!(r.text, [(true, "checking".to_string()), (false, "Measuring.".to_string())]);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].id, "t1");
+        assert_eq!(r.calls[0].name, "measure");
+        assert_eq!(r.calls[0].arguments, Ok(json!({"body": "b"})));
+        assert_eq!(r.assistant["role"], "assistant");
+        assert_eq!(r.assistant["content"][2]["type"], "tool_use");
+        let broken = anthropic_reply(&json!({"content": [{"type": "tool_use", "name": "measure", "input": "no"}]}));
+        assert!(broken.calls[0].arguments.is_err());
+        // Calls beyond the loop's cap are left out of the answer too: each kept one is answered.
+        let many: Vec<Value> = (0..40).map(|i| json!({"type": "tool_use", "id": format!("t{i}"), "name": "measure", "input": {}})).collect();
+        let capped = anthropic_reply(&json!({"content": many}));
+        assert_eq!(capped.calls.len(), 32);
+        assert_eq!(capped.assistant["content"].as_array().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn anthropic_urls_take_the_base_with_or_without_v1() {
+        assert_eq!(endpoint("https://api.anthropic.com", "messages"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(endpoint("https://api.anthropic.com/v1", "messages"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(endpoint("https://api.anthropic.com/v1/", "messages"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(endpoint("https://api.deepseek.com/anthropic/", "models"), "https://api.deepseek.com/anthropic/v1/models");
+        assert_eq!(
+            endpoint("https://dashscope.aliyuncs.com/apps/anthropic", "messages"),
+            "https://dashscope.aliyuncs.com/apps/anthropic/v1/messages"
+        );
+    }
+
+    /// A scripted Anthropic endpoint: one answer with a tool call, then a plain answer. The loop
+    /// runs the tool (here without SolidCraft tools: an unknown tool fails) and reports the end.
+    #[test]
+    fn the_anthropic_tool_loop_runs_calls_and_ends_the_turn() {
+        let answers = std::sync::Mutex::new(vec![
+            json!({"content": [{"type": "text", "text": "Done."}]}),
+            json!({"content": [
+                {"type": "text", "text": "Measuring."},
+                {"type": "tool_use", "id": "t1", "name": "measure", "input": {}},
+            ]}),
+        ]);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let log = seen.clone();
+        let http: HttpFn = Arc::new(move |r: &HttpRequest| {
+            if r.method == "GET" {
+                return Ok((200, b"{\"data\":[]}".to_vec()));
+            }
+            log.lock().unwrap().push(serde_json::from_slice(r.body.as_deref().unwrap_or(b"null")).unwrap());
+            Ok((200, answers.lock().unwrap().pop().unwrap_or(json!({})).to_string().into_bytes()))
+        });
+        let cfg = ApiConfig {
+            name: "Test".into(),
+            protocol: Protocol::Anthropic,
+            base_url: "http://localhost:1".into(),
+            model: "m".into(),
+            key: Some("sk-secret".into()),
+            http,
+            request_timeout_s: 300,
+        };
+        let ctx = StartContext { cwd: std::env::temp_dir(), bridge: None, tools: None, wake: Box::new(|| {}) };
+        let mut b = ApiBackend::start(cfg, ctx).unwrap();
+        b.prompt(&[PromptPart::Text("measure it".into())]);
+        let mut events = Vec::new();
+        let start = std::time::Instant::now();
+        while !events.iter().any(|e| matches!(e, Event::TurnEnded { .. })) && start.elapsed() < Duration::from_secs(10) {
+            events.extend(b.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(events.first(), Some(&Event::ToolsAvailable(false)));
+        assert!(events.iter().any(|e| matches!(e, Event::Ready { .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::Tool { status: Some(ToolStatus::Failed), .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::Text { text, .. } if text == "Done.")), "{events:?}");
+        assert!(matches!(events.last(), Some(Event::TurnEnded { reason }) if reason.is_empty()), "{events:?}");
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["system"], super::super::acp::SYSTEM_NOTE);
+        assert_eq!(sent[0]["max_tokens"], ANTHROPIC_MAX_TOKENS);
+        assert_eq!(sent[1]["messages"].as_array().unwrap().last().unwrap()["content"][0]["type"], "tool_result");
+        assert_eq!(sent[1]["messages"].as_array().unwrap().last().unwrap()["content"][0]["tool_use_id"], "t1");
+        b.shutdown(true);
+    }
+
+    #[test]
+    fn the_anthropic_test_sends_one_small_message_and_checks_the_key_rule() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<HttpRequest>::new()));
+        let log = seen.clone();
+        let http: HttpFn = Arc::new(move |r: &HttpRequest| {
+            log.lock().unwrap().push(r.clone());
+            Ok((200, json!({"content": [{"type": "text", "text": "Hi"}]}).to_string().into_bytes()))
+        });
+        let message = test_anthropic_endpoint(&http, "https://api.anthropic.com/v1", Some("sk-k"), "claude-opus-5-5").unwrap();
+        assert!(message.contains("claude-opus-5-5"), "{message}");
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent[0].url, "https://api.anthropic.com/v1/messages");
+        assert!(sent[0].headers.iter().any(|(k, v)| k == "anthropic-version" && v == ANTHROPIC_VERSION));
+        assert!(sent[0].headers.iter().any(|(k, v)| k == "x-api-key" && v == "sk-k"));
+        let body: Value = serde_json::from_slice(sent[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["max_tokens"], 16);
+        assert_eq!(body["messages"][0]["content"], "Hello");
+        drop(sent);
+        assert!(test_anthropic_endpoint(&http, "http://10.0.0.2/anthropic", Some("k"), "m").is_err());
+        assert!(test_anthropic_endpoint(&http, "https://api.anthropic.com", None, "").is_err());
     }
 }

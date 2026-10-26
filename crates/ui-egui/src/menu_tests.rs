@@ -4,8 +4,10 @@ use crate::test_support::sample_app;
 use egui::pos2;
 use serde_json::json;
 use solidcraft_engine::Session;
+use solidcraft_engine::geom::Vec3;
 
 use crate::context_menu::{self, Item, Target};
+use crate::viewport::Hit;
 use crate::{Services, SolveApp};
 
 #[test]
@@ -42,6 +44,52 @@ fn act(app: &mut SolveApp, t: &Target, label: &str) {
     context_menu::run_item(app, &item, pos2(0.0, 0.0));
 }
 
+#[test]
+fn linked_component_opens_its_part_in_a_tab_and_reports_a_missing_source() {
+    let mut h = crate::scenario::Harness::new();
+    let part = h.dir.join("part.solidcraft");
+    let assembly = h.dir.join("assembly.solidcraft");
+    let mut source = Session::default();
+    source.execute("solid.box", &json!({"length": 10, "width": 20, "height": 30})).unwrap();
+    source.execute("file.save", &json!({"path": part})).unwrap();
+    let inserted = h.app.run("component.insert_design", json!({"path": part})).unwrap();
+    let component = inserted["component"].as_u64().unwrap();
+    let occurrence = inserted["occurrence"].as_u64().unwrap();
+    let other_part = h.dir.join("other-part.solidcraft");
+    let mut other_source = Session::default();
+    other_source.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5})).unwrap();
+    other_source.execute("file.save", &json!({"path": other_part})).unwrap();
+    let other = h.app.run("component.insert_design", json!({"path": other_part})).unwrap();
+    let other_component = other["component"].as_u64().unwrap();
+    h.app.run("file.save", json!({"path": assembly})).unwrap();
+
+    h.app.tree.picked_components = vec![component, other_component];
+    let linked = Target::Component { id: component };
+    let row = context_menu::items(&h.app, &linked);
+    assert!(row.iter().any(|item| item.label == "Open Linked Design"));
+    let placed = context_menu::items(&h.app, &Target::Occurrence { path: vec![occurrence] });
+    assert!(placed.iter().any(|item| item.label == "Open Linked Design"));
+    assert!(!context_menu::items(&h.app, &Target::Component { id: 0 }).iter().any(|item| item.label == "Open Linked Design"));
+
+    act(&mut h.app, &linked, "Open Linked Design");
+    for _ in 0..600 {
+        if h.app.session.path.as_deref() == part.to_str() {
+            break;
+        }
+        h.frame();
+    }
+    assert_eq!(h.app.session.path.as_deref(), part.to_str());
+    assert_eq!(h.app.docs.count(), 2);
+    crate::documents::switch(&mut h.app, 0);
+    assert_eq!(h.app.session.path.as_deref(), assembly.to_str());
+
+    std::fs::remove_file(&part).unwrap();
+    act(&mut h.app, &linked, "Open Linked Design");
+    assert_eq!(h.app.docs.count(), 2);
+    assert_eq!(h.app.session.path.as_deref(), assembly.to_str());
+    assert!(h.app.status.as_ref().is_some_and(|(message, _, error)| *error && message.contains("Linked design not found")));
+}
+
 fn body(app: &SolveApp) -> String {
     app.session.model.state().bodies[0].name.clone()
 }
@@ -57,7 +105,7 @@ fn empty_space_offers_view_items_and_greys_out_undo() {
     assert!(!context_menu::radial_items(&app)[0].enabled, "no command to repeat yet");
     // Hide Origin toggles.
     context_menu::run_item(&mut app, &find(&items, "Hide Origin"), pos2(0.0, 0.0));
-    assert!(!app.ui.show_origin);
+    assert!(!app.origin_shown());
 }
 
 #[test]
@@ -133,6 +181,60 @@ fn a_selected_face_keeps_the_body_menu_beside_a_sketch_curve() {
     assert!(find(&items, "Press Pull").enabled);
     assert!(find(&items, "Edit Profile Sketch").enabled);
     assert!(!items.iter().any(|i| i.label == "Redefine Sketch Plane"), "the face menu, not the sketch menu");
+}
+
+/// A right-click on a face or edge that is part of a multi-selection keeps the whole selection:
+/// the pick keeps a point of its own, so the face is compared by body and index (#3733).
+#[test]
+fn right_click_on_a_selected_face_keeps_the_multi_selection() {
+    let mut app = sample_app();
+    let b = body(&app);
+    app.run(
+        "select.set",
+        json!({"items": [
+            {"type": "face", "body": b, "index": 0, "point": [1, 2, 3]},
+            {"type": "face", "body": b, "index": 1, "point": [4, 5, 6]},
+        ]}),
+    )
+    .unwrap();
+    app.viewport.hover = Some(Hit::Face { body: b.clone(), index: 0, point: Vec3::new(9.0, 9.0, 9.0) });
+    context_menu::open(&mut app, pos2(400.0, 300.0), Default::default());
+    assert_eq!(app.session.selection.len(), 2, "the right-click keeps the faces it is about: {:?}", app.session.selection);
+    // A face outside the selection is still picked, so its menu is about the face under the cursor.
+    app.viewport.hover = Some(Hit::Face { body: b, index: 2, point: Vec3::new(9.0, 9.0, 9.0) });
+    context_menu::open(&mut app, pos2(400.0, 300.0), Default::default());
+    assert_eq!(app.session.selection.len(), 1, "a face outside the selection is picked: {:?}", app.session.selection);
+}
+
+/// A right-click on a face of a selected body keeps the whole selection: the body is what is
+/// selected, so the menu is about the bodies and the face under the cursor does not replace them
+/// (#5849).
+#[test]
+fn right_click_on_a_face_of_a_selected_body_keeps_the_bodies() {
+    let mut app = sample_app();
+    let first = body(&app);
+    app.run("solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [200, 0, 0]})).unwrap();
+    let second = app.session.model.state().bodies.iter().map(|b| b.name.clone()).find(|n| *n != first).expect("a second body");
+    let both = vec![solidcraft_engine::Sel::Body { name: first.clone() }, solidcraft_engine::Sel::Body { name: second.clone() }];
+    app.run("select.set", json!({"items": [{"type": "body", "name": first}, {"type": "body", "name": second}]})).unwrap();
+    // A face of the first body: both bodies stay selected, and the menu stays the bodies' menu.
+    app.viewport.hover = Some(Hit::Face { body: first.clone(), index: 0, point: Vec3::new(9.0, 9.0, 9.0) });
+    context_menu::open(&mut app, pos2(400.0, 300.0), Default::default());
+    assert_eq!(app.session.selection, both, "the right-click keeps the bodies it is about");
+    assert!(!context_menu::items(&app, &Target::Viewport).iter().any(|i| i.label == "Create Sketch"), "the bodies' menu, not the face menu");
+    // An edge and a vertex of a selected body count the same way.
+    app.viewport.hover = Some(Hit::Edge { body: first.clone(), index: 0, mid: Vec3::new(9.0, 9.0, 9.0) });
+    context_menu::open(&mut app, pos2(400.0, 300.0), Default::default());
+    assert_eq!(app.session.selection, both, "an edge of a selected body keeps the bodies");
+    // A face of a body outside the selection is still picked, so the menu is about that face.
+    app.run("select.set", json!({"items": [{"type": "body", "name": first}]})).unwrap();
+    app.viewport.hover = Some(Hit::Face { body: second, index: 0, point: Vec3::new(9.0, 9.0, 9.0) });
+    context_menu::open(&mut app, pos2(400.0, 300.0), Default::default());
+    assert!(
+        matches!(app.session.selection.as_slice(), [solidcraft_engine::Sel::Face { .. }]),
+        "a face of an unselected body is picked: {:?}",
+        app.session.selection
+    );
 }
 
 #[test]
@@ -215,7 +317,7 @@ fn sketch_menu_hides_and_moves_to_another_plane() {
     context_menu::run_item(&mut app, &find(&items, "Show/Hide"), pos2(0.0, 0.0));
     assert_eq!(crate::browser::sketch_visible(&app, id), !vis);
     context_menu::run_item(&mut app, &find(&items, "Show Dimension"), pos2(0.0, 0.0));
-    assert_eq!(app.ui.shown_dims, vec![id]);
+    assert_eq!(app.session.visibility.shown_dimensions, vec![id]);
     assert!(find(&context_menu::items(&app, &t), "Hide Dimension").enabled);
     context_menu::run_item(&mut app, &find(&items, "Edit Sketch"), pos2(0.0, 0.0));
     assert_eq!(app.session.active_sketch, Some(id));
@@ -254,6 +356,11 @@ fn component_menu_activates_grounds_and_pastes() {
     let t = Target::Component { id: c };
     act(&mut app, &t, "Activate");
     assert_eq!(app.session.active_component, c);
+    // The design's first part comes in grounded (#2804); the menu frees it and grounds it again.
+    assert!(app.session.doc.occurrence_of(c).unwrap().grounded);
+    act(&mut app, &t, "Unground");
+    assert!(!app.session.doc.occurrence_of(c).unwrap().grounded);
+    assert!(find(&context_menu::items(&app, &t), "Move/Copy").enabled, "free");
     act(&mut app, &t, "Ground");
     assert!(app.session.doc.occurrence_of(c).unwrap().grounded);
     assert!(!find(&context_menu::items(&app, &t), "Move/Copy").enabled, "grounded");
@@ -274,10 +381,10 @@ fn move_shortcut_uses_the_selected_nested_instance_and_pending_position() {
     let baseline = app.session.pending_moves[&child];
     app.run("select.set", json!({"items":[{"type":"occurrence","path":path}]})).unwrap();
     crate::keymap::bind(&mut app, "solid.move", "Shift+M", false).unwrap();
-    crate::keymap::press(&mut app, "M");
+    crate::keymap::press(&mut app, "M", false);
     assert!(app.tree.occurrence_move.is_none(), "the old shortcut was cleared");
     app.ui.tab = "INSPECT".into();
-    crate::keymap::press(&mut app, "Shift+M");
+    crate::keymap::press(&mut app, "Shift+M", false);
     assert_eq!(app.ui.tab, "MODEL", "starting component Move still selects the command's workspace tab");
     let movement = app.tree.occurrence_move.as_ref().expect("component Move opens from its rebound shortcut");
     assert_eq!(movement.occurrence, child);
@@ -295,17 +402,35 @@ fn move_shortcut_respects_grounding_and_keeps_body_selection_as_a_body_move() {
     app.run("solid.box", json!({"length":30,"width":20,"height":10})).unwrap();
     app.run("occurrence.ground", json!({"occurrence":occurrence,"grounded":true})).unwrap();
     app.run("select.set", json!({"items":[{"type":"occurrence","path":[occurrence]}]})).unwrap();
-    crate::keymap::press(&mut app, "M");
+    crate::keymap::press(&mut app, "M", false);
     assert!(app.tree.occurrence_move.is_none(), "a grounded component cannot move");
     assert!(app.dialog.is_none(), "do not fall back to moving the grounded component's bodies");
 
     app.run("occurrence.ground", json!({"occurrence":occurrence,"grounded":false})).unwrap();
     app.run("select.set", json!({"items":[{"type":"body","name":"Body1"}]})).unwrap();
-    crate::keymap::press(&mut app, "M");
+    crate::keymap::press(&mut app, "M", false);
     assert!(app.tree.occurrence_move.is_none(), "a body selection still edits geometry");
     let dialog = app.dialog.as_ref().expect("body Move opens");
     assert!(matches!(dialog.kind, crate::dialogs::Kind::Move { .. }));
     assert_eq!(dialog.inputs[0].items, vec![solidcraft_engine::Sel::Body { name: "Body1".into() }]);
+}
+
+#[test]
+fn component_and_occurrence_menus_cycle_shared_identification_color() {
+    let mut app = SolveApp::new(Session::default(), Services::default());
+    let id = app.run("component.create", json!({"name":"Part"})).unwrap()["component"].as_u64().unwrap();
+    let original = app.session.doc.component_identification_color(id);
+    assert!(app.session.colored_components.is_none());
+    act(&mut app, &Target::Component { id }, "Cycle Component Color");
+    let next = app.session.doc.component_identification_color(id);
+    assert_ne!(original, next);
+    assert!(app.session.colored_components.is_some());
+    assert!(app.dialog.is_none());
+    let occurrence = app.session.doc.occurrence_of(id).unwrap().id;
+    act(&mut app, &Target::Occurrence { path: vec![occurrence] }, "Cycle Component Color");
+    assert_ne!(app.session.doc.component_identification_color(id), next);
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.doc.component_identification_color(id), next);
 }
 
 #[test]
@@ -318,7 +443,7 @@ fn pick_runs_an_item_of_the_open_menu() {
     assert!(context_menu::pick(&mut app, "Undo").is_err(), "disabled");
     assert!(context_menu::pick(&mut app, "ui.origin").is_ok());
     assert!(app.viewport.context_menu.is_none(), "a pick closes the menu");
-    assert!(!app.ui.show_origin);
+    assert!(!app.origin_shown());
 }
 
 #[test]
@@ -363,6 +488,31 @@ fn browser_folds_are_kept_in_the_preferences() {
 }
 
 #[test]
+fn expand_and_collapse_all_open_the_browser_tree_from_the_design_menu() {
+    let mut app = sample_app();
+    let n = app.session.undo.len();
+    let root = Target::Component { id: 0 };
+    assert!(context_menu::items(&app, &root).iter().any(|i| i.label == "Expand All" && i.id == "browser.expand_all"));
+    act(&mut app, &root, "Collapse All");
+    assert!(app.tree.collapsed.contains("c0/bodies"), "{:?}", app.tree.collapsed);
+    assert!(!app.tree.collapsed.contains("c0"), "the design row stays open: {:?}", app.tree.collapsed);
+    assert_eq!(app.session.undo.len(), n);
+    act(&mut app, &root, "Expand All");
+    assert!(!app.tree.collapsed.contains("c0/bodies"), "{:?}", app.tree.collapsed);
+    assert!(app.tree.expanded.contains("origin") && app.tree.expanded.contains("c0/features"), "{:?}", app.tree.expanded);
+    assert_eq!(app.session.undo.len(), n);
+
+    let created = app.run("component.create", json!({"name": "Part"})).unwrap();
+    let occ = created["occurrence"].as_u64().unwrap();
+    let path = vec![occ];
+    act(&mut app, &Target::Occurrence { path: path.clone() }, "Collapse All");
+    assert!(app.tree.collapsed.contains(&format!("o:{occ}")), "{:?}", app.tree.collapsed);
+    assert!(!app.tree.collapsed.contains("c0/bodies"), "a placement's collapse leaves the rest of the tree: {:?}", app.tree.collapsed);
+    act(&mut app, &Target::Occurrence { path }, "Expand All");
+    assert!(!app.tree.collapsed.contains(&format!("o:{occ}")), "{:?}", app.tree.collapsed);
+}
+
+#[test]
 fn delete_key_handles_every_kind_and_asks_about_dependents() {
     use solidcraft_engine::Sel;
     let mut app = sample_app();
@@ -399,6 +549,82 @@ fn delete_key_handles_every_kind_and_asks_about_dependents() {
     crate::delete::delete_selection(&mut app);
     assert!(app.status.as_ref().is_some_and(|s| s.0.contains("Delete Face")), "{:?}", app.status);
     assert_eq!(app.session.doc.features.len(), n);
+}
+
+#[test]
+fn browser_feature_menu_deletes_its_target_and_supports_undo() {
+    let mut app = SolveApp::new(Session::default(), Services::default());
+    for (name, x) in [("Keep", 0), ("Delete", 30)] {
+        app.run("solid.box", json!({"length":10,"width":10,"height":10,"corner":[x,0,0],"body_name":name})).unwrap();
+    }
+    let keep = app.session.doc.features[0].id;
+    let target = app.session.doc.features[1].id;
+    // A Browser context menu acts on its row, even when another feature is selected.
+    app.session.selection = vec![solidcraft_engine::Sel::Feature { id: keep }];
+    let saved = app.session.doc.to_json();
+    let undo = app.session.undo.len();
+    act(&mut app, &Target::Feature { id: target }, "Delete");
+    assert!(app.menu.confirm.is_none());
+    assert!(app.session.doc.feature(keep).is_some());
+    assert!(app.session.doc.feature(target).is_none());
+    assert_eq!(app.session.undo.len(), undo + 1);
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.doc.to_json(), saved);
+    app.run("edit.redo", json!({})).unwrap();
+    assert!(app.session.doc.feature(keep).is_some());
+    assert!(app.session.doc.feature(target).is_none());
+    assert!(!find(&context_menu::items(&app, &Target::Feature { id: target }), "Delete").enabled);
+    assert!(!find(&context_menu::items(&app, &Target::Feature { id: target }), "Rename").enabled);
+}
+
+#[test]
+fn browser_feature_menu_renames_its_target_and_supports_undo() {
+    let mut app = SolveApp::new(Session::default(), Services::default());
+    for x in [0, 30] {
+        app.run("solid.box", json!({"length":10,"width":10,"height":10,"corner":[x,0,0]})).unwrap();
+    }
+    let keep = app.session.doc.features[0].id;
+    let target = app.session.doc.features[1].id;
+    let keep_name = app.session.doc.feature(keep).unwrap().name.clone();
+    let target_name = app.session.doc.feature(target).unwrap().name.clone();
+    app.session.selection = vec![solidcraft_engine::Sel::Feature { id: keep }];
+    let saved = app.session.doc.to_json();
+    let undo = app.session.undo.len();
+    act(&mut app, &Target::Feature { id: target }, "Rename");
+    assert_eq!(app.menu.rename.as_ref().unwrap().text, target_name);
+    assert!(context_menu::finish_rename(&mut app, Some("Cancelled"), false));
+    assert_eq!(app.session.doc.to_json(), saved);
+    assert_eq!(app.session.undo.len(), undo);
+    act(&mut app, &Target::Feature { id: target }, "Rename");
+    assert!(context_menu::finish_rename(&mut app, Some("Renamed feature"), true));
+    assert!(app.menu.rename.is_none());
+    assert_eq!(app.session.doc.feature(target).unwrap().name, "Renamed feature");
+    assert_eq!(app.session.doc.feature(keep).unwrap().name, keep_name);
+    assert_eq!(app.session.undo.len(), undo + 1);
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.doc.to_json(), saved);
+    app.run("edit.redo", json!({})).unwrap();
+    assert_eq!(app.session.doc.feature(target).unwrap().name, "Renamed feature");
+}
+
+#[test]
+fn browser_feature_menu_confirms_dependent_changes_before_deleting() {
+    let mut app = sample_app();
+    let target = app.session.doc.features[1].id;
+    let saved = app.session.doc.to_json();
+    let undo = app.session.undo.len();
+    act(&mut app, &Target::Feature { id: target }, "Delete");
+    assert!(app.menu.confirm.is_some(), "later features depend on the plate's extrusion");
+    assert_eq!(app.session.doc.to_json(), saved);
+    assert_eq!(app.session.undo.len(), undo);
+    assert!(crate::delete::confirm(&mut app, false));
+    assert_eq!(app.session.doc.to_json(), saved);
+    act(&mut app, &Target::Feature { id: target }, "Delete");
+    assert!(crate::delete::confirm(&mut app, true));
+    assert!(app.session.doc.feature(target).is_none());
+    assert_eq!(app.session.undo.len(), undo + 1);
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.session.doc.to_json(), saved);
 }
 
 #[test]
@@ -608,6 +834,7 @@ fn an_uncaptured_move_asks_before_the_next_command() {
     let b = body(&app);
     app.run("component.from_bodies", json!({"bodies": [b]})).unwrap();
     let occ = app.session.doc.occurrences[0].id;
+    app.run("occurrence.ground", json!({"occurrence": occ, "grounded": false})).unwrap();
     app.run("occurrence.move", json!({"occurrence": occ, "translate": [10, 0, 0], "capture": false})).unwrap();
     app.start("sketch.create");
     assert_eq!(app.tree.capture_prompt.as_deref(), Some("sketch.create"), "asks first");
@@ -641,12 +868,42 @@ fn f2_renames_the_selected_item() {
     assert!(!context_menu::rename_selection(&mut app, pos2(0.0, 0.0)), "nothing selected");
 }
 
+/// A double-click on a body's browser row edits its name in the row, like F2 (no floating box);
+/// Escape cancels, and a second double-click then commits a new name.
+#[test]
+fn double_click_on_a_body_row_renames_it_in_the_row() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length": 40, "width": 40, "height": 10, "body_name": "Block"})).unwrap();
+    h.app.run("select.clear", json!({})).unwrap();
+    h.frames(3);
+    let at = crate::scenario::handle_at("row:Block").expect("the body has a browser row");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "double": true}));
+    h.frames(3);
+    let rename = h.app.menu.rename.as_ref().expect("a double-click starts the rename");
+    assert!(rename.inline, "the name is edited in its row");
+    assert!(matches!(&rename.what, context_menu::RenameWhat::Body(b) if b == "Block"));
+    assert!(crate::scenario::handle_at("rename:Block").is_some(), "the row shows its name editor");
+    // Escape leaves the name alone.
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.frames(2);
+    assert!(h.app.menu.rename.is_none());
+    assert!(h.app.session.model.state().body("Block").is_some());
+    // Past egui's double-click window, so this is a new double-click and not a triple.
+    h.frames(40);
+    let at = crate::scenario::handle_at("row:Block").expect("the row is still there");
+    h.call("ui.click", json!({"x": at.x, "y": at.y, "double": true}));
+    h.frames(3);
+    assert!(context_menu::finish_rename(&mut h.app, Some("Base"), true));
+    assert!(h.app.session.model.state().body("Base").is_some());
+}
+
 #[test]
 fn occurrence_moves_turn_about_their_origin_then_move() {
     let mut app = sample_app();
     let b = body(&app);
     app.run("component.from_bodies", json!({"bodies": [b]})).unwrap();
     let occ = app.session.doc.occurrences[0].id;
+    app.run("occurrence.ground", json!({"occurrence": occ, "grounded": false})).unwrap();
     let mut m = crate::browser::OccMove::new(occ);
     m.pivot = Some(solidcraft_engine::geom::Vec3::new(5.0, 0.0, 0.0));
     m.translate = [10.0, 0.0, 0.0];
@@ -771,7 +1028,7 @@ fn right_click_on_a_plane_offers_a_sketch_on_it() {
         let menu = h.call("ui.menu", json!({}))["result"].clone();
         let items = menu["items"].as_array().unwrap();
         let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).filter(|l| !l.is_empty()).collect();
-        assert_eq!(labels[..3], ["Select Other…", "Create Sketch", "Pan"], "{plane}: {labels:?}");
+        assert_eq!(labels[..4], ["Select Other…", "Create Sketch", "Look At", "Pan"], "{plane}: {labels:?}");
         let sketch = items.iter().find(|i| i["label"] == "Create Sketch").unwrap();
         assert_eq!(sketch["params"], json!({"plane": plane}));
         assert!(h.app.session.selection.is_empty(), "the right-click leaves the plane unselected");
@@ -812,6 +1069,54 @@ fn right_click_on_a_plane_offers_a_sketch_on_it() {
     assert_eq!(sketch, Some(25.0), "the sketch is on the construction plane");
 }
 
+/// A right-click on empty space leads with Create Sketch too (#3032), in the same place as on a
+/// plane: the toolbar's, which asks for the plane or face. Either way the menu offers it once.
+#[test]
+fn empty_space_leads_with_create_sketch() {
+    let mut app = sample_app();
+    let items = context_menu::items(&app, &Target::Viewport);
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).filter(|l| !l.is_empty()).collect();
+    assert_eq!(labels[..2], ["Create Sketch", "Pan"], "{labels:?}");
+    assert_eq!(items.first().map(|i| i.label.as_str()), Some("Create Sketch"), "first, as on a plane");
+    assert!(items.get(1).is_some_and(|i| i.id == "-"), "then a separator, as on a plane");
+    assert_eq!(labels.iter().filter(|l| **l == "Create Sketch").count(), 1, "{labels:?}");
+    let sketch = find(&items, "Create Sketch");
+    assert!(sketch.enabled && sketch.params.is_none(), "{sketch:?}");
+    // A plane under the cursor: still one Create Sketch, first, on that plane.
+    app.menu.plane = Some("XY".into());
+    let on_plane = context_menu::items(&app, &Target::Viewport);
+    let sketches: Vec<&Item> = on_plane.iter().filter(|i| i.label == "Create Sketch").collect();
+    assert_eq!(sketches.len(), 1);
+    assert_eq!(sketches[0].params, Some(json!({"plane": "XY"})));
+    assert_eq!(on_plane.first().map(|i| i.label.as_str()), Some("Create Sketch"));
+    // Picking the empty-space one starts the toolbar's Create Sketch, waiting for a plane.
+    app.menu.plane = None;
+    context_menu::run_item(&mut app, &sketch, pos2(0.0, 0.0));
+    assert!(matches!(app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::Sketch)), "Create Sketch started");
+}
+
+/// Create Sketch from a right-click on empty space sketches on the next plane clicked (#3032).
+#[test]
+fn create_sketch_from_empty_space_sketches_on_the_plane_clicked_next() {
+    use solidcraft_engine::geom::Vec3;
+    let mut h = crate::scenario::Harness::new();
+    h.app.home.open = false;
+    h.settle();
+    let view = h.call("ui.inspect", json!({}))["result"]["viewport"].clone();
+    let corner = [view[0].as_f64().unwrap() + 40.0, view[3].as_f64().unwrap() - 40.0];
+    h.call("ui.menu", json!({"x": corner[0], "y": corner[1]}));
+    let menu = h.call("ui.menu", json!({}))["result"].clone();
+    let first = menu["items"].as_array().unwrap().iter().find_map(|i| i["label"].as_str().filter(|l| !l.is_empty()));
+    assert_eq!(first, Some("Create Sketch"), "{menu}");
+    assert_eq!(h.call("ui.menuPick", json!({"item": "Create Sketch"}))["ok"], true);
+    assert!(h.app.session.active_sketch.is_none(), "it waits for a plane or face");
+    let p = h.at(&json!({"plane": "XY"})).unwrap();
+    h.call("ui.click", json!({"x": p[0], "y": p[1]}));
+    h.frames(3);
+    let normal = h.app.session.active_sketch.and_then(|s| h.app.session.world_state().sketch(s).map(|s| s.plane.normal()));
+    assert!(normal.is_some_and(|n| n.dot(Vec3::Z).abs() > 0.999), "sketching on XY: {normal:?}");
+}
+
 /// Menus opened near the window's bottom right corner, in the viewport or the browser, open up
 /// or to the left where they would not fit, ending at the cursor and staying in the window, at
 /// any UI scale (#1354).
@@ -848,6 +1153,41 @@ fn menus_near_the_window_corner_open_inward() {
     }
 }
 
+/// #3313: renaming a body by typing in the Rename box and pressing Enter (or Tab) renames it.
+#[test]
+fn typing_a_new_body_name_and_enter_renames_it() {
+    for confirm in ["Enter", "Tab"] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        let b = h.app.session.model.state().bodies[0].name.clone();
+        h.app.run("select.set", json!({"items": [{"type": "body", "name": b}]})).unwrap();
+        h.frames(2);
+        h.step(&json!({"key": "F2"})).unwrap();
+        h.frames(2);
+        assert!(h.app.menu.rename.is_some(), "F2 opens the Rename box");
+        h.step(&json!({"text": "Lid"})).unwrap();
+        h.frames(1);
+        h.step(&json!({"key": confirm})).unwrap();
+        h.frames(2);
+        let names: Vec<String> = h.app.session.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(names, ["Lid"], "{confirm} renames the body; status {:?}", h.app.status);
+    }
+    // Escape still cancels.
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+    let b = h.app.session.model.state().bodies[0].name.clone();
+    h.app.run("select.set", json!({"items": [{"type": "body", "name": b.clone()}]})).unwrap();
+    h.frames(2);
+    h.step(&json!({"key": "F2"})).unwrap();
+    h.frames(2);
+    h.step(&json!({"text": "Lid"})).unwrap();
+    h.frames(1);
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.frames(2);
+    assert!(h.app.menu.rename.is_none());
+    assert_eq!(h.app.session.model.state().bodies[0].name, b, "Escape keeps the old name");
+}
+
 #[test]
 fn contribution_picked_faces_open_their_own_feature_after_later_modifiers() {
     use solidcraft_engine::{Sel, geom::Vec3};
@@ -872,17 +1212,18 @@ fn contribution_picked_faces_open_their_own_feature_after_later_modifiers() {
         let pick = Sel::Face { body: "Plate".into(), index, point };
         app.session.selection = vec![pick.clone()];
         let items = context_menu::items(&app, &Target::Viewport);
-        for label in ["Edit Feature", "Find in Timeline", "Find in Browser"] {
+        for label in ["Edit Feature", "Find in Timeline"] {
             let item = find(&items, label);
             assert!(item.enabled, "{label}, {expected}: {names:?}");
             assert_eq!(item.params.as_ref().unwrap()["feature"], json!(expected));
         }
         act(&mut app, &Target::Viewport, "Find in Timeline");
         assert_eq!(app.session.selection, vec![Sel::Feature { id: expected }]);
+        // The browser lists bodies: a picked face finds its body there, whichever feature made the face.
         app.session.selection = vec![pick.clone()];
         act(&mut app, &Target::Viewport, "Find in Browser");
-        assert_eq!(app.session.selection, vec![Sel::Feature { id: expected }]);
-        assert_eq!(app.tree.reveal_feature.as_ref().unwrap().id, expected);
+        assert_eq!(app.session.selection, vec![Sel::Body { name: "Plate".into() }]);
+        assert_eq!(app.tree.reveal.as_deref(), Some("Plate"));
         app.session.selection = vec![pick];
         act(&mut app, &Target::Viewport, "Edit Feature");
         assert_eq!(app.dialog.as_ref().unwrap().editing.unwrap().0, expected);
@@ -898,7 +1239,7 @@ fn contribution_unresolvable_face_does_not_edit_the_body_creator() {
     let items = context_menu::items(&app, &Target::Viewport);
     assert!(!find(&items, "Edit Feature").enabled);
     assert!(!find(&items, "Find in Timeline").enabled);
-    assert!(!find(&items, "Find in Browser").enabled);
+    assert!(find(&items, "Find in Browser").enabled, "the body is still known");
 }
 
 #[test]
@@ -973,6 +1314,48 @@ fn appearance_submenu_swatches_apply_to_the_clicked_body_and_keep_library_action
 }
 
 #[test]
+fn appearance_parent_click_opens_editor_after_hovering_quick_choices() {
+    use crate::scenario::{Harness, rect_of};
+    let mut h = Harness::new();
+    h.app = sample_app();
+    let name = body(&h.app);
+    h.frames(3);
+    context_menu::open_for(&mut h.app, pos2(400.0, 180.0), Target::Body { name: name.clone() });
+    h.frames(2);
+    h.step(&json!({"move":[10, 10]})).unwrap();
+    h.step(&json!({"move":{"handle":"menu:ui.appearance"}})).unwrap();
+    h.frames(2);
+    assert!(rect_of("menu:appearance.assign:Aluminum - Satin").is_some(), "hover opens quick choices");
+    assert!(h.app.dialog.is_none(), "hover must not open the editor");
+    h.step(&json!({"click":{"handle":"menu:ui.appearance"}})).unwrap();
+    assert!(h.app.viewport.context_menu.is_none(), "activation closes the context menu");
+    let dialog = h.app.dialog.as_ref().expect("parent click opens the full editor");
+    assert!(matches!(dialog.kind, crate::dialogs::Kind::Appearance(_)));
+    assert_eq!(dialog.inputs[0].items, vec![solidcraft_engine::Sel::Body { name }]);
+}
+
+#[test]
+fn appearance_hovered_quick_choice_applies_without_opening_editor() {
+    use crate::scenario::Harness;
+    let mut h = Harness::new();
+    h.app = sample_app();
+    let name = body(&h.app);
+    let rows = context_menu::items(&h.app, &Target::Body { name: name.clone() });
+    let appearance = find(&rows, "Appearance");
+    let swatch = appearance.children.iter().find(|row| row.swatch.is_some()).unwrap();
+    h.frames(3);
+    context_menu::open_for(&mut h.app, pos2(400.0, 180.0), Target::Body { name: name.clone() });
+    h.frames(2);
+    h.step(&json!({"move":[10, 10]})).unwrap();
+    h.step(&json!({"move":{"handle":"menu:ui.appearance"}})).unwrap();
+    h.frames(2);
+    h.step(&json!({"click":{"handle":format!("menu:{}:{}", swatch.id, swatch.label)}})).unwrap();
+    assert_eq!(h.app.session.doc.appearances.bodies[&name].color, swatch.swatch.unwrap());
+    assert!(h.app.dialog.is_none(), "quick choice applies directly");
+    assert!(h.app.viewport.context_menu.is_none());
+}
+
+#[test]
 fn appearance_submenu_keyboard_opens_beside_parent_and_left_returns_to_it() {
     use crate::scenario::{Harness, rect_of};
     let mut h = Harness::new();
@@ -996,6 +1379,38 @@ fn appearance_submenu_keyboard_opens_beside_parent_and_left_returns_to_it() {
     assert!(h.app.viewport.context_menu.is_none());
 }
 
+/// The Appearance flyout opened by hovering its row closes once the pointer moves to another
+/// row of the same menu (#6657).
+#[test]
+fn appearance_submenu_closes_when_the_pointer_moves_to_another_row() {
+    use crate::scenario::{Harness, rect_of};
+    let mut h = Harness::new();
+    h.app = sample_app();
+    h.frames(3);
+    let target = Target::Body { name: body(&h.app) };
+    let rows = context_menu::items(&h.app, &target);
+    context_menu::open_for(&mut h.app, pos2(400.0, 180.0), target);
+    h.frames(2);
+    let flyout = "menu:appearance.assign:Aluminum - Satin";
+    h.step(&json!({"move":[10, 10]})).unwrap();
+    h.step(&json!({"move":{"handle":"menu:ui.appearance"}})).unwrap();
+    h.frames(2);
+    assert!(rect_of(flyout).is_some(), "hovering Appearance opens its flyout");
+    let other = rows.iter().find(|i| i.enabled && i.children.is_empty()).unwrap();
+    h.step(&json!({"move":{"handle":format!("menu:{}", other.id)}})).unwrap();
+    h.frames(2);
+    assert!(rect_of(flyout).is_some(), "passing over {} on the way keeps the flyout for a moment", other.label);
+    h.frames(30);
+    assert!(rect_of(flyout).is_none(), "resting on {} closes the Appearance flyout", other.label);
+    assert!(h.app.viewport.context_menu.is_some(), "the menu itself stays open");
+    h.step(&json!({"move":{"handle":"menu:ui.appearance"}})).unwrap();
+    h.frames(2);
+    assert!(rect_of(flyout).is_some(), "hovering Appearance again reopens it");
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert!(h.app.viewport.context_menu.is_none());
+    assert!(h.app.dialog.is_none(), "closing the flyout runs nothing");
+}
+
 #[test]
 fn narrow_overflow_submenu_keeps_opening_click_and_accepts_the_next_click() {
     use crate::scenario::Harness;
@@ -1007,4 +1422,91 @@ fn narrow_overflow_submenu_keeps_opening_click_and_accepts_the_next_click() {
     assert!(crate::scenario::handle_at("toolbar:solid.extrude").is_some());
     h.step(&json!({"click":{"handle":"toolbar:solid.extrude"}})).unwrap();
     assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::Extrude { .. })));
+}
+
+/// A right-click on a browser row opens its menu, also when the press and the release reach the
+/// same frame (a trackpad tap, or a click during a slow frame).
+mod browser_rows {
+    use egui::{Event, Modifiers, PointerButton, Pos2, vec2};
+
+    use crate::context_menu::Target;
+    use crate::scenario::Harness;
+
+    fn harness() -> Harness {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.app.ui.show_browser = true;
+        h.app.session.run_script(&solidcraft_engine::sample::script()).expect("sample");
+        h.frames(3);
+        h
+    }
+
+    /// What a menu is about, without the browser's scope of a folder.
+    fn kind(t: &Target) -> String {
+        match t {
+            Target::Folder { folder, .. } => format!("folder:{folder}"),
+            Target::Body { name } => format!("body:{name}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn right(at: Pos2, pressed: bool) -> Event {
+        Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    fn right_click(h: &mut Harness, at: Pos2, one_frame: bool) {
+        h.frame_with(vec![Event::PointerMoved(at)]);
+        if one_frame {
+            h.frame_with(vec![right(at, true), right(at, false)]);
+        } else {
+            h.frame_with(vec![right(at, true)]);
+            h.frame_with(vec![right(at, false)]);
+        }
+        h.frames(4);
+    }
+
+    #[test]
+    fn a_right_click_on_a_row_opens_its_menu_however_its_events_arrive() {
+        let mut h = harness();
+        let rows = [("row:Origin", "Origin"), ("row:Bodies", "folder:bodies"), ("row:Plate", "body:Plate"), ("row:Sketches", "folder:sketches")];
+        for (row, target) in rows {
+            let Some(centre) = crate::scenario::handle_at(row) else { panic!("{row} is not drawn: {:?}", crate::scenario::handles("row:")) };
+            // Pointers sit between whole points (trackpads, HiDPI screens).
+            for offset in [vec2(0.0, 0.0), vec2(0.25, 0.75), vec2(0.5, 0.5), vec2(0.75, 0.25)] {
+                for one_frame in [false, true] {
+                    crate::context_menu::close(&mut h.app);
+                    h.frames(2);
+                    right_click(&mut h, centre + offset, one_frame);
+                    let how = if one_frame { "in one frame" } else { "in two frames" };
+                    assert!(h.app.viewport.context_menu.is_some(), "{row} at {offset:?}, press and release {how}: the menu did not stay open");
+                    assert_eq!(kind(&h.app.menu.target), target, "{row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_elsewhere_moves_or_closes_an_open_menu() {
+        let mut h = harness();
+        let half = vec2(0.5, 0.5);
+        let plate = crate::scenario::handle_at("row:Plate").expect("Plate row");
+        let origin = crate::scenario::handle_at("row:Origin").expect("Origin row");
+        right_click(&mut h, plate + half, true);
+        assert!(h.app.viewport.context_menu.is_some());
+        assert_eq!(h.app.menu.target, Target::Body { name: "Plate".into() });
+        right_click(&mut h, origin + half, true);
+        assert!(h.app.viewport.context_menu.is_some(), "a right-click on another row opens that row's menu");
+        assert_eq!(h.app.menu.target, Target::Origin);
+
+        let empty = h.app.viewport.rect.expect("viewport").right_bottom() - vec2(80.5, 80.5);
+        right_click(&mut h, empty, true);
+        assert!(h.app.viewport.context_menu.is_some(), "the viewport's menu opens the same way");
+        assert_eq!(h.app.menu.target, Target::Viewport);
+
+        let primary = |pressed| Event::PointerButton { pos: origin, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.frame_with(vec![Event::PointerMoved(origin)]);
+        h.frame_with(vec![primary(true), primary(false)]);
+        h.frames(2);
+        assert!(h.app.viewport.context_menu.is_none(), "a click outside the menu closes it");
+    }
 }

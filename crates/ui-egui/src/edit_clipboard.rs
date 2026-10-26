@@ -34,19 +34,10 @@ fn sketch_selection(app: &SolveApp) -> Vec<String> {
         .selection
         .iter()
         .filter_map(|s| match s {
-            Sel::SketchCurve { id } | Sel::SketchPoint { id } => Some(id.clone()),
+            Sel::SketchCurve { id, .. } | Sel::SketchPoint { id } => Some(id.clone()),
             _ => None,
         })
         .collect()
-}
-
-/// Is there something Copy would copy?
-pub fn can_copy(app: &SolveApp) -> bool {
-    if app.session.active_sketch.is_some() {
-        !sketch_selection(app).is_empty()
-    } else {
-        app.tree.picked_components == [0] || !crate::timeline::selected_feature_ids(app).is_empty()
-    }
 }
 
 /// Is there something Paste would paste here?
@@ -212,11 +203,16 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context) {
         let mut copies = 0;
         let mut cuts = 0;
         let mut pastes = 0;
+        // Firefox on Linux sends primary-selection Paste events during middle-click navigation.
+        // Include release frames and clicks completed within one frame; explicit Ctrl/Cmd+V still works.
+        let middle_navigation = i.pointer.button_down(egui::PointerButton::Middle)
+            || i.pointer.button_pressed(egui::PointerButton::Middle)
+            || i.pointer.button_released(egui::PointerButton::Middle);
         for e in &i.events {
             match e {
                 egui::Event::Copy => copies += 1,
                 egui::Event::Cut => cuts += 1,
-                egui::Event::Paste(_) => pastes += 1,
+                egui::Event::Paste(_) if !middle_navigation => pastes += 1,
                 egui::Event::Key { key: egui::Key::C, pressed: true, modifiers, .. } if modifiers.command && !modifiers.shift && !modifiers.alt => {
                     copies += 1
                 }

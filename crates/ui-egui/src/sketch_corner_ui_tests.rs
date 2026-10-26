@@ -62,7 +62,9 @@ fn dialog_curves(h: &crate::scenario::Harness) -> Vec<String> {
         .dialog
         .as_ref()
         .and_then(|d| d.inputs.first())
-        .map(|i| i.items.iter().filter_map(|x| if let solidcraft_engine::Sel::SketchCurve { id } = x { Some(id.clone()) } else { None }).collect())
+        .map(|i| {
+            i.items.iter().filter_map(|x| if let solidcraft_engine::Sel::SketchCurve { id, .. } = x { Some(id.clone()) } else { None }).collect()
+        })
         .unwrap_or_default()
 }
 
@@ -128,7 +130,7 @@ fn offset_window_without_a_curve_reports_it_and_keeps_the_window_open() {
 #[test]
 fn clicked_extend_endpoint_reaches_exact_ellipse_and_preserves_support() {
     let mut h = crate::scenario::Harness::new();
-    h.app.ui.show_origin = true;
+    h.app.set_origin_shown(true);
     h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
     h.app.run("sketch.ellipse", json!({"center":[20,0],"major":[30,0],"minor_radius":5})).unwrap();
     h.app.run("sketch.constraint.fix", json!({"entity":"e1"})).unwrap();
@@ -150,7 +152,7 @@ fn derived_offset_context_action_releases_geometry_and_undo_restores() {
     h.app.run("sketch.ellipse", json!({"center":[0,0],"major":[10,0],"minor_radius":5})).unwrap();
     let out = h.app.run("sketch.offset", json!({"curves":["e1"],"distance":-1,"chain":false})).unwrap();
     let id = out["curves"][0].as_str().unwrap().to_string();
-    h.app.session.selection = vec![solidcraft_engine::Sel::SketchCurve { id: id.clone() }];
+    h.app.session.selection = vec![solidcraft_engine::Sel::SketchCurve { id: id.clone(), sketch: None }];
     let items = crate::context_menu::items(&h.app, &crate::context_menu::Target::Viewport);
     let item = items.iter().find(|item| item.id == "sketch.offset.break").unwrap();
     assert_eq!(item.params, Some(json!({"curve":id})));
@@ -200,7 +202,7 @@ fn has_point(h: &crate::scenario::Harness, at: Vec2) -> bool {
 fn corner_window_takes_the_corner_then_applies_the_typed_size() {
     for command in ["sketch.fillet", "sketch.chamfer.equal_distance", "sketch.chamfer.distance_angle", "sketch.chamfer.two_distance"] {
         let mut h = crate::scenario::Harness::new();
-        h.app.ui.show_origin = true;
+        h.app.set_origin_shown(true);
         h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
         h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[20,30]})).unwrap();
         h.frames(2);
@@ -518,7 +520,7 @@ fn fully_constrained_center_rectangle_corners_can_be_picked_and_filleted() {
 #[test]
 fn ordinary_drawing_keeps_origin_snap_and_real_origin_corners_work() {
     let mut h = crate::scenario::Harness::new();
-    h.app.ui.show_origin = true;
+    h.app.set_origin_shown(true);
     h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
     h.step(&json!({"start":"sketch.line"})).unwrap();
     h.step(&json!({"move":{"world":[0,0,0]}})).unwrap();
@@ -585,7 +587,7 @@ fn chamfer_window_cuts_the_corner_between_two_picked_lines() {
     assert!(sk.curve_index("left").is_some(), "the third line stays");
 }
 
-/// Corner previews draw new curves when a corner is picked, just like Mirror and Offset do.
+/// Corner previews draw the new corner curve and the two shortened sides when a corner is picked.
 /// This tests that `previews()` for Corner produces sketch preview curves visible in the viewport.
 #[test]
 fn fillet_chamfer_corner_preview_draws_curves() {
@@ -602,8 +604,8 @@ fn fillet_chamfer_corner_preview_draws_curves() {
     h.step(&json!({"click":{"world":[0.0,10.0,0.0]}})).unwrap();
     h.frames(3);
 
-    // The preview should have drawn new curves (fillet arcs at picked corners).
-    h.step(&json!({"until":{"count":{"name":"sketch_preview_curves","value":1}}})).unwrap();
+    // Show the fillet arc and both shortened sides, whose ids stay the same.
+    h.step(&json!({"until":{"count":{"name":"sketch_preview_curves","value":3}}})).unwrap();
 
     // Verify the sketch itself hasn't been modified yet.
     let sid = h.app.session.active_sketch.unwrap();
@@ -618,8 +620,8 @@ fn fillet_chamfer_corner_preview_draws_curves() {
     h.step(&json!({"click":{"world":[0.0,10.0,0.0]}})).unwrap();
     h.frames(3);
 
-    // Chamfer preview should also produce curves.
-    h.step(&json!({"until":{"count":{"name":"sketch_preview_curves","value":1}}})).unwrap();
+    // Show the chamfer line and both shortened sides too.
+    h.step(&json!({"until":{"count":{"name":"sketch_preview_curves","value":3}}})).unwrap();
 
     let sk = h.app.session.world_state().sketch(sid).unwrap().sketch.clone();
     assert_eq!(sk.curves.len(), 2, "chamfer preview must not modify the sketch");
@@ -678,4 +680,51 @@ fn two_tangent_circle_clicked_on_two_sides_fits_the_corner_and_moves_nothing() {
         let after = points(&h);
         assert!(before.iter().zip(&after).all(|(a, b)| a.dist(*b) < 1e-9), "fixed {fixed}: the rectangle moved: {after:?}");
     }
+}
+
+/// #3099: the centre circle tool, its centre snapped to a line's midpoint and its second click
+/// to the line's end, keeps the circle through that end: nothing is left free.
+#[test]
+fn centre_circle_clicked_through_a_line_end_stays_on_it() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,30],[40,30]]})).unwrap();
+    h.step(&json!({"call":"ui.view","params":{"view":"fit"}})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    h.step(&json!({"start":"sketch.circle.center"})).unwrap();
+    for at in [[20, 30, 0], [40, 30, 0]] {
+        h.step(&json!({"move":{"world":at}})).unwrap();
+        h.step(&json!({"click":{"world":at}})).unwrap();
+    }
+    let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+    let circle = sk.curves.iter().position(|c| matches!(c.kind, CurveKind::Circle { .. })).unwrap();
+    let end = sk.resolve_point("l1.end").unwrap();
+    assert!(
+        sk.constraints.iter().any(|k| matches!(k.kind, solidcraft_engine::sketch::ConstraintKind::Midpoint { l: 0, .. })),
+        "{:?}",
+        sk.constraints
+    );
+    assert!(
+        sk.constraints.iter().any(|k| k.kind == solidcraft_engine::sketch::ConstraintKind::PointOnCurve { p: end, c: circle }),
+        "the circle stays on the line's end: {:?}",
+        sk.constraints
+    );
+}
+
+/// #4691: the Point tool clicked on a line's midpoint makes a point held there (a MidPoint
+/// constraint), not a free point that happens to sit on the middle.
+#[test]
+fn a_point_clicked_on_a_line_midpoint_is_held_there() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,0],[20,0]],"ids":["base"]})).unwrap();
+    h.settle();
+    h.step(&json!({"start":"sketch.point"})).unwrap();
+    h.step(&json!({"click":{"world":[10, 0, 0]}})).unwrap();
+    let sid = h.app.session.active_sketch.unwrap();
+    let state = h.app.session.model.state();
+    let sk = &state.sketch(sid).unwrap().sketch;
+    let held = sk.constraints.iter().any(|c| matches!(c.kind, solidcraft_engine::sketch::ConstraintKind::Midpoint { .. }));
+    assert!(held, "no MidPoint constraint: {:?}", sk.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
 }

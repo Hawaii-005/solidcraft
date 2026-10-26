@@ -31,12 +31,14 @@ pub struct Colors {
     pub new_body: [u8; 4],
     pub removed: [u8; 4],
     pub edge: [u8; 4],
+    /// Whether a moved component's old place is drawn as a ghost (Drive Joints' Show ghost).
+    pub ghost: bool,
 }
 
 impl Colors {
     pub fn from_tokens(t: &Tokens) -> Colors {
         let c = |c: egui::Color32| c.to_srgba_unmultiplied();
-        Colors { body: c(t.body), added: c(t.preview_add), new_body: c(t.preview_new), removed: c(t.preview_cut), edge: c(t.body_edge) }
+        Colors { body: c(t.body), added: c(t.preview_add), new_body: c(t.preview_new), removed: c(t.preview_cut), edge: c(t.body_edge), ghost: true }
     }
 
     fn for_tool(t: &Tokens, tab: &str, active: bool) -> Colors {
@@ -111,6 +113,7 @@ pub struct PreviewState {
     /// The radius splines the previewed fillet tapered its edges with.
     pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
     straight: crate::extrude_preview::StraightPreview,
+    moving: crate::move_preview::MovePreview,
     /// PreviewReselect: Primary held - hide the preview and restore replaced bodies for picks.
     pub rolled_back: bool,
 }
@@ -119,11 +122,6 @@ impl PreviewState {
     /// Bodies the model scene should hide for the preview (empty while rolled back).
     pub fn effective_replaced(&self) -> &[String] {
         if self.rolled_back { &[] } else { &self.replaced }
-    }
-
-    /// Whether the preview scene should be drawn.
-    pub fn draw_active(&self) -> bool {
-        self.active && !self.rolled_back
     }
 
     /// Stop drawing the preview scene and give the bodies it stood in for back to the model.
@@ -138,6 +136,7 @@ impl PreviewState {
 
     fn clear(&mut self) {
         self.straight.clear();
+        self.moving.clear();
         self.running = None;
         self.running_tool = false;
         self.running_stream_key = None;
@@ -323,7 +322,10 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
             return;
         }
     };
-    let colors = Colors::for_tool(&Tokens::get(), &app.ui.tab, app.tool.is_some() || app.dialog.is_some());
+    let mut colors = Colors::for_tool(&Tokens::get(), &app.ui.tab, app.tool.is_some() || app.dialog.is_some());
+    if app.dialog.as_ref().is_some_and(|d| matches!(d.kind, crate::dialogs::Kind::Assembly(crate::dialogs_assembly::Asm::Drive { .. }))) {
+        colors.ghost = app.preferences.drive_joints_ghost;
+    }
     let key = job_key(&cmds, app.session.revision, colors);
     let stream_key = stream_key(&cmds, app.session.revision, colors);
     let tool = as_new_body(&cmds).is_some();
@@ -333,8 +335,13 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
         pv.started = crate::now_ms();
         pv.running_stream_key = stream_key;
         let mut straight = std::mem::take(&mut app.preview.straight);
-        let job = straight.compute(app, &cmds, colors);
+        let mut job = straight.compute(app, &cmds, colors);
         app.preview.straight = straight;
+        if job.is_none() {
+            let mut moving = std::mem::take(&mut app.preview.moving);
+            job = moving.compute(app, &cmds, colors);
+            app.preview.moving = moving;
+        }
         if let Some(job) = job {
             app.preview.apply(key, job);
             app.preview.busy = false;
@@ -441,7 +448,9 @@ pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
 /// error. Other features: their whole preview ([`compute`]).
 fn compute_tool(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     let Some((alt, op)) = as_new_body(cmds) else { return compute(s, cmds, colors) };
-    let tool = match s.preview(&alt) {
+    // Where the view shows it: in a component placed away from its own frame (an imported
+    // part stood upright) the model's frame would draw the tool at right angles to the face.
+    let tool = match s.preview_world(&alt) {
         Ok(t) => t,
         Err(e) => return Err(s.preview(cmds).err().map_or_else(|| e.to_string(), |r| r.to_string())),
     };
@@ -484,8 +493,13 @@ pub(crate) fn extrusion_target_error(s: &Session, cmds: &[(String, Value)], befo
                 }
             }
         } else {
+            // A cut or intersect from a component with no body of its own takes part in every
+            // body: the command decides that (#1234), and the preview asks it the same (#3085).
             found = params.get("faces").and_then(|_| params.get("face_body")).and_then(Value::as_str).map_or_else(
-                || before.bodies.iter().any(|body| s.doc.model_body_component(body) == s.active_component),
+                || {
+                    before.bodies.iter().any(|body| s.doc.model_body_component(body) == s.active_component)
+                        || (matches!(op, "cut" | "intersect") && s.cut_takes_every_body(before))
+                },
                 |name| s.world_state().body(name).is_some(),
             );
         }
@@ -655,15 +669,20 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
         .iter()
         .filter_map(|sketch| {
             let old = before.sketch(sketch.feature);
-            let old_curves = old.into_iter().flat_map(|s| s.sketch.curves.iter().map(|c| c.id.as_str())).collect::<std::collections::HashSet<_>>();
-            let old_points = old.into_iter().flat_map(|s| s.sketch.points.iter().map(|p| p.id.as_str())).collect::<std::collections::HashSet<_>>();
+            let old_curves =
+                old.into_iter().flat_map(|s| s.sketch.curves.iter().map(|c| (c.id.as_str(), c))).collect::<std::collections::HashMap<_, _>>();
+            let old_points =
+                old.into_iter().flat_map(|s| s.sketch.points.iter().map(|p| (p.id.as_str(), p.pos))).collect::<std::collections::HashMap<_, _>>();
             let indices = sketch
                 .sketch
                 .curves
                 .iter()
                 .enumerate()
                 .filter_map(|(index, curve)| {
-                    let unchanged = old_curves.contains(curve.id.as_str());
+                    let unchanged = old_curves.get(curve.id.as_str()).is_some_and(|previous| {
+                        previous.kind == curve.kind
+                            && curve.kind.point_ids().iter().all(|i| old.and_then(|s| s.sketch.point(*i)) == sketch.sketch.point(*i))
+                    });
                     if unchanged { None } else { Some(index) }
                 })
                 .collect::<Vec<_>>();
@@ -672,7 +691,7 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
                 .points
                 .iter()
                 .enumerate()
-                .filter_map(|(i, p)| if old_points.contains(p.id.as_str()) { None } else { Some(i) })
+                .filter_map(|(i, p)| if old_points.get(p.id.as_str()) == Some(&p.pos) { None } else { Some(i) })
                 .collect::<Vec<_>>();
             if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
         })
@@ -854,7 +873,7 @@ mod tests {
     }
 
     fn colors() -> Colors {
-        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], new_body: [4, 4, 4, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255] }
+        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], new_body: [4, 4, 4, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255], ghost: true }
     }
 
     #[test]
@@ -1007,6 +1026,68 @@ mod tests {
         assert_eq!(motion_key(&cam("0 deg"), 7, colors()), motion_key(&cam("90 deg"), 7, colors()));
     }
 
+    #[test]
+    fn edited_pattern_preview_includes_moved_instances_only() -> Result<(), Box<dyn std::error::Error>> {
+        for (command, initial, edits) in [
+            (
+                "sketch.pattern.rectangular",
+                json!({"entities":["seed"],"count":3,"spacing":10,"count2":2,"spacing2":15}),
+                vec![(json!({"spacing":14}), 4), (json!({"spacing2":19}), 3)],
+            ),
+            (
+                "sketch.pattern.circular",
+                json!({"entities":["seed"],"center":"origin","count":5}),
+                vec![(json!({"count":20}), 19), (json!({"count":2}), 1)],
+            ),
+        ] {
+            let mut s = Session::default();
+            s.execute("sketch.create", &json!({"plane":"XY"}))?;
+            s.execute("sketch.circle.center", &json!({"center":[-50,0],"radius":2,"id":"seed"}))?;
+            let pattern = s.execute(command, &initial)?;
+            // An identical result must not draw the seed or any existing copies.
+            let unchanged = compute(&s, &[(command.into(), json!({"pattern":pattern["pattern"]}))], colors())?;
+            assert!(unchanged.sketches.is_empty());
+            for (mut edit, expected) in edits {
+                edit["pattern"] = pattern["pattern"].clone();
+                let built = compute(&s, &[(command.into(), edit)], colors())?;
+                assert_eq!(built.sketches.len(), 1, "{command}");
+                for preview in &built.sketches {
+                    assert_eq!(preview.curves.len(), expected, "{command}");
+                    assert_eq!(preview.points.len(), expected, "{command}");
+                    assert!(preview.curves.iter().all(|i| preview.sketch.sketch.curves.get(*i).is_some_and(|c| c.id != "seed")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sketch_preview_includes_changed_curve_shapes() -> Result<(), Box<dyn std::error::Error>> {
+        let mut s = Session::default();
+        s.execute("sketch.create", &json!({"plane":"XY"}))?;
+        s.execute("sketch.circle.center", &json!({"center":[0,0],"radius":2,"id":"circle"}))?;
+        s.execute("sketch.line", &json!({"points":[[10,0],[20,0]],"ids":["line"]}))?;
+        let before = s.model.state();
+        let mut after = before.as_ref().clone();
+        for sketch in &mut after.sketches {
+            let sketch = &mut std::sync::Arc::make_mut(sketch).sketch;
+            for curve in &mut sketch.curves {
+                match &mut curve.kind {
+                    solidcraft_engine::sketch::CurveKind::Circle { r, .. } => *r = 3.0,
+                    solidcraft_engine::sketch::CurveKind::Line { a, b } => std::mem::swap(a, b),
+                    _ => {}
+                }
+            }
+        }
+        let built = build(&before, &after, colors());
+        assert_eq!(built.sketches.len(), 1);
+        for preview in &built.sketches {
+            assert_eq!(preview.curves, vec![0, 1]);
+            assert!(preview.points.is_empty());
+        }
+        Ok(())
+    }
+
     /// Combine previews its result (cut, join or intersect between existing bodies) without an
     /// error, so its dialog's OK is enabled. Before, the preview also tried the command as a new
     /// body, which a combine has no form of, and always reported "operation must be join, cut or
@@ -1021,6 +1102,23 @@ mod tests {
             let built = compute(&s, &[cmd], colors()).unwrap_or_else(|e| panic!("{op}: {e}"));
             assert!(built.error.is_none(), "{op}: {:?}", built.error);
         }
+    }
+
+    /// A plate in its own component, stood up by its placement (an imported part set upright)
+    /// and edited with that component active: the extrusion's tool is drawn where the plate is
+    /// shown, on its top face, not at right angles to it in the component's own frame.
+    #[test]
+    fn a_tool_on_a_turned_component_previews_where_it_is_shown() {
+        let mut s = Session::default();
+        let made = s.execute("component.create", &json!({"name": "Plate", "grounded": false})).unwrap();
+        s.execute("solid.box", &json!({"length": 20, "width": 8, "height": 30, "corner": [0, 0, -30], "body_name": "Plate"})).unwrap();
+        s.execute("occurrence.move", &json!({"occurrence": made["occurrence"], "axis": [1, 0, 0], "angle": "90 deg"})).unwrap();
+        s.execute("component.activate", &json!({"component": made["component"], "occurrence": made["occurrence"], "path": [made["occurrence"]]}))
+            .unwrap();
+        // Shown lying flat: 20 × 30, 8 high. Its top face pulled up 10.
+        let cmd = ("solid.extrude".to_string(), json!({"face": [10, 15, 8], "face_body": "Plate", "distance": "10 mm", "operation": "join"}));
+        let b = compute_tool(&s, &[cmd], colors()).unwrap().bounds;
+        assert!((b.max.z - 18.0).abs() < 1e-6 && (b.max.y - 30.0).abs() < 1e-6, "on top, not at right angles: {b:?}");
     }
 
     fn count(bytes: &[u8], stride: usize, col: [u8; 4]) -> usize {
@@ -1093,17 +1191,75 @@ mod tests {
         assert!(SurfaceIndex::new(&Mesh::default()).is_none());
     }
 
-    /// Thousands of faces (a modeled thread's) are classified at once, not face by face against
-    /// every triangle: filleting beside a thread froze the app for minutes.
-    #[test]
-    fn many_faces_are_classified_quickly() {
-        let started = std::time::Instant::now();
-        let n = 120;
+    /// How long the faces of a sheet of `n × n` squares take to classify against an old sheet of
+    /// the same size. The meshes are built before the clock starts and the faces are collected
+    /// before it stops: only the classification, the work that used to freeze the app, is measured.
+    fn classify_sheet(n: usize) -> std::time::Duration {
         let (old, same, lifted) = (sheet(n, 0.0), sheet(n, 0.0), sheet(n, 5.0));
         let nf = n * n;
-        assert!(new_faces(&same, nf, &old).iter().all(|new| !new), "faces on the old surface are not new");
-        assert!(new_faces(&lifted, nf, &old).iter().all(|new| *new), "faces off the old surface are new");
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        let on = new_faces(&same, nf, &old);
+        let off = new_faces(&lifted, nf, &old);
+        let took = started.elapsed();
+        assert!(on.iter().all(|new| !new), "faces on the old surface are not new");
+        assert!(off.iter().all(|new| *new), "faces off the old surface are new");
+        took
+    }
+
+    /// Whether a job four times the size took at most about twice linear: `pair` times the small job,
+    /// then the big one. Linear is 4x, the quadratic that the bug cost 16x or more, so eight times the
+    /// small time is the limit. The load of the other test binaries can rise between the two runs, so a
+    /// pair that misses is measured again, up to three times. Load only ever slows a run, so each size
+    /// keeps its fastest time and the ratio is taken of those: a retry cannot pass a regression on a
+    /// small run that a spike happened to slow, once an earlier small run was fast.
+    ///
+    /// `slack` is the room the noise of a busy machine gets, on top of the ratio.
+    fn scales_linearly(mut pair: impl FnMut() -> (std::time::Duration, std::time::Duration), slack: std::time::Duration) -> Result<(), String> {
+        let limit = |small: f64| 8.0 * small + slack.as_secs_f64();
+        let (mut small, mut big) = (f64::INFINITY, f64::INFINITY);
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            let (s, b) = pair();
+            small = small.min(s.as_secs_f64());
+            big = big.min(b.as_secs_f64());
+            runs.push(format!("{s:?} then {b:?}"));
+            if big < limit(small) {
+                return Ok(());
+            }
+        }
+        Err(format!("{}; fastest {small:.3} s and {big:.3} s, limit {:.3} s", runs.join(", "), limit(small)))
+    }
+
+    #[test]
+    fn scales_linearly_keeps_each_sizes_fastest_run() {
+        let pairs = |p: Vec<(u64, u64)>| {
+            let mut p = p.into_iter().map(|(s, b)| (std::time::Duration::from_millis(s), std::time::Duration::from_millis(b)));
+            move || p.next().unwrap_or((std::time::Duration::from_secs(1), std::time::Duration::from_secs(1)))
+        };
+        let slack = std::time::Duration::from_millis(0);
+        // Linear: four times the work, four times the time.
+        assert!(scales_linearly(pairs(vec![(5, 20)]), slack).is_ok());
+        // A big run slowed by load, then a quiet pair.
+        assert!(scales_linearly(pairs(vec![(5, 80), (5, 20)]), slack).is_ok());
+        // A quadratic cost (16x) whose later small runs a spike slowed: the fast first one still counts.
+        let r = scales_linearly(pairs(vec![(5, 80), (15, 80), (15, 80)]), slack);
+        assert!(r.as_ref().is_err_and(|e| e.contains("fastest 0.005 s and 0.080 s, limit 0.040 s")), "{r:?}");
+    }
+
+    /// Thousands of faces (a modeled thread's) are classified at once, not face by face against
+    /// every triangle: filleting beside a thread froze the app for minutes.
+    ///
+    /// A ratio and not a limit: a test must not depend on wall-clock timing (CONTRIBUTING.md), the
+    /// machine is busy. 900 faces are classified, then 3 600, four times as many: linear is 4x, the
+    /// face-against-triangle cost 16x or more.
+    #[test]
+    fn many_faces_are_classified_quickly() {
+        /// The room the noise of a run on a busy machine gets, on top of the ratio: the 900 faces
+        /// take a fraction of a second, so this is the noise of one run and not a change of scale.
+        const SLACK: std::time::Duration = std::time::Duration::from_millis(20);
+        if let Err(missed) = scales_linearly(|| (classify_sheet(30), classify_sheet(60)), SLACK) {
+            panic!("the faces do not scale linearly: {missed}");
+        }
     }
 
     /// A fillet preview stands in for the body: the round face is new, the rest is kept, and the
@@ -1190,6 +1346,27 @@ mod tests {
         let whole = compute(&s, &cmds, colors()).unwrap();
         assert!(whole.error.as_deref().is_some_and(|e| e.contains("no body to cut")), "{:?}", whole.error);
         assert_eq!(whole.scene.xray.len(), tool.scene.xray.len());
+    }
+
+    /// #3085: a cut sketched in the root, where every body lives in a component, cuts every body
+    /// it meets (#1234). The preview said "there is no body to cut or intersect" all the same,
+    /// while the cut itself went through.
+    #[test]
+    fn a_cut_from_an_empty_root_is_not_refused_by_its_preview() {
+        let mut s = session_of(&[
+            ("component.create", json!({"name": "Part"})),
+            ("solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Block"})),
+            ("component.activate", json!({"component": "root"})),
+            ("sketch.create", json!({"plane": "XY"})),
+            ("sketch.rectangle.two_point", json!({"p0": [3, 3], "p1": [7, 7]})),
+            ("sketch.finish", json!({})),
+        ]);
+        let params = json!({"distance": 20, "operation": "cut"});
+        let cmds = vec![("solid.extrude".to_string(), params.clone())];
+        assert_eq!(extrusion_target_error(&s, &cmds, &s.model.state()), None);
+        s.execute("solid.extrude", &params).unwrap();
+        let volume = s.model.state().body("Block").map(|b| solidcraft_engine::kernel::measure(&b.body).unwrap().volume).unwrap_or(0.0);
+        assert!((volume - (1000.0 - 160.0)).abs() < 1e-6, "{volume}");
     }
 
     /// While an arrow is dragged the inputs change faster than a tool is built: a tool built

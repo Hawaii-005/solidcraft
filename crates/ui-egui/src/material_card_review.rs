@@ -1,4 +1,4 @@
-//! Candidate review through the existing validator, independent of assigned-card persistence.
+//! Candidate and saved-card review through the shared physical-material validator.
 use serde_json::{Value, json};
 use solidcraft_engine::doc::physical_material::{Family, MaterialCard, PropertyData, admit_card};
 
@@ -49,7 +49,7 @@ impl ReviewWindow {
 /// Open only through ui.start; executing the validator never opens a window.
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let Some(mut window) = app.material_card_review.take() else { return };
-    let viewport = crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect()));
+    let viewport = crate::agent_chat::tool_space(app, crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect())));
     if !viewport.is_finite() || !viewport.is_positive() {
         app.material_card_review = Some(window);
         return;
@@ -61,12 +61,13 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let docked = egui::pos2(side.anchor_x(viewport), top);
     let title = tr("ui.material_review.title");
     let moved = crate::frame::dock_offset(ctx, "material_card_review");
-    let anchor = crate::frame::offset_anchor(docked, moved, viewport, side);
+    let drag_bounds = crate::shell::tool_drag_rect(app, viewport);
+    let anchor = crate::frame::offset_anchor(docked, moved, drag_bounds, side);
     let panel = ui_kit::Panel::new(
         title,
         egui::Id::new("sc_material_card_review"),
         anchor,
-        viewport,
+        drag_bounds,
         side,
         ui_kit::Panel::feature_frame(ctx, app.ui.layout, side),
     )
@@ -78,7 +79,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         panel
     };
     let mut close = false;
-    panel.window().show(ctx, |ui| {
+    panel.window(ctx).show(ctx, |ui| {
         let (closed, action) = panel.feature(
             ui,
             ui_kit::FeatureOptions {
@@ -127,6 +128,30 @@ fn value(ui: &mut egui::Ui, field: &str, value: Option<String>, unit: &str) {
 
 fn numbers(ui: &mut egui::Ui, field: &str, values: &[f64], unit: &str) {
     value(ui, field, Some(values.iter().map(|v| format!("{v:e}")).collect::<Vec<_>>().join(", ")), unit);
+}
+
+/// Review a saved card inside the existing physical-material assignment panel.
+/// Reading properties never changes the assigned density or the candidate reviewer.
+pub(crate) fn show_saved_material(ui: &mut egui::Ui, doc: &solidcraft_engine::doc::Document, name: &str) {
+    value(ui, tr("Density"), doc.material_density(name).map(|density| density.to_string()), "g/cm³");
+    let Some(record) = doc.user_material(name).and_then(|material| material.physical_card.as_ref()) else {
+        value(ui, tr("ui.material_review.properties"), None, "");
+        return;
+    };
+    show_record(ui, record);
+}
+
+/// Read-only card preview shared by the saved-material panel and library picker.
+pub(crate) fn show_record(ui: &mut egui::Ui, record: &solidcraft_engine::doc::physical_material::ValidatedCard) {
+    ui_kit::section(ui, "saved_physical_card", tr("ui.material_review.properties"), false, |ui| {
+        let card = record.card();
+        match card.validate() {
+            Ok(report) => show_card(ui, card, &json!({"validation":report})),
+            Err(error) => {
+                ui_kit::text(ui, &error.to_string(), ui_kit::Text::Report("material_error", true));
+            }
+        }
+    });
 }
 
 fn show_card(ui: &mut egui::Ui, card: &MaterialCard, report: &Value) {
@@ -347,7 +372,7 @@ mod tests {
             "moisture_unit",
         ];
         for catalog in crate::i18n::LOCALES.iter().filter(|c| c.id != "en-GB") {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/locales").join(format!("{}.json", catalog.id));
+            let path = std::path::Path::new(env!("OUT_DIR")).join("locales").join(format!("{}.json", catalog.id));
             let messages: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
             for key in keys.into_iter().chain(KINDS) {
                 let key = format!("ui.material_review.{key}");

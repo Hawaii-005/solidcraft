@@ -43,6 +43,61 @@ fn plane(s: &Session, name: &str) -> Plane {
     construction_planes(s).into_iter().find(|p| p.1 == name).map(|p| p.2).unwrap_or_else(|| panic!("no plane {name}"))
 }
 
+#[test]
+fn renamed_construction_references_survive_edits_and_reopening() {
+    let mut s = Session::default();
+    run(&mut s, "construct.axis.two_planes", json!({"a": "XZ", "b": "YZ", "name": "Spine"}));
+    run(&mut s, "construct.plane.perpendicular", json!({"plane": "XZ", "line": {"axis": "Spine"}, "name": "Fence"}));
+    run(&mut s, "construct.point.three_planes", json!({"a": "XY", "b": "XZ", "c": "YZ", "name": "Pin"}));
+    run(&mut s, "construct.axis.two_points", json!({"a": {"construct_point": "Pin"}, "b": {"point": [30, 30, 30]}, "name": "Brace"}));
+    run(&mut s, "construct.point.vertex", json!({"point": {"construct_point": "Pin"}, "name": "Copy"}));
+    let before = (*s.doc).clone();
+    run(&mut s, "timeline.rename", json!({"feature": "Spine", "name": "Mast"}));
+    run(&mut s, "timeline.rename", json!({"feature": "Pin", "name": "Peg"}));
+    let fence = run(&mut s, "timeline.inspect", json!({"feature": "Fence"}));
+    assert_eq!(fence["definition"]["plane"]["line"]["name"], "Mast");
+    let brace = run(&mut s, "timeline.inspect", json!({"feature": "Brace"}));
+    assert_eq!(brace["definition"]["def"]["a"]["name"], "Peg");
+    let renamed = (*s.doc).clone();
+    for _ in 0..2 {
+        run(&mut s, "edit.undo", json!({}));
+    }
+    assert_eq!(*s.doc, before);
+    for _ in 0..2 {
+        run(&mut s, "edit.redo", json!({}));
+    }
+    assert_eq!(*s.doc, renamed);
+    run(&mut s, "timeline.edit", json!({"feature": "Mast", "set": {"def.b": {"type": "plane", "plane": {"type": "origin", "name": "XY"}}}}));
+    let saved = serde_json::to_vec(&*s.doc).unwrap();
+    let mut reopened = Session::new(serde_json::from_slice(&saved).unwrap());
+    reopened.refresh();
+    for session in [&s, &reopened] {
+        assert!(session.model.results.iter().all(|r| r.error.is_none()), "{:?}", session.model.results);
+        assert!(parallel(plane(session, "Fence").normal(), Vec3::Z));
+        assert!(parallel(axis(session, "Brace").1, Vec3::new(1.0, 1.0, 1.0)));
+        assert!(near(point(session, "Copy"), Vec3::ZERO));
+    }
+}
+
+#[test]
+fn renamed_hidden_axes_and_points_stay_hidden_through_undo_redo() {
+    let mut s = Session::default();
+    run(&mut s, "construct.axis.two_planes", json!({"a": "XZ", "b": "YZ", "name": "Spine"}));
+    run(&mut s, "construct.point.three_planes", json!({"a": "XY", "b": "XZ", "c": "YZ", "name": "Pin"}));
+    run(&mut s, "browser.visibility", json!({"items": ["Spine", "Pin", "XY"], "visible": false}));
+    for (old, new) in [("Spine", "Mast"), ("Pin", "Peg")] {
+        run(&mut s, "timeline.rename", json!({"feature": old, "name": new}));
+        assert!(!s.construction_visible(new));
+        assert!(!s.visibility.hidden_origin.iter().any(|n| n == old));
+        run(&mut s, "edit.undo", json!({}));
+        assert!(!s.construction_visible(old));
+        assert!(!s.visibility.hidden_origin.iter().any(|n| n == new));
+        run(&mut s, "edit.redo", json!({}));
+        assert!(!s.construction_visible(new));
+    }
+    assert!(!s.construction_visible("XY"));
+}
+
 /// The line through `o` along `d` contains `p`.
 fn on_line(o: Vec3, d: Vec3, p: Vec3) -> bool {
     let d = d.normalized().unwrap_or(Vec3::Z);
@@ -245,7 +300,7 @@ fn construction_on_a_3d_wire_ignores_its_sketch_plane_and_follows_edits() {
 #[test]
 fn plane_on_a_3d_wire_moves_with_its_component() {
     let mut s = Session::default();
-    run(&mut s, "component.create", json!({"name":"Part"}));
+    run(&mut s, "component.create", json!({"name":"Part","grounded":false}));
     let sketch = run(&mut s, "sketch.create", json!({"plane":"XY"}))["sketch"].as_u64().unwrap();
     run(&mut s, "sketch.options", json!({"sketch_3d":true}));
     let wire = run(&mut s, "sketch.line3d", json!({"points":[[0,0,10],[0,0,40]]}))["curves"][0].as_str().unwrap().to_string();
@@ -255,6 +310,25 @@ fn plane_on_a_3d_wire_moves_with_its_component() {
     let p = plane(&s, "Section");
     assert!(near(p.origin, Vec3::new(50.0, 20.0, 25.0)), "{p:?}");
     assert!(parallel(p.normal(), Vec3::Z));
+}
+
+/// Once a design has a component, the root's constructions are built in the model placed in the
+/// world. A plane through a construction axis of the root finds the axis there and follows it
+/// (it failed with "unknown construction `Ax`" on every evaluation after the component came).
+#[test]
+fn a_plane_through_a_construction_axis_follows_it_in_a_design_with_a_component() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "d", "expression": "10 mm"}));
+    run(&mut s, "construct.plane.offset", json!({"base": "XZ", "offset": "d", "name": "P1"}));
+    run(&mut s, "construct.plane.offset", json!({"base": "XY", "offset": "5 mm", "name": "P2"}));
+    run(&mut s, "construct.axis.two_planes", json!({"a": {"plane": "P1"}, "b": {"plane": "P2"}, "name": "Ax"}));
+    run(&mut s, "construct.plane.perpendicular", json!({"plane": "XY", "line": {"axis": "Ax"}, "name": "Q"}));
+    run(&mut s, "component.create", json!({"name": "Part"}));
+    run(&mut s, "parameters.change", json!({"name": "d", "expression": "30 mm"}));
+    let errors: Vec<String> = s.model.results.iter().filter_map(|r| r.error.clone()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let q = plane(&s, "Q");
+    assert!(on_plane(&q, Vec3::new(0.0, 30.0, 5.0)) && parallel(q.normal(), Vec3::Y), "{q:?}");
 }
 
 /// Built from model geometry, they follow when the model changes: the box gets taller.
@@ -311,7 +385,7 @@ fn a_plane_through_three_vertices_follows_them() {
 #[test]
 fn construction_lives_in_the_component_frame() {
     let mut s = Session::default();
-    run(&mut s, "component.create", json!({"name": "Part"}));
+    run(&mut s, "component.create", json!({"name": "Part", "grounded": false}));
     run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 10, "body_name": "Pin"}));
     run(&mut s, "occurrence.move", json!({"occurrence": "Part:1", "translate": [50, 0, 0]}));
     run(&mut s, "construct.axis.through_cylinder", json!({"face": {"face": [55, 0, 5]}, "name": "PinAxis"}));
@@ -449,4 +523,42 @@ fn ambiguity_error_names_the_other_origin_alias() {
         let inspected = run(&mut s, "sketch.inspect", json!({}));
         assert_eq!(inspected["plane"]["origin"], json!([0.0, 0.0, 0.0]));
     }
+}
+
+/// An offset plane through a point instead of at a distance: parallel to its base, through a
+/// vertex, a sketch point or a construction point, and moving with the point.
+#[test]
+fn offset_plane_through_a_point_follows_the_point() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "h", "expression": "20 mm"}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": "h", "body_name": "Box"}));
+    // Through the box's top corner, parallel to XY: the top face's plane.
+    run(&mut s, "construct.plane.offset", json!({"base": "XY", "through": {"vertex": [40, 30, 20]}, "name": "Lid"}));
+    let lid = plane(&s, "Lid");
+    assert!(parallel(lid.normal(), Vec3::Z) && near(lid.origin, Vec3::new(0.0, 0.0, 20.0)), "{lid:?}");
+    // Through a point of a sketch on XZ, parallel to the box's side face at x = 40.
+    let sketch = run(&mut s, "sketch.create", json!({"plane": "XZ"}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.point", json!({"point": [70, 5], "id": "mark"}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "construct.plane.offset", json!({"base": {"face": [40, 15, 10]}, "through": {"sketch": sketch, "point": "mark"}, "name": "Side"}));
+    let side = plane(&s, "Side");
+    assert!(parallel(side.normal(), Vec3::X) && on_plane(&side, Vec3::new(70.0, 9.0, 3.0)), "{side:?}");
+    // Through a construction point, parallel to another construction plane.
+    run(&mut s, "construct.point.vertex", json!({"point": {"vertex": [0, 30, 20]}, "name": "Corner"}));
+    run(&mut s, "construct.plane.offset", json!({"base": "XZ", "offset": 5, "name": "Fore"}));
+    run(&mut s, "construct.plane.offset", json!({"base": "Fore", "through": {"construct_point": "Corner"}, "name": "Back"}));
+    let back = plane(&s, "Back");
+    assert!(parallel(back.normal(), Vec3::Y) && on_plane(&back, Vec3::new(3.0, 30.0, 7.0)), "{back:?}");
+    // The box gets taller: the planes through its corners follow.
+    run(&mut s, "parameters.change", json!({"name": "h", "expression": "50 mm"}));
+    assert!(on_plane(&plane(&s, "Lid"), Vec3::new(1.0, 2.0, 50.0)), "{:?}", plane(&s, "Lid"));
+    assert!(on_plane(&plane(&s, "Back"), Vec3::new(1.0, 30.0, 2.0)), "{:?}", plane(&s, "Back"));
+    // Saved and opened again, the planes come back where they were.
+    let restored = solidcraft_doc::format::read(&s.doc.to_json()).unwrap();
+    let mut cold = Session { doc: restored.into(), ..Default::default() };
+    cold.refresh();
+    assert!(near(plane(&cold, "Lid").origin, plane(&s, "Lid").origin));
+    assert!(near(plane(&cold, "Side").origin, plane(&s, "Side").origin));
+    // A distance and a point at once is refused.
+    assert!(s.execute("construct.plane.offset", &json!({"base": "XY", "offset": 5, "through": {"vertex": [0, 0, 0]}})).is_err());
 }

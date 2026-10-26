@@ -1,16 +1,16 @@
 //! Sketch modify tools: trim, extend, break, fillet, chamfer, offset, mirror, circular and
 //! rectangular patterns, move/copy and scale.
 
-use std::f64::consts::TAU;
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use serde_json::{Value, json};
 use solidcraft_doc::ProfileSel;
 use solidcraft_geom::Vec2;
-use solidcraft_sketch::{ConstraintKind, Curve, CurveKind, Shape, Sketch, intersections};
+use solidcraft_sketch::{ConstraintKind, Curve, CurveKind, Shape, Sketch, intersections, intersections_within};
 
 use super::sketch::{add_c, edit, ids_of, solve_current};
 use super::{CommandSpec, in_sketch};
-use crate::params::{bad, bool_, expr, num, req_vec2, str_, string_list, vec2, vec2_list};
+use crate::params::{bad, bool_, expr, num, req_expr, req_vec2, str_, string_list, vec2, vec2_list};
 use crate::{Result, Session};
 
 #[path = "sketch_pattern.rs"]
@@ -70,7 +70,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "MODIFY")
         .icon("extend")
         .enabled(in_sketch)
-        .params("curve: id, at: [x,y] near the end to extend (to the nearest curve)"),
+        .params("curve: id, at: [x,y] near the end to extend (a line runs on to the nearest curve, or the previewed reach when nothing is in the way; an arc grows along its circle and closes into a whole circle when nothing stops it)"),
     CommandSpec::new("sketch.break", "Break", break_cmd)
         .at("SKETCH", "MODIFY")
         .icon("sketch_break")
@@ -85,7 +85,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "MODIFY")
         .icon("sketch_move")
         .enabled(in_sketch)
-        .params(concat!("entities: [ids], translate?: [dx,dy], angle?: deg, center?: [x,y], copy?: bool; picking a text outline or linked point transforms its whole text source once, and copies remain editable text", created_doc!())),
+        .params(concat!("entities: [ids], translate?: [dx,dy], angle?: deg, center?: [x,y], copy?: bool, rotate_constraints?: bool (default true; false keeps constraints unchanged); a rotation turns the constraints tied to the sketch axes when all their geometry moves (horizontal and vertical relations and dimensions swap at odd quarter turns and stay at half turns, line angles turn with the line) and removes the horizontal and vertical ones that cannot hold at other angles; picking a text outline or linked point transforms its whole text source once, and copies remain editable text", created_doc!())),
     CommandSpec::new("sketch.mirror", "Mirror", mirror)
         .at("SKETCH", "PATTERN")
         .icon("sketch_mirror")
@@ -95,12 +95,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "PATTERN")
         .icon("sketch_circ_pattern")
         .enabled(in_sketch)
-        .params(concat!("entities: [ids], center: [x,y] or point ref, count: 2…500, angle?: total deg (default 360); alignment?: left|center|right (default right); reversed?: bool (default false). Quantity includes the original. Center balances copies around it; reversed flips the direction and extra side for even totals. Partial arcs span angle with angle/(count-1) spacing; full turns use angle/count. Adds associative pattern constraints; a coordinate center creates a constrainable point. Returns pattern and center ids. pattern?: existing pattern id to edit (omitted values retained; surviving instance ids retained)", created_doc!())),
+        .params(concat!("entities: [ids], center: [x,y] or point ref, count: 2…500 (number or unitless expression, retained through edits), angle?: total deg, number or expression (default 360); alignment?: left|center|right (default right); reversed?: bool (default false). Quantity includes the original. Center balances copies around it; reversed flips the direction and extra side for even totals. Partial arcs span angle with angle/(count-1) spacing; full turns use angle/count. Adds associative pattern constraints; a coordinate center creates a constrainable point. Returns pattern and center ids. pattern?: existing pattern id to edit (omitted values retained; surviving instance ids retained)", created_doc!())),
     CommandSpec::new("sketch.pattern.rectangular", "Rectangular Pattern", pattern_rect)
         .at("SKETCH", "PATTERN")
         .icon("sketch_rect_pattern")
         .enabled(in_sketch)
-        .params(concat!("entities: [ids], count, spacing; count2?, spacing2?; direction?, direction2?: sketch line ids (live references); dir?, dir2?: [x,y] vectors (defaults: sketch x, perpendicular to direction 1); alignment?, alignment2?: left|center|right (default right). Signed spacings reverse each direction. reversed?, reversed2?: bool (default false); reverses placement and the extra side of even centered totals. Quantities include the original. Adds associative pattern constraints. Returns pattern id. pattern?: existing pattern id to edit (omitted values retained; surviving instance ids retained)", created_doc!())),
+        .params(concat!("entities: [ids], count, spacing; count2?, spacing2?; counts: positive integer numbers or expressions, at most 500 instances total; spacings: length numbers or expressions; direction?, direction2?: sketch line ids (live references); dir?, dir2?: [x,y] vectors (defaults: sketch x, perpendicular to direction 1); alignment?, alignment2?: left|center|right (default right). Signed spacings reverse each direction. reversed?, reversed2?: bool (default false); reverses placement and the extra side of even centered totals. Quantities include the original. Adds associative pattern constraints. Returns pattern id. pattern?: existing pattern id to edit (omitted values retained; surviving instance ids retained)", created_doc!())),
 ];
 
 const TOL: f64 = 1e-7;
@@ -144,7 +144,10 @@ fn cut_points(sk: &Sketch, ci: usize) -> Vec<(f64, Vec2, usize)> {
             continue;
         }
         let Some(other) = sk.shape(oi) else { continue };
-        let mut pts = intersections(&sh, &other);
+        // A line or circle the solver made tangent to a circle touches it within rounding noise,
+        // and the exact roots miss it whenever the noise falls outside: the touch counts as a
+        // cut, as profile detection counts it (#588), or trim deletes the whole curve (#5074).
+        let mut pts = intersections_within(&sh, &other, TOL * 10.0);
         // Overlapping or touching ends that the analytic intersection misses (parallel lines).
         if let Shape::Line { a, b } = other {
             pts.extend([a, b]);
@@ -179,10 +182,7 @@ fn cut_points(sk: &Sketch, ci: usize) -> Vec<(f64, Vec2, usize)> {
 fn pin(sk: &mut Sketch, p: usize, cutter: usize) -> Result<()> {
     let at = sk.point(p).unwrap_or_default();
     // An end point of the cutter there: coincident with it; otherwise on the curve.
-    let ends: Vec<usize> = match sk.curves.get(cutter).map(|c| c.kind.clone()) {
-        Some(CurveKind::Line { a, b }) | Some(CurveKind::Arc { a, b, .. }) => vec![a, b],
-        _ => Vec::new(),
-    };
+    let ends: Vec<usize> = sk.curves.get(cutter).and_then(|c| c.kind.ends()).map(|(a, b)| vec![a, b]).unwrap_or_default();
     if let Some(e) = ends.into_iter().find(|e| sk.point(*e).is_some_and(|q| q.dist(at) < TOL * 10.0)) {
         if e != p {
             add_c(sk, ConstraintKind::Coincident { p, q: e })?;
@@ -345,6 +345,22 @@ pub fn trim_piece(sk: &Sketch, curve: &str, at: Vec2) -> Option<Vec<Vec2>> {
     Some((0..=n).map(|i| sh.point(a + (b - a) * f64::from(i) / f64::from(n))).collect())
 }
 
+/// Trim and extend refuse an offset's output: its ends are recomputed from its source curves on
+/// every solve, so a new end there would be pulled straight back (the trim reported success and
+/// left the curve whole).
+fn refuse_offset_ends(sk: &Sketch, ci: usize, what: &str, cmd: &str) -> Result<()> {
+    match sk.curves.get(ci).filter(|c| sk.offset_distance(&c.id).is_some()) {
+        Some(c) => Err(bad(
+            cmd,
+            format!(
+                "`{}` is an offset, and its ends follow its source curves: {what} the source curves instead, or break the offset association first",
+                c.id
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 fn trim(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.trim";
     let at = req_vec2(cmd, p, "at")?;
@@ -383,6 +399,7 @@ fn remove_piece(sk: &mut Sketch, ci: usize, at: Vec2, cmd: &str) -> Result<(Valu
         sk.remove_curves(&[ci]);
         return Ok((json!({"deleted": id}), removed));
     }
+    refuse_offset_ends(sk, ci, "trim", cmd)?;
     release_extent(sk, ci);
     let ts: Vec<f64> = cuts.iter().map(|c| c.0).collect();
     let (pieces, pts) = split_at(sk, ci, &ts)?;
@@ -581,6 +598,356 @@ fn break_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"curves": out, "sketch": info}))
 }
 
+/// How far a line with nothing in its way extends: the reach its preview draws, and the length
+/// `sketch.extend` adds, so clicking a preview that overhangs its target adds that line instead
+/// of nothing.
+const EXTEND_REACH: f64 = 50.0;
+
+/// One end of a line growing along its own support, and what stops it.
+///
+/// A line extends past either of its ends, running on along its own straight support until the
+/// first geometry in the way. `sketch.extend` and its preview both take this aim, so the preview
+/// draws the line the click adds, never one the command refuses.
+#[derive(Clone, Copy, Debug)]
+struct LineAim {
+    /// The end that grows.
+    end: usize,
+    /// The point the extension stops at: the first geometry on the way, or the reach past the end
+    /// when nothing is in the way.
+    hit: Vec2,
+    /// The curve that stops it there, and the stop as the sketch's own point when the sketch
+    /// already has one there.
+    cutter: Option<usize>,
+    stop: Option<usize>,
+}
+
+/// The first geometry a line meets when it grows past the end of `ci` nearest `at`, or the reach
+/// past that end when nothing is in the way. Two curves stopping it equally far are one stop: the
+/// first of them is taken.
+fn line_aim(sk: &Sketch, ci: usize, at: Vec2) -> Result<Option<LineAim>> {
+    let cmd = "sketch.extend";
+    // An infinite line has no end to grow: moving either of its points moves the whole line.
+    let Some(curve) = sk.curves.get(ci).filter(|c| !c.infinite) else { return Ok(None) };
+    let CurveKind::Line { a: pa, b: pb } = curve.kind else { return Ok(None) };
+    let sh = sk.shape(ci).ok_or_else(|| bad(cmd, "curve"))?;
+    let (qa, qb) = (sk.point(pa).unwrap_or_default(), sk.point(pb).unwrap_or_default());
+    let at_b = at.dist(qb) <= at.dist(qa);
+    let (end, end_pt) = if at_b { (pb, qb) } else { (pa, qa) };
+    let dir = (end_pt - if at_b { qa } else { qb }).normalized().ok_or_else(|| bad(cmd, "cannot determine extension direction"))?;
+
+    // A neighbour running on the same way as the extension has it nowhere to go.
+    for (oi, c) in sk.curves.iter().enumerate() {
+        if oi == ci || !uses(c, end) {
+            continue;
+        }
+        // Arcs do not block a line: the line runs past the point they share.
+        if let CurveKind::Line { a: na, b: nb } = c.kind {
+            let other_idx = if na == end { nb } else { na };
+            let v = sk.point(other_idx).unwrap_or_default() - end_pt;
+            if v.cross(dir).abs() < 1e-6 && v.dot(dir) > 1e-6 {
+                return Err(bad(cmd, "that end is connected to other geometry"));
+            }
+        }
+    }
+
+    // Candidate stops on the line's unbounded support beyond the chosen end.
+    let length = qa.dist(qb);
+    let mut best: Option<(f64, Vec2, usize)> = None;
+    let mut budget = 1_000_000usize;
+    let mut segment_count = 0usize;
+    for (oi, other) in sk.curves.iter().enumerate() {
+        if oi == ci {
+            continue;
+        }
+        let mut pieces = sk.exact_segs(oi).unwrap_or_else(|| sk.segs(oi));
+        // An infinite line (#1359) is a boundary along its whole line.
+        if other.infinite {
+            pieces = pieces.iter().map(|s| support::endless(s, sh.point(sh.param(at)))).collect();
+        }
+        segment_count += pieces.len();
+        if segment_count > 16_384 {
+            return Err(bad(cmd, "too many exact curve pieces to extend safely"));
+        }
+        for piece in &pieces {
+            for q in support::hits(&sh, piece, &mut budget)? {
+                let t = sh.param(q);
+                let travel = if at_b { (t - 1.0) * length } else { -t * length };
+                if travel <= TOL * 10.0 {
+                    continue;
+                }
+                // Equally far stops are both on the way: the first one found is the stop.
+                if best.is_none_or(|x| travel < x.0 - TOL) {
+                    best = Some((travel, q, oi));
+                }
+            }
+        }
+    }
+
+    let (hit, cutter, stop) = match best {
+        Some((_, q, oi)) => (q, Some(oi), stop_point(sk, ci, q)),
+        None => (end_pt + dir * EXTEND_REACH, None, None),
+    };
+    Ok(Some(LineAim { end, hit, cutter, stop }))
+}
+
+/// Preview the extend operation without modifying the sketch: the point the line past the end
+/// nearest `hover_pos` reaches, from the same search `sketch.extend` makes. `None` when the curve
+/// is not a line to extend, when it is an infinite line, or when the extension has nowhere to go
+/// (the end is connected to a line running on from it).
+pub fn extend_preview(sk: &solidcraft_sketch::Sketch, ci: usize, hover_pos: Vec2) -> Option<Vec2> {
+    line_aim(sk, ci, hover_pos).ok().flatten().map(|aim| aim.hit)
+}
+
+/// One end of an arc growing along the arc's own circle, as a new arc, and what stops it.
+///
+/// Arcs extend both ways: past their `b` end counter-clockwise and past their `a` end clockwise,
+/// each as far as the first geometry on that path. The path ends at the arc's far end, where the
+/// arc itself begins again, so an extension never runs over the arc it grows from; reaching it
+/// closes the gap between the two ends.
+#[derive(Clone, Copy, Debug)]
+struct ArcAim {
+    /// The arc's end that grows (a point index), and the far end the extension must not pass.
+    end: usize,
+    far: usize,
+    /// Whether the growing end is the arc's `b` end: `b` grows counter-clockwise, `a` clockwise.
+    at_b: bool,
+    /// The arc's circle: the centre itself and the radius.
+    centre: Vec2,
+    radius: f64,
+    /// The angle the growing end sits at, and how far round the circle the extension travels.
+    end_angle: f64,
+    travel: f64,
+    /// The point the extension stops at, and the curve that stops it there.
+    hit: Vec2,
+    cutter: usize,
+}
+
+impl ArcAim {
+    /// The extension as points along the circle, the growing end first.
+    fn points(&self) -> Vec<Vec2> {
+        const N: usize = 64;
+        let dir = if self.at_b { 1.0 } else { -1.0 };
+        (0..=N).map(|i| self.centre + Vec2::from_angle(self.end_angle + dir * self.travel * i as f64 / N as f64) * self.radius).collect()
+    }
+}
+
+/// The first geometry an arc meets when it grows from the end of `ci` nearest `at`. Both ends
+/// grow: past `b` counter-clockwise, past `a` clockwise, and only as far as the nearest curve on
+/// that path stops them. With nothing in the way the extension runs on to the arc's own far end,
+/// closing the arc into a full circle. Two curves stopping it equally far are one stop: the first
+/// is taken.
+fn arc_aim(sk: &Sketch, ci: usize, at: Vec2, cmd: &str) -> Result<Option<ArcAim>> {
+    let Some(CurveKind::Arc { a, b, .. }) = sk.curves.get(ci).map(|c| c.kind.clone()) else { return Ok(None) };
+    let Some(Shape::Round { c: centre, r, start, sweep }) = sk.shape(ci) else { return Ok(None) };
+    if !(r.is_finite() && r > 0.0) || !start.is_finite() || !sweep.is_finite() {
+        return Err(bad(cmd, "the arc's circle is not usable"));
+    }
+    // A whole circle has no end to grow from.
+    if sweep >= TAU - 1e-12 {
+        return Ok(None);
+    }
+    let (Some(qa), Some(qb)) = (sk.point(a), sk.point(b)) else { return Ok(None) };
+    let at_b = at.dist(qb) <= at.dist(qa);
+    let (end, far, end_angle) = if at_b { (b, a, start + sweep) } else { (a, b, start) };
+    // The extension runs from the growing end round to the far end, where the arc itself begins
+    // again: it may stop on it (closing the gap between the two ends) but not pass it.
+    let reach = TAU - sweep;
+    let angle_tol = TOL / r;
+    let far_tol = TOL * 10.0 / r;
+    let circle = Shape::Round { c: centre, r, start: 0.0, sweep: TAU };
+    let mut best: Option<(f64, Vec2, usize)> = None;
+    let mut budget = 1_000_000usize;
+    let mut segment_count = 0usize;
+    for (oi, curve) in sk.curves.iter().enumerate() {
+        if oi == ci {
+            continue;
+        }
+        // A circle passes over arcs lying on it, so no intersection reports them: an arc on the
+        // same circle stops the extension where it begins along the way, and the gap ends there.
+        if matches!(curve.kind, CurveKind::Arc { .. })
+            && let Some(Shape::Round { c: oc, r: or, start: os, sweep: ow }) = sk.shape(oi)
+            && oc.dist(centre) <= TOL * 10.0
+            && (or - r).abs() <= TOL * 10.0
+        {
+            if !(os.is_finite() && ow.is_finite() && ow > 0.0) {
+                return Err(bad(cmd, "another arc on the same circle is not usable"));
+            }
+            let (entry, travel) = if at_b { (os, (os - end_angle).rem_euclid(TAU)) } else { (os + ow, (end_angle - os - ow).rem_euclid(TAU)) };
+            // Lying on that arc already, or on the point it goes on from, leaves no gap to fill:
+            // the extension could only double the arc that is there.
+            let into = if at_b { (end_angle - os).rem_euclid(TAU) } else { (os + ow - end_angle).rem_euclid(TAU) };
+            if travel <= angle_tol || into <= angle_tol || into < ow - angle_tol {
+                return Err(bad(cmd, "the arc already continues into another arc on its circle"));
+            }
+            if travel > reach + far_tol {
+                continue;
+            }
+            let entry = centre + Vec2::from_angle(entry) * r;
+            keep_stop(&mut best, travel, entry, oi, angle_tol);
+            continue;
+        }
+        let mut pieces = sk.exact_segs(oi).unwrap_or_else(|| sk.segs(oi));
+        // An infinite line (#1359) is a boundary along its whole line.
+        if curve.infinite {
+            pieces = pieces.iter().map(|s| support::endless(s, centre)).collect();
+        }
+        segment_count += pieces.len();
+        if segment_count > 16_384 {
+            return Err(bad(cmd, "too many exact curve pieces to extend safely"));
+        }
+        for piece in &pieces {
+            for q in support::hits(&circle, piece, &mut budget)? {
+                let travel = if at_b { (q - centre).angle() - end_angle } else { end_angle - (q - centre).angle() }.rem_euclid(TAU);
+                // The growing end itself, or past the arc's far end (where the extension would
+                // run over the arc).
+                if travel <= angle_tol || travel > reach + far_tol {
+                    continue;
+                }
+                keep_stop(&mut best, travel, q, oi, angle_tol);
+            }
+        }
+    }
+    // Nothing stops the arc on its way round: it grows all the way to its own far end, closing
+    // the gap between its ends into a full circle.
+    let far_pt = if at_b { qa } else { qb };
+    let (travel, hit, cutter) = best.unwrap_or((reach, far_pt, ci));
+    Ok(Some(ArcAim { end, far, at_b, centre, radius: r, end_angle, travel, hit, cutter }))
+}
+
+/// Keep the stop the nearest of the candidates. Two curves stopping the extension equally far are
+/// both on the way, so the first one found is taken instead of refusing to choose.
+fn keep_stop(best: &mut Option<(f64, Vec2, usize)>, travel: f64, q: Vec2, oi: usize, angle_tol: f64) {
+    if best.is_none_or(|x| travel < x.0 - angle_tol) {
+        *best = Some((travel, q, oi));
+    }
+}
+
+/// The point the extension ends at when the sketch already has one there: the arc's own far end
+/// (closing the gap between its two ends), or the end of another curve the extension runs into —
+/// an arc on the same circle across the gap, or any other curve crossing its path. Joining that
+/// point keeps the geometry one chain instead of laying a second point over a point that is
+/// there, so a circle met exactly where another curve already ends closes onto that curve.
+/// `None` when the stop needs a new point.
+fn arc_stop(sk: &Sketch, ci: usize, aim: &ArcAim) -> Option<usize> {
+    let at_hit = |p: usize| sk.point(p).is_some_and(|pt| pt.dist(aim.hit) <= TOL * 10.0);
+    if at_hit(aim.far) {
+        return Some(aim.far);
+    }
+    sk.curves.iter().enumerate().filter(|(i, _)| *i != ci).find_map(|(_, c)| {
+        let (a, b) = c.kind.ends()?;
+        [a, b].into_iter().find(|p| at_hit(*p))
+    })
+}
+
+/// Add the arc an extension needs: a new arc on the same circle as `ci`, from the growing end to
+/// the stop, sweeping the way the extension went. The arc being extended keeps its geometry and
+/// its constraints; the extension is new geometry.
+fn add_arc_extension(sk: &mut Sketch, ci: usize, aim: &ArcAim, stop: Option<usize>) -> Result<String> {
+    let centre = match sk.curves.get(ci).map(|c| c.kind.clone()) {
+        Some(CurveKind::Arc { c, .. }) => c,
+        _ => return Err(bad("sketch.extend", "only arcs extend along their circle")),
+    };
+    let stop = match stop {
+        Some(p) => p,
+        None => sk.add_point(aim.hit, None)?,
+    };
+    // `CurveKind::Arc` always sweeps counter-clockwise from `a` to `b`: growing `b` runs from the
+    // arc's end to the stop, growing `a` runs the other way round, from the stop back to the end.
+    let kind = if aim.at_b { CurveKind::Arc { c: centre, a: aim.end, b: stop } } else { CurveKind::Arc { c: centre, a: stop, b: aim.end } };
+    sk.add_curve(kind, None)?;
+    Ok(sk.points.get(stop).map(|x| x.id.clone()).unwrap_or_default())
+}
+
+/// The point the extension stops at when the sketch already has one there: an end of another
+/// curve at the hit. Joining that point keeps the extension attached to the geometry that is
+/// there instead of laying a second point over it. `None` when the stop needs a new point.
+fn stop_point(sk: &Sketch, ci: usize, q: Vec2) -> Option<usize> {
+    sk.curves.iter().enumerate().filter(|(i, _)| *i != ci).find_map(|(_, c)| {
+        let (a, b) = c.kind.ends()?;
+        [a, b].into_iter().find(|p| sk.point(*p).is_some_and(|pt| pt.dist(q) <= TOL * 10.0))
+    })
+}
+
+/// Add the line an extension needs, from the growing end to the stop: the sketch's own point
+/// when the stop already is one, a new point otherwise.
+fn add_line_extension(sk: &mut Sketch, end: usize, q: Vec2, stop: Option<usize>) -> Result<String> {
+    let b = match stop {
+        Some(p) => p,
+        None => sk.add_point(q, None)?,
+    };
+    sk.add_curve(CurveKind::Line { a: end, b }, None)?;
+    Ok(sk.points.get(b).map(|x| x.id.clone()).unwrap_or_default())
+}
+
+/// Whether the growing end of an arc already carries geometry: another curve starts there, or a
+/// constraint holds the point. Such an end keeps its place, so the extension has to be new
+/// geometry.
+fn arc_end_held(sk: &Sketch, ci: usize, end: usize) -> bool {
+    if sk.curves.iter().enumerate().any(|(i, c)| i != ci && uses(c, end)) {
+        return true;
+    }
+    sk.constraints.iter().any(|c| {
+        use solidcraft_sketch::ConstraintKind::*;
+        match c.kind {
+            Coincident { p, q } => p == end || q == end,
+            Fix { p } | PointOnCurve { p, .. } | Midpoint { p, .. } => p == end,
+            HorizontalPoints { p, q } | VerticalPoints { p, q } | Symmetric { p, q, .. } => p == end || q == end,
+            _ => false,
+        }
+    })
+}
+
+/// Extend an arc, in either direction, up to the first geometry on the way. A free end grows in
+/// place, so the sketch keeps one arc; an end that already carries geometry, or a stop where the
+/// sketch already has a point, is joined by a new arc instead.
+fn extend_arc(sk: &mut Sketch, ci: usize, at: Vec2) -> Result<String> {
+    let cmd = "sketch.extend";
+    let Some(aim) = arc_aim(sk, ci, at, cmd)? else {
+        return Err(bad(cmd, "an arc that is already a whole circle has no end to extend"));
+    };
+    let stop = arc_stop(sk, ci, &aim);
+    // The arc's own far end is where the arc begins again: moving the end onto it would leave a
+    // whole circle, so the gap is filled by a new arc joining that end.
+    if stop.is_some_and(|p| p == aim.far) || arc_end_held(sk, ci, aim.end) {
+        return add_arc_extension(sk, ci, &aim, stop);
+    }
+    // A free end moves along instead, if the solver lets it.
+    let original = sk.point(aim.end).unwrap_or_default();
+    if let Some(pt) = sk.points.get_mut(aim.end) {
+        pt.pos = aim.hit;
+    }
+    let before = sk.points.iter().map(|p| p.pos).collect::<Vec<_>>();
+    let hold = solidcraft_sketch::Hold { points: (0..sk.points.len()).filter(|i| *i != aim.end).collect(), radii: (0..sk.curves.len()).collect() };
+    let moved = solidcraft_sketch::solve_with(sk, &hold, None, solidcraft_sketch::Analysis::StatusOnly, None).ok()
+        && sk.point(aim.end).is_some_and(|point| point.dist(aim.hit) <= TOL)
+        && sk.points.iter().enumerate().all(|(i, point)| i == aim.end || point.pos.dist(before[i]) <= TOL);
+    if !moved {
+        // The solve could not put the end where it belongs: the extension is a new arc instead.
+        if let Some(pt) = sk.points.get_mut(aim.end) {
+            pt.pos = original;
+        }
+        return add_arc_extension(sk, ci, &aim, stop);
+    }
+    // Held to the point that is already there or to what else stopped it, the end stays on the
+    // geometry it reached.
+    if let Some(stop) = stop {
+        if stop != aim.end {
+            add_c(sk, ConstraintKind::Coincident { p: aim.end, q: stop })?;
+        }
+    } else {
+        pin(sk, aim.end, aim.cutter)?;
+    }
+    Ok(sk.points.get(aim.end).map(|x| x.id.clone()).unwrap_or_default())
+}
+
+/// The arc `sketch.extend` would add from the end of `ci` nearest `hover_pos`, for the viewport to
+/// show before the click: the new arc as points, the growing end first. `None` when the arc cannot
+/// grow (it is already a whole circle).
+pub fn extend_arc_preview(sk: &solidcraft_sketch::Sketch, ci: usize, hover_pos: Vec2) -> Option<Vec<Vec2>> {
+    let aim = arc_aim(sk, ci, hover_pos, "sketch.extend").ok().flatten()?;
+    Some(aim.points())
+}
+
 fn extend(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.extend";
     let at = req_vec2(cmd, p, "at")?;
@@ -590,86 +957,88 @@ fn extend(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad(cmd, rep.failure(|_| "solve the existing sketch constraints before extending".into())));
         }
         let ci = curve_arg(sk, p, cmd)?;
-        let sh = sk.shape(ci).ok_or_else(|| bad(cmd, "curve"))?;
-        let (pa, pb) = match sk.curves.get(ci).map(|c| c.kind.clone()) {
-            Some(CurveKind::Line { a, b }) | Some(CurveKind::Arc { a, b, .. }) => (a, b),
-            _ => return Err(bad(cmd, "only lines and arcs can be extended")),
+        refuse_offset_ends(sk, ci, "extend", cmd)?;
+        // An infinite line already reaches across the view: moving one of its two points would
+        // move the whole line instead of extending it.
+        if sk.curves.get(ci).is_some_and(|c| c.infinite) {
+            return Err(bad(cmd, "an infinite line has no end to extend: make it a normal line first"));
+        }
+        // An arc grows along its own circle, either way round: in place when its end is free, as
+        // a new arc when the end already carries geometry.
+        if matches!(sk.curves.get(ci).map(|c| &c.kind), Some(CurveKind::Arc { .. })) {
+            return extend_arc(sk, ci, at);
+        }
+        // The line grows past one end, out to the first geometry on the way, or the reach the
+        // preview draws when nothing is in the way. A stop where the sketch already has a point
+        // (another curve's end) joins that point instead of doubling it.
+        let Some(aim) = line_aim(sk, ci, at)? else {
+            return Err(bad(cmd, "only lines and arcs can be extended"));
         };
-        let (qa, qb) = (sk.point(pa).unwrap_or_default(), sk.point(pb).unwrap_or_default());
-        let at_b = at.dist(qb) <= at.dist(qa);
-        let end = if at_b { pb } else { pa };
-        let shared = sk.curves.iter().enumerate().filter(|(i, c)| *i != ci && uses(c, end)).count();
-        if shared > 0 || sk.points.get(end).is_some_and(|q| q.fixed) {
-            return Err(bad(cmd, "that end is connected to other geometry"));
+        let end = aim.end;
+        let (q, cutter, stop) = (aim.hit, aim.cutter, aim.stop);
+        let neighbors: Vec<_> = sk.curves.iter().enumerate().filter(|(i, c)| *i != ci && uses(c, end)).collect();
+
+        // The end joined to other geometry stays where it is: add a line from it.
+        if !neighbors.is_empty() {
+            return add_line_extension(sk, end, q, stop);
         }
-        // Candidate hits on the unbounded curve beyond the chosen end.
-        let unbounded = match sh {
-            Shape::Line { .. } => sh,
-            Shape::Round { c, r, start, .. } => Shape::Round { c, r, start, sweep: TAU },
+
+        // An end held by a constraint, or lying on a circle or arc, stays where it is too: the
+        // extension is a new line from it.
+        let end_is_held = sk.constraints.iter().any(|c| {
+            use solidcraft_sketch::ConstraintKind::*;
+            match c.kind {
+                Coincident { p, q } => p == end || q == end,
+                Fix { p } => p == end,
+                PointOnCurve { p, .. } => p == end,
+                Midpoint { p, .. } => p == end,
+                HorizontalPoints { p, q } | VerticalPoints { p, q } => p == end || q == end,
+                Symmetric { p, q, .. } => p == end || q == end,
+                _ => false,
+            }
+        }) || {
+            // Geometric check: does the endpoint lie on any circle or arc?
+            let ep = sk.point(end).unwrap_or_default();
+            sk.curves.iter().any(|curve| match curve.kind {
+                CurveKind::Circle { c, r } => (ep - sk.point(c).unwrap_or_default()).len().abs() - r < 1e-6,
+                // This is an arc's own start or end: it sits on that arc.
+                CurveKind::Arc { a, b, .. } => ep.dist(sk.point(a).unwrap_or_default()) < 1e-6 || ep.dist(sk.point(b).unwrap_or_default()) < 1e-6,
+                _ => false,
+            })
         };
-        let (_, t1) = sh.range();
-        let mut best: Option<(f64, Vec2, usize)> = None;
-        let mut ambiguous = false;
-        let mut budget = 1_000_000usize;
-        let mut segment_count = 0usize;
-        for (oi, _) in sk.curves.iter().enumerate() {
-            if oi == ci {
-                continue;
-            }
-            let mut pieces = sk.exact_segs(oi).unwrap_or_else(|| sk.segs(oi));
-            // An infinite line (#1359) is a boundary along its whole line.
-            if sk.curves.get(oi).is_some_and(|c| c.infinite) {
-                pieces = pieces.iter().map(|s| support::endless(s, sh.point(sh.param(at)))).collect();
-            }
-            segment_count += pieces.len();
-            if segment_count > 16_384 {
-                return Err(bad(cmd, "too many exact curve pieces to extend safely"));
-            }
-            for piece in &pieces {
-                for q in support::hits(&unbounded, piece, &mut budget)? {
-                    let t = sh.param(q);
-                    let gap = match sh {
-                        Shape::Line { a, b } => {
-                            let l = a.dist(b);
-                            if at_b { (t - 1.0) * l } else { -t * l }
-                        }
-                        Shape::Round { r, .. } => {
-                            // A hit already inside the arc cannot lengthen either end. In
-                            // particular, extending the start must not turn a quarter into an eighth.
-                            if t <= t1 + TOL / r.max(1e-12) || t >= TAU - TOL / r.max(1e-12) {
-                                continue;
-                            }
-                            if at_b { (t - t1) * r } else { (TAU - t) * r }
-                        }
-                    };
-                    if gap > TOL * 10.0 {
-                        if best.is_none_or(|b| gap < b.0 - TOL) {
-                            best = Some((gap, q, oi));
-                            ambiguous = false;
-                        } else if best.is_some_and(|b| (gap - b.0).abs() <= TOL && (b.2 != oi || b.1.dist(q) > TOL)) {
-                            ambiguous = true;
-                        }
-                    }
-                }
-            }
+
+        if end_is_held {
+            return add_line_extension(sk, end, q, stop);
         }
-        if ambiguous {
-            return Err(bad(cmd, "multiple curves stop the extension at the same distance"));
-        }
-        let (_, q, oi) = best.ok_or_else(|| bad(cmd, "nothing to extend to"))?;
-        if let Some(pt) = sk.points.get_mut(end) {
+
+        // A free end moves along instead, if the solver lets it. The attempt is made on a copy,
+        // so an end the solver cannot put where it belongs leaves the sketch as it was for the
+        // new line below.
+        let mut attempt = sk.clone();
+        if let Some(pt) = attempt.points.get_mut(end) {
             pt.pos = q;
         }
-        pin(sk, end, oi)?;
-        let before = sk.points.iter().map(|p| p.pos).collect::<Vec<_>>();
-        let hold = solidcraft_sketch::Hold { points: (0..sk.points.len()).filter(|i| *i != end).collect(), radii: (0..sk.curves.len()).collect() };
-        if !solidcraft_sketch::solve_with(sk, &hold, None, solidcraft_sketch::Analysis::StatusOnly, None).ok()
-            || sk.point(end).is_none_or(|point| point.dist(q) > TOL)
-            || sk.points.iter().enumerate().any(|(i, point)| i != end && point.pos.dist(before[i]) > TOL)
-        {
-            return Err(bad(cmd, "the extension conflicts with constraints or cannot preserve its original support"));
+        // Held to the point that is already there or to what else stopped it, an end stays where
+        // the extension put it; an end with nothing to hold it is simply placed there.
+        if let Some(stop) = stop {
+            if stop != end {
+                add_c(&mut attempt, ConstraintKind::Coincident { p: end, q: stop })?;
+            }
+        } else if let Some(cutter) = cutter {
+            pin(&mut attempt, end, cutter)?;
         }
-        Ok(sk.points.get(end).map(|x| x.id.clone()).unwrap_or_default())
+        let before = sk.points.iter().map(|p| p.pos).collect::<Vec<_>>();
+        let hold =
+            solidcraft_sketch::Hold { points: (0..attempt.points.len()).filter(|i| *i != end).collect(), radii: (0..attempt.curves.len()).collect() };
+        let moved = solidcraft_sketch::solve_with(&mut attempt, &hold, None, solidcraft_sketch::Analysis::StatusOnly, None).ok()
+            && attempt.point(end).is_some_and(|point| point.dist(q) <= TOL)
+            && attempt.points.iter().enumerate().all(|(i, point)| i == end || point.pos.dist(before[i]) <= TOL);
+        if moved {
+            *sk = attempt;
+            return Ok(sk.points.get(end).map(|x| x.id.clone()).unwrap_or_default());
+        }
+        // The solve could not put the end where it belongs: add a new line instead.
+        add_line_extension(sk, end, q, stop)
     })?;
     Ok(json!({"moved": out, "sketch": info}))
 }
@@ -738,6 +1107,26 @@ fn refuse_infinite_corner(sk: &Sketch, p: &Value, cmd: &str) -> Result<()> {
         None => ["a", "b"].iter().any(|k| infinite(str_(p, k).and_then(|i| sk.curve_index(i)))),
     };
     if at_corner { Err(bad(cmd, "an infinite line has no corner to round or cut: make it a normal line first")) } else { Ok(()) }
+}
+
+/// Fillets and chamfers refuse a corner of an offset's output (#2874). The output's ends are
+/// recomputed from its source curves on every solve, so a corner cut there would be pulled back
+/// to the sharp corner, leaving full circles and an unsolved sketch.
+fn refuse_offset_corner(sk: &Sketch, p: &Value, cmd: &str) -> Result<()> {
+    let output = |c: usize| sk.curves.get(c).filter(|c| sk.offset_distance(&c.id).is_some()).map(|c| c.id.clone());
+    let found = match str_(p, "point").and_then(|r| sk.resolve_point(r)) {
+        Some(q) => (0..sk.curves.len()).filter(|c| sk.curves.get(*c).is_some_and(|x| x.kind.uses(q))).find_map(output),
+        None => ["a", "b"].iter().find_map(|k| str_(p, k).and_then(|i| sk.curve_index(i)).and_then(output)),
+    };
+    match found {
+        Some(id) => Err(bad(
+            cmd,
+            format!(
+                "`{id}` is an offset, and its corners follow its source curves: round or cut the source corners before offsetting, or break the offset association first"
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// A corner of two lines: (line a, line b, corner point, far end of a, far end of b).
@@ -828,11 +1217,11 @@ struct CornerKept {
 }
 
 /// Keep corner point `c` of curves `ca`, `cb` (whose corner ends were just moved to `na`, `nb`)
-/// when anything measures to it: a constraint or dimension on the point, the length of either
-/// line, or it is the origin or still ends another curve. It stays as a virtual sharp corner,
-/// held on both curves' extensions (their intersection), and the line lengths become distances
-/// from the far end to it, so the part keeps its size. Otherwise None: the
-/// caller removes the point.
+/// when anything measures to it or places it: a constraint or dimension on the point, the length
+/// of either line, a fixed or expression-driven position, or it is the origin or still ends another
+/// curve. It stays as a virtual sharp corner, held on both curves' extensions (their
+/// intersection), and the line lengths become distances from the far end to it, so the part
+/// keeps its size. Otherwise None: the caller removes the point.
 fn keep_corner(sk: &mut Sketch, c: usize, [(ca, na), (cb, nb)]: [(usize, usize); 2]) -> Result<Option<CornerKept>> {
     let used = sk.curves.iter().any(|x| uses(x, c));
     let mut moved: Vec<String> = sk.constraints.iter().filter(|k| k.kind.refers_to_point(c)).map(|k| k.id.clone()).collect();
@@ -850,7 +1239,8 @@ fn keep_corner(sk: &mut Sketch, c: usize, [(ca, na), (cb, nb)]: [(usize, usize);
         k.kind = if *a == new_end { ConstraintKind::Distance { p: c, q: *b, value } } else { ConstraintKind::Distance { p: *a, q: c, value } };
         moved.push(k.id.clone());
     }
-    if moved.is_empty() && !used && c != 0 {
+    let positioned = sk.points.get(c).is_some_and(|pt| pt.fixed || pt.exprs.is_some());
+    if moved.is_empty() && !used && c != 0 && !positioned {
         return Ok(None);
     }
     for cu in [ca, cb] {
@@ -911,7 +1301,7 @@ fn cut_corner(
 
 fn fillet(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.fillet";
-    let r_expr = expr(p, "radius").ok_or_else(|| bad(cmd, "`radius` must be a number or an expression"))?;
+    let r_expr = req_expr(cmd, p, "radius")?;
     // Several corners at once (`points`), each like a single `point`.
     let corners: Vec<Value> = match p.get("points").and_then(Value::as_array) {
         Some(a) if !a.is_empty() && a.len() <= 500 => a.iter().map(|q| json!({ "point": q })).collect(),
@@ -958,6 +1348,7 @@ fn kept_json(kept: Vec<CornerKept>) -> (Vec<String>, Vec<String>) {
 /// the arc, the tangent constraints and what became of the corner point.
 fn fillet_corner(sk: &mut Sketch, p: &Value, r: f64, cmd: &str) -> Result<(usize, Vec<String>, CornerKept)> {
     refuse_infinite_corner(sk, p, cmd)?;
+    refuse_offset_corner(sk, p, cmd)?;
     weld_corner(sk, p);
     let (la, lb, c, fa, fb) = match corner(sk, p, cmd) {
         Ok(x) => x,
@@ -1068,6 +1459,7 @@ fn round_corner(sk: &mut Sketch, p: &Value, r: f64, cmd: &str) -> Result<Option<
 fn chamfer(s: &mut Session, p: &Value, cmd: &str, dists: impl FnOnce(f64) -> Result<(f64, f64)>) -> Result<Value> {
     let (out, info) = edit(s, p, cmd, false, |sk, _| {
         refuse_infinite_corner(sk, p, cmd)?;
+        refuse_offset_corner(sk, p, cmd)?;
         weld_corner(sk, p);
         let (la, lb, c, fa, fb) = corner(sk, p, cmd)?;
         let (pc, pa, pb) = (sk.point(c).unwrap_or_default(), sk.point(fa).unwrap_or_default(), sk.point(fb).unwrap_or_default());
@@ -1246,6 +1638,11 @@ struct Side {
     constraints: Vec<String>,
     association: Option<String>,
     param: Option<String>,
+    /// Set when the offset is not linked to its source: a free-form curve whose plain offset
+    /// folds over a tight bend or crosses itself (trimmed), or a chain of curves that
+    /// includes free-form ones. Its curves then have no association and no distance to
+    /// drive, and this names the source curves they were made from.
+    unlinked_sources: Option<Vec<String>>,
 }
 
 /// The signed distances an offset runs at. One side is the distance as given. `symmetric` is the
@@ -1282,7 +1679,14 @@ fn offset_side(sk: &mut Sketch, cmd: &str, order: &[(usize, bool)], sources: &[(
                 cons.push(add_c(sk, ConstraintKind::Parallel { a, b })?);
             }
         }
-        return Ok(Side { distance: d, curves: created.curves, constraints: cons, association: Some(created.association), param: None });
+        return Ok(Side {
+            distance: d,
+            curves: created.curves,
+            constraints: cons,
+            association: Some(created.association),
+            param: None,
+            unlinked_sources: None,
+        });
     }
     let pieces: Vec<Piece> =
         order.iter().map(|(c, f)| offset_piece(sk, *c, *f, d)).collect::<Option<_>>().ok_or_else(|| bad(cmd, "the offset collapses an arc"))?;
@@ -1378,7 +1782,7 @@ fn offset_side(sk: &mut Sketch, cmd: &str, order: &[(usize, bool)], sources: &[(
         sk.offsets.push(solidcraft_sketch::OffsetChain { sources: sources.to_vec(), outputs: outputs.clone(), distance: d, closed, topology: None });
         sk.refresh_offsets()?;
     }
-    Ok(Side { distance: d, curves: outputs, constraints: cons, association: None, param: None })
+    Ok(Side { distance: d, curves: outputs, constraints: cons, association: None, param: None, unlinked_sources: None })
 }
 
 /// Numbers remain millimetres for programmatic callers; expressions use design units.
@@ -1451,7 +1855,7 @@ fn offset_group(sk: &mut Sketch, ids: &[String], eligible: &std::collections::Ha
                 closed: true,
                 topology: None,
             });
-            sides.push(Side { distance: r - nr, curves: outputs, constraints: Vec::new(), association: None, param: None });
+            sides.push(Side { distance: r - nr, curves: outputs, constraints: Vec::new(), association: None, param: None, unlinked_sources: None });
         }
         return Ok(sides);
     }
@@ -1479,16 +1883,41 @@ fn offset_group(sk: &mut Sketch, ids: &[String], eligible: &std::collections::Ha
     };
     let runs = offset_runs(d, symmetric, distance2);
     if order.iter().any(|(i, _)| sk.shape(*i).is_none()) {
-        // A smooth free-form entity is offset from exact pieces. Junctions that
-        // would require trimming/intersecting independent normal offsets are
-        // refused rather than joined by a guessed average point.
-        if order.len() != 1 {
-            return Err(bad(cmd, "offset smooth free-form curves individually; mixed chain junctions are ambiguous"));
-        }
-        let (source, forward) = *order.first().ok_or_else(|| bad(cmd, "no curves"))?;
+        // A smooth free-form entity is offset from exact pieces. One curve gets a linked
+        // offset where its plain offset is smooth and simple; otherwise (a fold or a
+        // crossing to trim, or a chain with corners) the offset is the trimmed parallel
+        // boundary, rounded at outer corners, and not linked to its source.
+        let source_ids = order
+            .iter()
+            .map(|(i, _)| sk.curves.get(*i).map(|c| c.id.clone()).ok_or_else(|| bad(cmd, "offset source vanished")))
+            .collect::<Result<Vec<_>>>()?;
+        let unlinked = |sk: &Sketch, dd: f64, curves: &[usize]| Side {
+            distance: dd,
+            curves: ids_of(sk, curves),
+            constraints: Vec::new(),
+            association: None,
+            param: None,
+            unlinked_sources: Some(source_ids.clone()),
+        };
         for dd in runs {
-            let output = sk.add_freeform_offset(source, forward, dd)?;
-            sides.push(Side { distance: dd, curves: ids_of(sk, &[output]), constraints: Vec::new(), association: None, param: None });
+            let side = match order.as_slice() {
+                [(source, forward)] => match sk.offset_freeform(*source, *forward, dd)? {
+                    solidcraft_sketch::FreeformOffsetOutput::Linked(output) => Side {
+                        distance: dd,
+                        curves: ids_of(sk, &[output]),
+                        constraints: Vec::new(),
+                        association: None,
+                        param: None,
+                        unlinked_sources: None,
+                    },
+                    solidcraft_sketch::FreeformOffsetOutput::Unlinked(curves) => unlinked(sk, dd, &curves),
+                },
+                _ => {
+                    let curves = sk.offset_freeform_chain(&order, dd)?;
+                    unlinked(sk, dd, &curves)
+                }
+            };
+            sides.push(side);
         }
         return Ok(sides);
     }
@@ -1545,6 +1974,7 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
         let eligible = sk.curves.iter().map(|c| c.id.clone()).collect::<std::collections::HashSet<_>>();
         let param = doc.new_model_param(&expression, "mm");
         let param2 = expression2.as_ref().map(|e| doc.new_model_param(e, "mm"));
+        let made: Vec<String> = std::iter::once(param.clone()).chain(param2.clone()).collect();
         let mut pending = ids.clone();
         let mut sides = Vec::new();
         while !pending.is_empty() {
@@ -1556,6 +1986,7 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
                 .find(|o| o.owns_output(output))
                 .map(|o| o.sources.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
                 .or_else(|| sk.freeform_offsets.iter().find(|o| o.output == *output).map(|o| vec![o.source.clone()]))
+                .or_else(|| group.iter().find_map(|side| side.unlinked_sources.clone()))
                 .ok_or_else(|| bad(cmd, "offset association is missing"))?;
             // An offset of infinite lines is infinite lines too (#1359).
             let infinite = sources.iter().all(|id| sk.curve_index(id).and_then(|c| sk.curves.get(c)).is_some_and(|c| c.infinite));
@@ -1570,6 +2001,10 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             }
             for (index, side) in group.iter_mut().enumerate() {
+                // A trimmed offset is not linked to its source: it has no distance to drive.
+                if side.unlinked_sources.is_some() {
+                    continue;
+                }
                 let name = if index == 1 { param2.as_ref().unwrap_or(&param) } else { &param };
                 let output = side.curves.first().ok_or_else(|| bad(cmd, "offset produced no curves"))?;
                 side.constraints.push(sk.add_constraint(
@@ -1585,6 +2020,11 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
             }
             sides.extend(group);
         }
+        // Parameters made for distances that only trimmed (unlinked) offsets used drive nothing.
+        let used = |name: &String| sides.iter().any(|side: &Side| side.param.as_ref() == Some(name));
+        let param = used(&param).then_some(param);
+        let param2 = param2.filter(|name| used(name));
+        doc.params.retain(|p| !made.contains(&p.name) || param.as_ref() == Some(&p.name) || param2.as_ref() == Some(&p.name));
         Ok((sides, param, param2))
     })?;
     let curves: Vec<&String> = sides.iter().flat_map(|side| side.curves.iter()).collect();
@@ -1908,14 +2348,6 @@ fn mirror(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"curves": out.0, "constraints": out.1, "sketch": info}))
 }
 
-fn count(p: &Value, k: &str, cmd: &str) -> Result<usize> {
-    let n = num(p, k).ok_or_else(|| bad(cmd, format!("`{k}` must be a number")))?;
-    if !(1.0..=MAX_COPIES as f64).contains(&n) || n.fract() != 0.0 {
-        return Err(bad(cmd, format!("`{k}` must be 1…{MAX_COPIES}")));
-    }
-    Ok(n as usize)
-}
-
 fn point_or_ref(sk: &Sketch, p: &Value, k: &str, cmd: &str) -> Result<Vec2> {
     match p.get(k) {
         Some(Value::String(r)) => sk.resolve_point(r).and_then(|i| sk.point(i)).ok_or_else(|| bad(cmd, format!("unknown point `{r}`"))),
@@ -1946,6 +2378,17 @@ fn transform_in_place(sk: &mut Sketch, cs: &[usize], ps: &[usize], f: &dyn Fn(Ve
     if pts.iter().any(|q| sk.points.get(*q).is_some_and(|x| x.fixed || x.link.is_some())) {
         return Err(bad(cmd, "fixed or projected geometry cannot move"));
     }
+    // A point the origin holds goes where the move takes it: the coincidence that held it
+    // there is dropped (#5034).
+    let moved: Vec<usize> = pts
+        .iter()
+        .copied()
+        .filter(|q| {
+            let p = sk.point(*q).unwrap_or_default();
+            (f(p) - p).len() > TOL
+        })
+        .collect();
+    release_origin_holds(sk, &moved);
     for q in pts {
         if let Some(x) = sk.points.get_mut(q) {
             x.pos = f(x.pos);
@@ -1960,12 +2403,88 @@ fn transform_in_place(sk: &mut Sketch, cs: &[usize], ps: &[usize], f: &dyn Fn(Ve
     Ok(())
 }
 
+/// Turn the constraints tied to the sketch axes with geometry rotated by `angle` (radians), when
+/// every point they refer to is in `moved`: horizontal and vertical relations and dimensions swap
+/// at odd quarter turns and stay at half turns, and a line's angle dimension turns with the line,
+/// its parameter too. Horizontal and vertical relations and dimensions cannot hold at any other
+/// angle and are removed. Every other constraint keeps its meaning under a rigid move.
+fn rotate_axis_constraints(sk: &mut Sketch, doc: &mut solidcraft_doc::Document, moved: &[usize], angle: f64) -> Result<()> {
+    let quarters = angle.rem_euclid(TAU) / FRAC_PI_2;
+    let turns = quarters.round();
+    if turns.rem_euclid(4.0) == 0.0 && (quarters - turns).abs() < 1e-10 {
+        return Ok(());
+    }
+    let square = (quarters - turns).abs() < 1e-10;
+    let odd = square && turns.rem_euclid(2.0) == 1.0;
+    let curves = &sk.curves;
+    let mut angles = Vec::new();
+    sk.constraints.retain_mut(|c| {
+        if c.driven {
+            return true;
+        }
+        let (mut points, refs) = c.kind.indices();
+        for l in refs {
+            match curves.get(l) {
+                Some(curve) => points.extend(curve.kind.point_ids()),
+                None => return true,
+            }
+        }
+        if points.is_empty() || !points.iter().all(|q| moved.contains(q)) {
+            return true;
+        }
+        use ConstraintKind::*;
+        let swapped = match c.kind {
+            Horizontal { l } => Vertical { l },
+            Vertical { l } => Horizontal { l },
+            HorizontalPoints { p, q } => VerticalPoints { p, q },
+            VerticalPoints { p, q } => HorizontalPoints { p, q },
+            DistanceX { p, q, value } => DistanceY { p, q, value },
+            DistanceY { p, q, value } => DistanceX { p, q, value },
+            LineAngle { l, value } => {
+                let turned = (value + angle + PI).rem_euclid(TAU) - PI;
+                c.kind = LineAngle { l, value: turned };
+                if let Some(name) = &c.param {
+                    angles.push((name.clone(), turned));
+                }
+                return true;
+            }
+            _ => return true,
+        };
+        if odd {
+            c.kind = swapped;
+        }
+        square
+    });
+    for (name, turned) in angles {
+        let Some(param) = doc.param(&name) else { continue };
+        let degrees = (angle.to_degrees() * 1e6).round() / 1e6;
+        // A literal becomes the new angle; a formula keeps its references and gains the turn.
+        let expr = if solidcraft_doc::expr::references(&param.expr).is_empty() {
+            format!("{} deg", (turned.to_degrees() * 1e6).round() / 1e6)
+        } else {
+            format!("({}) + {degrees} deg", param.expr)
+        };
+        doc.set_param(&name, &expr, None, None)?;
+    }
+    Ok(())
+}
+
+/// Drop the coincidences that held the moved points to the sketch's origin: a move translates
+/// the geometry it is given, and the origin does not travel with it (#5034).
+fn release_origin_holds(sk: &mut Sketch, pts: &[usize]) {
+    let Some(origin) = sk.point_index("origin") else { return };
+    sk.constraints.retain(
+        |c| !matches!(&c.kind, ConstraintKind::Coincident { p, q } if (pts.contains(p) && *q == origin) || (pts.contains(q) && *p == origin)),
+    );
+}
+
 fn move_copy(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.move";
     let t = if p.get("translate").is_some() { req_vec2(cmd, p, "translate")? } else { Vec2::ZERO };
     let ang = if p.get("angle").is_some() { num(p, "angle").ok_or_else(|| bad(cmd, "`angle` must be finite"))? } else { 0.0 }.to_radians();
     let copy = bool_(p, "copy").unwrap_or(false);
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
+    let rotate_constraints = bool_(p, "rotate_constraints").unwrap_or(true);
+    let (out, info) = edit(s, p, cmd, false, |sk, doc| {
         let (mut cs, mut ps) = entities(sk, p, cmd)?;
         let c = if p.get("center").is_some() { point_or_ref(sk, p, "center", cmd)? } else { Vec2::ZERO };
         let rot = rotate(c, ang);
@@ -1990,9 +2509,14 @@ fn move_copy(s: &mut Session, p: &Value) -> Result<Value> {
             return Ok(ids_of(sk, &m));
         }
         transform_in_place(sk, &cs, &ps, &f, 1.0, cmd)?;
+        if rotate_constraints {
+            let moved = involved_points(sk, &cs, &ps);
+            rotate_axis_constraints(sk, doc, &moved, ang)?;
+        }
         cs.extend(text_curves);
         Ok(ids_of(sk, &cs))
     })?;
+    s.doc_mut().prune_model_params();
     Ok(json!({"curves": out, "sketch": info}))
 }
 

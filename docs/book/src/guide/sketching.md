@@ -3,7 +3,9 @@
 A sketch lies on a plane: an origin plane, a construction plane or a planar face. Start one with
 **Create Sketch** (`sketch.create`) and click a plane, or pick a face first. Right-clicking a
 plane, in the view or on its browser row, offers **Create Sketch** on that plane too.
-**Finish Sketch** returns to the model.
+**Finish Sketch** returns to the model. **Cancel Sketch** (`sketch.cancel`) returns without
+keeping what changed since the sketch was created or opened for editing: a new sketch is removed,
+an edited one goes back to how it was, as one step that Undo brings back.
 
 In scripts, `XY`, `XZ`, `YZ` and their `Top`, `Front`, `Right` aliases name origin planes.
 These names are reserved: a construction plane cannot be created with or renamed to one
@@ -33,6 +35,12 @@ into reference geometry that doesn't form profiles. Modify tools include trim (T
 fillet, chamfer, offset (O), mirror, patterns, move/copy and scale. With trim on, click a
 piece to remove it, or press and drag a path across several pieces: the ones it crosses light up
 and all go when you let go, in one undo step (`sketch.trim.path`).
+
+Tools with several variants (line and midpoint line; two-point, three-point, centre and rounded
+rectangle; the circle, arc, slot, polygon and spline variants) share one toolbar button with a
+drop-down. The button and the family's shortcut start the variant you picked last, so a
+shortcut such as L can start a Midpoint Line; pick the variant you want from the drop-down to
+change it ([Keyboard shortcuts](shortcuts.md)).
 
 The Sketch Palette's **Construction Geometries** option hides construction curves while you
 work. A hidden construction curve cannot be picked by a click or by a box. Nothing invisible
@@ -154,6 +162,13 @@ ending the tool or losing picked points and inline values. The preview and hover
 keep construction dashes and centerline dash-dot patterns visible. With curves selected,
 Construction changes those curves as before.
 
+The pointer snaps to existing sketch points, to a line's midpoint, and to **where two
+curves cross** (two lines, a line and a circle or arc, or two circles or arcs). The snap
+hint shows **X**. The new point stays on both curves when either one moves. Hold **Shift**
+to prefer a line midpoint instead; hold Ctrl/Cmd or Alt/Option (the default suppress chord)
+to stop snapping for that gesture. Scripts pass `"x:<curve>+<curve>:x,y"` as a point
+argument, the same way `"mid:<line>"` and `"on:<curve>:x,y"` work.
+
 Enable **3D Sketch** in the Sketch Palette to draw lines, fit splines and points off the plane.
 While placing these points, you can snap to points on other visible sketches. For a bridge
 line, start Line and click an endpoint on each source sketch; each endpoint uses its source
@@ -194,15 +209,16 @@ Scripts use the same command, with a midpoint reference in the `points` array:
 The solver is SolidCraft's own (damped Gauss–Newton with degree-of-freedom analysis). Constraints:
 coincident, horizontal/vertical, parallel, perpendicular, tangent, equal, concentric, collinear,
 midpoint, symmetry, fix, curvature (G2) and polygon. **Sketch Dimension** (D) adds linear,
-aligned, horizontal, vertical, point-to-line, line-to-circle, radius, diameter and angle
-dimensions. Each is a parameter
+aligned, horizontal, vertical, point-to-line, line-to-circle, point-to-circle, circle-to-circle,
+radius, diameter, arc length and angle dimensions. For an arc's length, click the arc and then one of its end points. Each is a parameter
 (`d1`, `d2`, …), so it can hold an expression.
 
 Press D, click what you want to measure and type the value: as soon as the click settles the
 dimension (one line, circle or arc, or the second point or line of a distance or angle), its
 value box takes the keyboard with the measured value selected, so typing replaces it. Numbers,
 units (`1 in`), expressions (`2*width`) and parameter names all work; letters go into the box,
-not to tool shortcuts. While you type, the dimension text follows the cursor, and Enter places
+not to tool shortcuts. `width = 40` (or `#width = 40`) defines the user parameter `width` and dimensions with it,
+in one step. While you type, the dimension text follows the cursor, and Enter places
 it there (or in its default place if you haven't moved the cursor) as one undo step. Esc
 cancels the dimension.
 
@@ -210,6 +226,11 @@ You can still place the text first. Before you type, a click on empty sketch spa
 text there and keeps the value box focused; a click on another point or line makes the
 dimension a distance or angle instead; Tab leaves the picks waiting for a click to place the
 text.
+
+To change a dimension you already have, double-click it, or, with Sketch Dimension on and
+nothing picked yet, click it once: its value box opens with the value selected, Enter applies,
+and the tool stays on for the next dimension. The dimension's text always takes the click; its
+lines take it only away from sketch points and curves, which still start a new dimension.
 
 Between two points, or on a line, that don't line up with an axis, where you place the
 dimension picks what it measures: across from them, the distance between them; above or below
@@ -221,6 +242,13 @@ the circle touches the line. When the line cuts through the circle, the dimensio
 far the edge reaches past the line instead. An arc is measured to the circle it lies on. For
 the distance to the centre, click the centre point instead of the edge. In scripts:
 `{"command": "sketch.dimension", "params": {"entities": ["l1", "c1"], "value": 5}}`.
+
+A point and a circle or arc measure from the point to the circle's edge, along the radius
+through the point: 0 puts the point on the circle, and a point inside the circle measures how
+far within the edge it lies. Two circles or arcs measure between their edges, along the line
+through their centres: the gap between them (0 when they touch), how far they overlap when they
+cross, or, when one lies inside the other, the narrowest gap between them (the thinnest part of
+the wall). For the distance between the centres, click the two centre points instead.
 
 A dimension the sketch can't take, because the geometry is already fixed by other constraints
 and dimensions, is added as a driven (reference) dimension instead: it is shown in
@@ -240,7 +268,9 @@ You can also start the constraint first and then pick its curves. An incomplete 
 selection leaves the tool ready for ordinary picking.
 
 Coincident accepts an exact selection of two points or a point and a curve. Midpoint
-accepts one point and one line, in either selection order. Symmetry accepts two distinct
+accepts one point and one line, in either selection order, or two lines: the second line
+moves (keeping its length) until its midpoint sits on the first line's midpoint,
+and stays centred there as either line changes. Symmetry accepts two distinct
 points and one symmetry line, regardless of where the line occurs in the selection.
 Successful constraints clear the selection; rejected constraints preserve it.
 

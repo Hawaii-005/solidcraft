@@ -128,6 +128,50 @@ fn forward_tab_completes_expression_then_cycles_and_shift_tab_moves_back() {
     assert!((sketch.profiles[0].area - 120.0).abs() < 1e-6);
 }
 
+/// #3257: clicking a parameter suggestion under a line's length box puts the name in the box,
+/// which keeps the focus; the click places nothing, and Enter draws the line that long.
+#[test]
+fn clicking_a_parameter_suggestion_fills_the_length_box() {
+    let mut h = drawing("sketch.line");
+    h.app.run("parameters.add", json!({"name": "width", "expression": "24 mm"})).unwrap();
+    h.frames(2);
+    type_value(&mut h, "wid");
+    h.frames(1);
+    h.step(&json!({"click": {"handle": "dialog:suggestion:0"}})).unwrap();
+    h.frames(1);
+    assert_focus(&h, 0);
+    assert_eq!(h.app.tool.as_ref().unwrap().dims[0].value, "width");
+    let sketch = |h: &Harness| h.app.session.world_state().sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch.curves.len();
+    assert_eq!(sketch(&h), 0, "the click on the list placed no point");
+    h.step(&json!({"key": "Enter"})).unwrap();
+    let state = h.app.session.world_state();
+    let sk = &state.sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch;
+    assert_eq!(sk.curves.len(), 1);
+    let length = sk.shape(0).map(|s| match s {
+        solidcraft_engine::sketch::Shape::Line { a, b } => a.dist(b),
+        _ => 0.0,
+    });
+    assert!(length.is_some_and(|l| (l - 24.0).abs() < 1e-6), "{length:?}");
+}
+
+/// #3278: after the 2-point circle's first point, a Diameter box takes the keyboard; the typed
+/// diameter sets the second point along the cursor's direction, and Enter draws that circle.
+#[test]
+fn two_point_circle_takes_a_typed_diameter() {
+    let mut h = drawing("sketch.circle.two_point");
+    assert_eq!(h.app.tool.as_ref().unwrap().dims.iter().map(|b| b.label).collect::<Vec<_>>(), ["Diameter"]);
+    type_value(&mut h, "30");
+    h.step(&json!({"key": "Enter"})).unwrap();
+    let state = h.app.session.world_state();
+    let sk = &state.sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch;
+    assert_eq!(sk.curves.len(), 1, "{:?}", h.app.status);
+    assert!(sk.radius(0).is_some_and(|r| (r - 15.0).abs() < 1e-6), "{:?}", sk.radius(0));
+    let c = sk.center(0).unwrap();
+    // From the first point (the origin) toward the cursor at (20, 10).
+    let dir = solidcraft_engine::geom::Vec2::new(20.0, 10.0).normalized().unwrap();
+    assert!((c - dir * 15.0).len() < 1e-6, "{c:?}");
+}
+
 #[test]
 fn inch_live_lengths_use_design_units_and_typed_four_digits_commit_in_inches() {
     let mut h = Harness::new();
@@ -143,6 +187,9 @@ fn inch_live_lengths_use_design_units_and_typed_four_digits_commit_in_inches() {
     type_value(&mut h, "1.2345");
     tab(&mut h, false);
     type_value(&mut h, "0.500");
+    let tool = h.app.tool.as_ref().unwrap();
+    assert!((crate::sketch_dims::locked_value(&h.app, tool, "Width").unwrap() - 31.3563).abs() < 1e-6);
+    assert!((crate::sketch_dims::locked_value(&h.app, tool, "Height").unwrap() - 12.7).abs() < 1e-6);
     h.step(&json!({"key":"Enter"})).unwrap();
     let st = h.app.session.world_state();
     let sk = &st.sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch;
@@ -316,6 +363,53 @@ fn a_line_end_on_a_circle_outside_the_axis_snap_stays_at_the_cursor() {
     let b = sk.curves.iter().find_map(|c| if let CurveKind::Line { b, .. } = c.kind { Some(b) } else { None }).unwrap();
     let end = sk.point(b).unwrap();
     assert!((end.len() - 30.0).abs() < 1e-9 && end.dist(at) < 0.5, "{end:?}");
+}
+
+/// #6198: the Midpoint Line tool shows the same Length/Angle readout as the Line tool while
+/// the line is being drawn.
+#[test]
+fn a_midpoint_line_shows_its_length_and_angle_while_it_is_drawn() {
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    h.step(&json!({"start": "sketch.line.midpoint"})).unwrap();
+    h.step(&json!({"click": {"world": [0, 0, 0]}})).unwrap();
+    h.step(&json!({"move": {"world": [10, 0, 0]}})).unwrap();
+    let tool = h.app.tool.as_ref().unwrap();
+    assert_eq!(tool.dims.iter().map(|d| d.label).collect::<Vec<_>>(), ["Length", "Angle"], "the midpoint line shows the line tool's boxes");
+    // The line runs from the cursor's mirror image through the clicked middle to the
+    // cursor: its length is twice the middle-to-cursor distance.
+    let length: f64 = tool.dims[0].value.parse().unwrap_or_default();
+    assert!((length - 20.0).abs() < 0.01, "the whole line's length: {}", tool.dims[0].value);
+    let angle: f64 = tool.dims[1].value.trim_end_matches(" deg").parse().unwrap_or_default();
+    assert!(angle.abs() < 0.1, "the line's angle: {}", tool.dims[1].value);
+}
+
+/// #6198: a typed length and angle drive the midpoint line that is drawn.
+#[test]
+fn a_midpoint_line_takes_a_typed_length_and_angle() {
+    use solidcraft_engine::sketch::ConstraintKind;
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    h.step(&json!({"start": "sketch.line.midpoint"})).unwrap();
+    h.step(&json!({"click": {"world": [0, 0, 0]}})).unwrap();
+    h.step(&json!({"move": {"world": [10, 0, 0]}})).unwrap();
+    type_value(&mut h, "20");
+    tab(&mut h, false);
+    type_value(&mut h, "45 deg");
+    h.step(&json!({"key": "Enter"})).unwrap();
+    let state = h.app.session.world_state();
+    let sk = &state.sketch(h.app.session.active_sketch.unwrap()).unwrap().sketch;
+    assert_eq!(sk.curves.len(), 1, "{:?}", h.app.status);
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::Length { value, .. } if (value - 20.0).abs() < 1e-9)),
+        "the typed length is a driving dimension: {:?}",
+        sk.constraints
+    );
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::LineAngle { value, .. } if (value - 45f64.to_radians()).abs() < 1e-9)),
+        "the typed angle is a driving dimension: {:?}",
+        sk.constraints
+    );
 }
 
 /// A value box set off the cursor stays in the drawing area (#2201): past an edge it goes to the

@@ -1,6 +1,7 @@
 //! Ribbon-anchored command search. Ranking comes from the registry; document results use
 //! existing feature-edit and parameter commands. JSON mode never starts an interactive tool.
 
+use crate::ui_kit::{Container, Surface};
 use egui::{Pos2, Rect, pos2, vec2};
 use serde_json::{Value, json};
 use solidcraft_engine::command_specs;
@@ -149,7 +150,7 @@ pub fn search(app: &SolveApp, q: &str) -> Vec<Row> {
                 .max(score(&q, panel).max(score(&q, home_panel)) / 3);
             let recent = app.sbox.recent.iter().position(|r| r == c.id).map_or(0, |i| 2000u32.saturating_sub(i.min(2000) as u32));
             // Commands that can run now come before those that can't.
-            let usable = if c.info(&app.session).enabled { 150 } else { 0 };
+            let usable = if crate::render_workspace::interactive_command_info(app, c).enabled { 150 } else { 0 };
             (s > 0).then_some((s + usable + if q.is_empty() { recent } else { recent / 20 }, (c.id, label, c.icon, place)))
         })
         .collect();
@@ -355,8 +356,16 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut rows = Vec::new();
     let mut design = Vec::new();
     let mut mode = None;
-    let response =
-        crate::frame::area(egui::Id::new("sc_sbox")).fixed_pos(pos).order(egui::Order::Foreground).fade_in(false).constrain(false).show(ctx, |ui| {
+    // Closed, the field is part of the ribbon and belongs under the system windows the rest of
+    // the ribbon goes under (Preferences, say); open, its sheet floats over everything.
+    let floating = open || progress > 0.0;
+    let response = Container::new(ctx, Surface::Popup)
+        .area(egui::Id::new("sc_sbox"))
+        .fixed_pos(pos)
+        .order(if floating { egui::Order::Foreground } else { egui::Order::Background })
+        .fade_in(false)
+        .constrain(false)
+        .show(ctx, |ui| {
             // Area rounds its origin; place the child at the exact interpolated bounds
             // so the field's right edge does not drift during expansion.
             ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_size(pos, vec2(field_size.x, height + field_size.y))), |ui| {
@@ -374,7 +383,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         ui_kit::SearchFieldGeometry {
                             height: field_size.y,
                             progress,
-                            radius: ui_kit::CommandSearch::field_radius(progress, app.ui.layout == crate::shell::LayoutMode::Floating),
+                            radius: ui_kit::CommandSearch::field_radius(progress, ui_kit::Container::new(ctx, ui_kit::Surface::Chrome).floating()),
                         },
                         MAX_QUERY,
                     );
@@ -409,7 +418,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     }
                     let enabled: Vec<_> = rows
                         .iter()
-                        .map(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| c.info(&app.session).enabled))
+                        .map(|r| {
+                            solidcraft_engine::find_command(r.0).is_some_and(|c| crate::render_workspace::interactive_command_info(app, c).enabled)
+                        })
                         .chain(design.iter().map(|_| true))
                         .take(MAX_RESULTS)
                         .collect();
@@ -474,7 +485,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                                         let mut item = ui_kit::MenuItem::new(id, label, icon);
                                         item.enabled = enabled.get(index).copied().unwrap_or(false);
                                         item.highlighted = index == app.sbox.index;
-                                        let shortcut = crate::keymap::effective(app, id).unwrap_or_default();
+                                        let shortcut = crate::keymap::display_for(app, id).unwrap_or_default();
                                         item.shortcut = &shortcut;
                                         let path = place.map_or_else(|| id.to_string(), |(tab, panel)| format!("{tab} › {panel}"));
                                         let response = item.search_row(ui, &query, &path, None);
@@ -574,7 +585,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
         } else {
             let index = picked.unwrap_or(app.sbox.index);
-            if let Some((id, ..)) = rows.get(index).filter(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| c.info(&app.session).enabled)) {
+            if let Some((id, ..)) = rows
+                .get(index)
+                .filter(|r| solidcraft_engine::find_command(r.0).is_some_and(|c| crate::render_workspace::interactive_command_info(app, c).enabled))
+            {
                 app.sbox.used(id);
                 close(app);
                 app.start(id);
@@ -833,6 +847,31 @@ mod tests {
         h.call("ui.palette", json!({"open":false}));
         assert!(!h.app.ui.palette_open);
     }
+    #[test]
+    fn the_closed_field_draws_under_system_windows_and_the_open_sheet_over_them() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.frames(3);
+        let order = |h: &crate::scenario::Harness| {
+            h.ctx.memory(|m| m.areas().visible_layer_ids().into_iter().find(|l| l.id == egui::Id::new("sc_sbox")).map(|l| l.order))
+        };
+        // Closed, the field is ribbon chrome: Preferences and the other system windows cover it.
+        assert_eq!(order(&h), Some(egui::Order::Background), "the closed field belongs to the ribbon");
+        h.call("ui.prefs", json!({"open": "General"}));
+        h.frames(3);
+        let window = h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_prefs"))).unwrap();
+        let field = crate::scenario::rect_of("ribbon:search").unwrap();
+        assert!(order(&h) < Some(egui::Order::Middle), "a system window draws over the closed field");
+        assert!(
+            !window.contains(field.center()) || h.ctx.memory(|m| m.layer_id_at(field.center())).is_some_and(|l| l.id == egui::Id::new("sc_prefs"))
+        );
+        h.call("ui.prefs", json!({"button": "cancel"}));
+        // Open, the sheet is a popup again and floats over every window.
+        h.call("ui.palette", json!({}));
+        h.frames(3);
+        assert_eq!(order(&h), Some(egui::Order::Foreground), "the open sheet floats over windows");
+    }
+
     #[test]
     fn ribbon_field_is_one_editor_and_interpolates_with_anchored_right_edge() {
         let mut h = crate::scenario::Harness::new();

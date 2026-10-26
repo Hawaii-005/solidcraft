@@ -22,7 +22,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         "face: [x,y,z] on the rim face of a shelled body; width, height; type?: lip|groove; gap? (groove clearance); side?: inside|outside (which rim edge); body?",
     ),
     CommandSpec::new("plastic.snap_fit", "Snap Fit", snap_fit).at("PLASTIC", "CREATE").icon("snap_fit").params(
-        "position: [x,y,z] on a face; direction? (default: out of the face); hook: [x,y,z] (the catch's direction); length, thickness, width, catch_depth, catch_length; body?",
+        "position: [x,y,z] on a face; direction? (default: out of the face); hook: [x,y,z] (the catch's direction); length, thickness, width, catch_depth, catch_length; \
+         base_height? (extends the base below the face); new_body?: bool (make a separate body instead of joining); body?",
     ),
     CommandSpec::new("plastic.rest", "Rest", rest).at("PLASTIC", "CREATE").icon("rest").params(
         "position: [x,y,z] on a face (the rest's centre); direction? (default: out of the face); width (round: the diameter); length? (a rectangle, along `along`); along?: [x,y,z]; \
@@ -262,6 +263,8 @@ fn snap_fit(s: &mut Session, p: &Value) -> Result<Value> {
         width: required(s, p, "width", Kind::Length, cmd)?,
         catch_depth: required(s, p, "catch_depth", Kind::Length, cmd)?,
         catch_length: required(s, p, "catch_length", Kind::Length, cmd)?,
+        base_height: checked(s, p, "base_height", Kind::Length, cmd)?,
+        new_body: bool_(p, "new_body").unwrap_or(false),
         body: str_(p, "body").map(BodyName::from),
     };
     add_feature(s, p, kind)
@@ -423,6 +426,77 @@ mod tests {
         let m = run(&mut s, "inspect.measure", json!({}));
         assert!((m["bodies"][0]["bbox"]["max"][0].as_f64().unwrap_or(0.0) - 40.0).abs() < 1e-9);
         assert!(s.execute("plastic.snap_fit", &json!({"position": [5, 5, 4], "direction": [0, 0, 1], "hook": [0, 0, 1], "length": 15, "thickness": 1.5, "width": 6, "catch_depth": 1, "catch_length": 3})).is_err());
+    }
+
+    #[test]
+    fn snap_fit_base_height_and_new_body() {
+        let snap =
+            json!({"position": [20, 20, 4], "hook": [1, 0, 0], "length": 15, "thickness": 1.5, "width": 6, "catch_depth": 1, "catch_length": 3});
+        let arm = 1.5 * 15.0 * 6.0 + 0.5 * 1.0 * 3.0 * 6.0;
+        let snap_volume = |s: &mut Session| {
+            let m = run(s, "inspect.measure", json!({}));
+            m["bodies"].as_array().unwrap().iter().map(|b| b["volume_mm3"].as_f64().unwrap()).min_by(f64::total_cmp).unwrap_or(f64::NAN)
+        };
+        // New body: the snap fit stands on its own, its volume exact, so it can be arrayed or moved.
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 4}));
+        let mut p = snap.clone();
+        p["new_body"] = json!(true);
+        run(&mut s, "plastic.snap_fit", p);
+        assert_eq!(run(&mut s, "inspect.measure", json!({}))["body_count"], 2);
+        assert!(rel(snap_volume(&mut s), arm) < 1e-6);
+        // Base height adds a t·w·base_height base below the face.
+        let mut t = Session::default();
+        run(&mut t, "solid.box", json!({"length": 40, "width": 40, "height": 4}));
+        let mut p = snap.clone();
+        p["new_body"] = json!(true);
+        p["base_height"] = json!(4);
+        run(&mut t, "plastic.snap_fit", p);
+        assert!(rel(snap_volume(&mut t), arm + 1.5 * 6.0 * 4.0) < 1e-6);
+        // Joined with a base height it still builds: the base bites into the wall, so the
+        // total grows only by the arm above the face, and there is still one body.
+        let mut u = Session::default();
+        run(&mut u, "solid.box", json!({"length": 40, "width": 40, "height": 4}));
+        let v0 = volume(&mut u);
+        let mut p = snap.clone();
+        p["base_height"] = json!(2);
+        run(&mut u, "plastic.snap_fit", p);
+        assert!(rel(volume(&mut u) - v0, arm) < 1e-6);
+        assert_eq!(run(&mut u, "inspect.measure", json!({}))["body_count"], 1);
+    }
+
+    #[test]
+    fn plastic_sizes_below_the_minimum_are_refused_by_name() {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 4}));
+        let v0 = volume(&mut s);
+        let snap =
+            json!({"position": [20, 20, 4], "hook": [1, 0, 0], "length": 15, "thickness": 1.5, "width": 6, "catch_depth": 1, "catch_length": 3});
+        for (key, tiny) in
+            [("thickness", 1e-9), ("thickness", 1e-320), ("length", 1e-5), ("width", 0.005), ("catch_depth", 1e-9), ("catch_length", 1e-9)]
+        {
+            let mut p = snap.clone();
+            p[key] = json!(tiny);
+            let e = s.execute("plastic.snap_fit", &p).unwrap_err().to_string();
+            assert!(e.contains(&format!("snap fit's {key} must be at least 0.01 mm")), "{key}={tiny}: {e}");
+        }
+        let boss = json!({"position": [20, 20, 4], "diameter": 6, "height": 5});
+        for (key, tiny) in [("diameter", 1e-9), ("height", 1e-9), ("hole_diameter", 1e-9), ("rib_thickness", 1e-9)] {
+            let mut p = boss.clone();
+            p[key] = json!(tiny);
+            if key == "rib_thickness" {
+                p["ribs"] = json!(4);
+            }
+            let e = s.execute("plastic.boss", &p).unwrap_err().to_string();
+            assert!(e.contains(&format!("boss's {key} must be at least 0.01 mm")), "{key}={tiny}: {e}");
+        }
+        let e = s.execute("plastic.rest", &json!({"position": [20, 20, 4], "width": 6, "height": 1e-9})).unwrap_err().to_string();
+        assert!(e.contains("rest's height must be at least 0.01 mm"), "{e}");
+        assert!(rel(volume(&mut s), v0) < 1e-9, "the refused features changed nothing");
+        // The minimum itself still builds.
+        let mut p = snap.clone();
+        p["thickness"] = json!(0.01);
+        run(&mut s, "plastic.snap_fit", p);
     }
 
     #[test]

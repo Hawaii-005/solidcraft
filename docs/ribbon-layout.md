@@ -2,7 +2,7 @@
 
 The UI layout in `crates/ui-egui/src/workspace.rs` maps the original engine registry placements into ribbon sections. `docs/features.md` continues to document registry placements; command registrations and ids are unchanged.
 
-Always shown, in order: MODEL, SURFACE, ASSEMBLE, INSERT, INSPECT, MANAGE, VIEW, SHEET METAL. SKETCH appears during sketch editing. SHEET METAL is reachable in every document, so a sheet-metal part can start from a sketch or a solid; it takes the contextual style and selects itself when the selected body (or the last body of the active component) has evaluated sheet-metal data. Entering a context selects its tab; the other tabs remain available. RENDER belongs to the Render workspace.
+Always shown, in order: MODEL, SURFACE, ASSEMBLE, INSERT, INSPECT, MANAGE, VIEW, SHEET METAL, WELDMENTS. SKETCH appears during sketch editing. SHEET METAL is reachable in every document, so a sheet-metal part can start from a sketch or a solid; it takes the contextual style and selects itself when the selected body (or the last body of the active component) has evaluated sheet-metal data. WELDMENTS is reachable in every document too, since a frame starts from a sketch of its lines; it selects itself when that body is a frame member, keeping the ordinary tab look (sheet metal comes first). Entering a context selects its tab; the other tabs remain available. RENDER belongs to the Render workspace.
 
 **Bold command ids are default promoted buttons.** Every listed command remains in the section menu. Saved user pins can add buttons, as before.
 
@@ -52,6 +52,9 @@ Always shown, in order: MODEL, SURFACE, ASSEMBLE, INSERT, INSPECT, MANAGE, VIEW,
 | SHEET METAL | OUTPUT | **`sheet.export_dxf`**, **`sheet.export_bend_table`** |
 | SHEET METAL | RULES | **`sheet.manage_rules`** |
 | SHEET METAL | CONFIGURE | **`parameters.change`**, **`config.table`**, `config.configure` |
+| WELDMENTS | SKETCH | **`sketch.create`** |
+| WELDMENTS | CREATE | **`frame.member`** |
+| WELDMENTS | CONFIGURE | **`parameters.change`**, **`config.table`**, `config.configure` |
 | SKETCH | CONFIGURE | **`parameters.change`**, **`config.table`**, `config.configure` |
 | RENDER | SCENE | **`render.scene`** |
 | RENDER | IMAGE | **`render.start`** |
@@ -110,6 +113,7 @@ Explicit command-id lists override the default placement mapping. Shared command
 | SURFACE / CREATE | SURFACE / CREATE | `surface.boundary`, `surface.patch`, `surface.extrude`, `surface.revolve`, `surface.sweep`, `surface.loft`, `surface.offset`, `surface.ruled`, `surface.blend` |
 | SURFACE / INSPECT | INSPECT / SURFACE QUALITY | `inspect.continuity` |
 | SURFACE / MODIFY | SURFACE / EDIT | `surface.stitch`, `surface.extend`, `surface.trim`, `surface.untrim`, `surface.unstitch`, `surface.reverse_normal`, `surface.fair`, `surface.fillet`, `surface.match` |
+| WELDMENTS / CREATE | WELDMENTS / CREATE | `frame.member` |
 
 ## Placement decisions and missing commands
 

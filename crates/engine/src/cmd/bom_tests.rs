@@ -123,6 +123,61 @@ fn part_properties_survive_save_and_open_and_undo_in_one_step() {
 }
 
 #[test]
+fn inserted_design_carries_its_part_properties_into_the_bom() {
+    let dir = scratch("insert-design");
+    let source = dir.join("plate.solidcraft");
+    let metadata = json!({
+        "part_number": "PL-6624", "description": "Mounting plate", "revision": "B",
+        "author": "Example author", "license": "CC0-1.0", "com.example.catalog": {"stock": 12}
+    });
+    let mut part = Session::default();
+    run(&mut part, "solid.box", json!({"length": 40, "width": 20, "height": 3}));
+    run(&mut part, "document.metadata.set", json!({"values": metadata}));
+    run(&mut part, "file.save", json!({"path": source}));
+
+    for reuse in [false, true] {
+        let mut s = Session::default();
+        run(&mut s, "document.metadata.set", json!({"values": {"part_number": "ASM-1", "description": "Assembly"}}));
+        let own_metadata = s.doc.metadata.clone();
+        let undo = s.undo.len();
+        let inserted = run(&mut s, "component.insert_design", json!({"path": source, "name": "Plate", "reuse": reuse}));
+        let component = inserted["component"].as_u64().unwrap();
+        assert_eq!(run(&mut s, "component.metadata", json!({"component": component}))["metadata"], metadata);
+        assert_eq!(s.doc.metadata, own_metadata, "the assembly keeps its own properties");
+        let bom = run(&mut s, "assembly.bom", json!({}));
+        assert_eq!(bom["rows"][0]["part_number"], "PL-6624");
+        assert_eq!(bom["rows"][0]["description"], "Mounting plate");
+        assert_eq!(bom["rows"][0]["revision"], "B");
+        assert_eq!(bom["rows"][0]["count"], 1);
+        assert_eq!(s.undo.len(), undo + 1, "insertion including properties is one undo step");
+        run(&mut s, "edit.undo", json!({}));
+        assert!(s.doc.components.is_empty());
+        assert!(s.doc.links.is_empty());
+        run(&mut s, "edit.redo", json!({}));
+        assert_eq!(run(&mut s, "component.metadata", json!({"component": component}))["metadata"], metadata);
+
+        for (file, format) in [("assembly.json", "json"), ("assembly.solidcraft", "container")] {
+            let path = dir.join(file);
+            run(&mut s, "file.save_as", json!({"path": path, "format": format}));
+            let mut back = Session::default();
+            run(&mut back, "doc.open", json!({"path": path}));
+            assert_eq!(run(&mut back, "component.metadata", json!({"component": component}))["metadata"], metadata, "{format}");
+            assert_eq!(run(&mut back, "assembly.bom", json!({}))["rows"], bom["rows"], "{format}");
+        }
+
+        // Reusing the link shares its definition, including locally edited part properties.
+        run(&mut s, "component.metadata.set", json!({"component": component, "description": "Assembly-specific description"}));
+        run(&mut s, "component.insert_design", json!({"path": source, "reuse": true, "translate": [50, 0, 0]}));
+        let bom = run(&mut s, "assembly.bom", json!({}));
+        assert_eq!(bom["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(bom["rows"][0]["count"], 2);
+        assert_eq!(bom["rows"][0]["part_number"], "PL-6624");
+        assert_eq!(bom["rows"][0]["description"], "Assembly-specific description");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn csv_quotes_every_field_and_json_writes_the_rows() {
     let dir = scratch("export");
     let mut s = assembly();
@@ -273,5 +328,8 @@ fn body_owners_match_each_bodys_component() {
         let each: std::collections::HashSet<u64> = st.bodies.iter().map(|b| s.doc.model_body_component(b)).collect();
         assert_eq!(s.doc.body_owners(&st), each);
         assert!(each.len() > 1);
+        // The same answers body by body, in the state's order.
+        let in_order: Vec<u64> = st.bodies.iter().map(|b| s.doc.model_body_component(b)).collect();
+        assert_eq!(s.doc.model_body_components(&st), in_order);
     }
 }

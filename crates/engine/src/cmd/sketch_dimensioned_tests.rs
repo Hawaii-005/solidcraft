@@ -45,8 +45,23 @@ fn typed_line_angle_survives_quadrants_move_reopen_and_one_undo() {
     let mut reopened = Session { doc: std::sync::Arc::new(doc), active_sketch: s.active_sketch, ..Session::default() };
     reopened.refresh();
     close(measure(&reopened, |k| matches!(k, ConstraintKind::LineAngle { .. })), 90f64.to_radians());
-    run(&mut reopened, "sketch.move", json!({"entities":out["curves"],"translate":[4,3],"angle":20}));
-    close(measure(&reopened, |k| matches!(k, ConstraintKind::LineAngle { .. })), 90f64.to_radians());
+    let before_move = reopened.doc.clone();
+    for rotate_constraints in [false, true] {
+        reopened.doc = before_move.clone();
+        reopened.refresh();
+        let result =
+            run(&mut reopened, "sketch.move", json!({"entities":out["curves"],"translate":[4,3],"angle":20,"rotate_constraints":rotate_constraints}));
+        assert_eq!(result["sketch"]["solved"], true);
+        let expected = if rotate_constraints { 110.0_f64 } else { 90.0 };
+        close(measure(&reopened, |k| matches!(k, ConstraintKind::LineAngle { .. })), expected.to_radians());
+        close(measure(&reopened, |k| matches!(k, ConstraintKind::Length { .. })), 10.0);
+        assert_eq!(reopened.doc.param("heading").unwrap().expr, "90 deg");
+        let sk = sketch(&reopened);
+        let c = sk.constraints.iter().find(|c| matches!(c.kind, ConstraintKind::LineAngle { .. })).unwrap();
+        assert_eq!(reopened.doc.param(c.param.as_deref().unwrap()).unwrap().expr, if rotate_constraints { "(heading) + 20 deg" } else { "heading" });
+        run(&mut reopened, "edit.undo", json!({}));
+        close(measure(&reopened, |k| matches!(k, ConstraintKind::LineAngle { .. })), 90f64.to_radians());
+    }
     let mut atomic = session();
     draw(&mut atomic, "sketch.line", json!({"points":[[0,0],[5,5]]}), json!({"length":10,"angle":45}));
     run(&mut atomic, "edit.undo", json!({}));
@@ -74,9 +89,14 @@ fn signed_arc_sweep_retains_radius_and_logical_endpoint_identity() {
 
 #[test]
 fn slots_and_polygon_keep_permanent_typed_dimensions() {
-    for command in ["sketch.slot.center_to_center", "sketch.slot.overall"] {
+    for command in ["sketch.slot.center_to_center", "sketch.slot.overall", "sketch.slot.center_point"] {
         let mut s = session();
-        let out = draw(&mut s, command, json!({"p0":[2,3],"p1":[22,3],"width":4,"connect":false}), json!({"length":20,"width":4}));
+        let out = draw(
+            &mut s,
+            command,
+            json!({"p0":[2,3],"p1":[22,3],"center":[12,3],"end":[22,3],"width":4,"connect":false}),
+            json!({"length":20,"width":4}),
+        );
         let length = out["dimensions"]["length"]["param"].as_str().unwrap();
         let result = run(&mut s, "parameters.change", json!({"name":length,"expression":30}));
         assert_eq!(result["errors"], json!([]));
@@ -97,6 +117,28 @@ fn slots_and_polygon_keep_permanent_typed_dimensions() {
         assert_eq!(result["errors"], json!([]));
         close(measure(&s, |k| matches!(k, ConstraintKind::Radius { .. })), 15.0);
     }
+}
+
+#[test]
+fn arc_slot_dimensions_survive_parameter_edits_and_reopening() {
+    let mut s = session();
+    let out = draw(
+        &mut s,
+        "sketch.slot.arc_center",
+        json!({"center":[0,0],"start":[20,0],"end":[0,20],"width":6}),
+        json!({"radius":20,"sweep":90,"width":6}),
+    );
+    for (role, value) in [("radius", 25), ("sweep", 120), ("width", 8)] {
+        let name = out["dimensions"][role]["param"].as_str().unwrap();
+        let result = run(&mut s, "parameters.change", json!({"name":name,"expression":value}));
+        assert_eq!(result["errors"], json!([]), "{role}: {result}");
+    }
+    let doc = serde_json::from_value(serde_json::to_value(s.design()).unwrap()).unwrap();
+    let mut reopened = Session::new(doc);
+    reopened.active_sketch = s.active_sketch;
+    close(measure(&reopened, |k| matches!(k, ConstraintKind::Radius { .. })), 25.0);
+    close(measure(&reopened, |k| matches!(k, ConstraintKind::ArcSweep { .. })), 120f64.to_radians());
+    close(measure(&reopened, |k| matches!(k, ConstraintKind::Diameter { .. })), 8.0);
 }
 
 #[test]
@@ -138,6 +180,26 @@ fn invalid_dimensioned_shapes_are_atomic_including_late_constraint_failure() {
     }
     assert_eq!(before["features"].as_array().unwrap().len(), 1);
     assert!(s.undo.len() >= history);
+}
+
+#[test]
+fn a_dimensioned_midpoint_line_carries_its_length_and_angle() {
+    let mut s = session();
+    let out = draw(&mut s, "sketch.line.midpoint", json!({"mid":[0,0],"end":[10,0]}), json!({"length":20,"angle":0}));
+    assert_eq!(out["curves"].as_array().map(|c| c.len()), Some(1), "{out}");
+    close(measure(&s, |k| matches!(k, ConstraintKind::Length { .. })), 20.0);
+    close(measure(&s, |k| matches!(k, ConstraintKind::LineAngle { .. })), 0.0);
+    let sk = sketch(&s);
+    let line = sk.curve_index(out["curves"][0].as_str().unwrap()).unwrap();
+    let solidcraft_sketch::CurveKind::Line { a, b } = sk.curves[line].kind else { panic!("a line") };
+    // The clicked middle is the line's middle.
+    close((sk.points[a].pos.x + sk.points[b].pos.x) * 0.5, 0.0);
+    close((sk.points[a].pos.y + sk.points[b].pos.y) * 0.5, 0.0);
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::Midpoint { l, .. } if l == line)),
+        "the middle is constrained: {:?}",
+        sk.constraints
+    );
 }
 
 #[test]

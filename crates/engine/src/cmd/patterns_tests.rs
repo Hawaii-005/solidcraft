@@ -42,6 +42,65 @@ fn feature_pattern_plate() -> Session {
 }
 
 #[test]
+fn rectangular_hole_pattern_warns_for_copies_that_miss_and_clears_after_edit() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":40,"width":30,"height":10,"corner":[0,0,0],"body_name":"Plate"}));
+    run(&mut s, "solid.hole", json!({"position":[10,15,10],"diameter":5,"depth":10,"name":"Hole1"}));
+    let before = volume(&mut s);
+    let reply = run(
+        &mut s,
+        "solid.pattern.rectangular",
+        json!({"features":["Hole1"],"dir1":[1,0,0],"count1":2,"spacing1":45,
+            "dir2":[0,0,1],"count2":2,"spacing2":5,"name":"Pattern"}),
+    );
+    let id = reply["feature"].as_u64().unwrap();
+    let check = |session: &Session| {
+        let result = session.model.result(id).unwrap();
+        assert!(result.error.is_none(), "{result:?}");
+        assert_eq!(result.warning.as_deref(), Some("3 of 3 cut copies remove no material"));
+    };
+    check(&s);
+    assert_eq!(reply["warning"], "3 of 3 cut copies remove no material");
+    // The remaining copy lands in the existing through hole, so the plate stays intact.
+    assert!(rel(volume(&mut s), before) < 1e-8);
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    check(&reopened);
+    run(
+        &mut s,
+        "timeline.redefine",
+        json!({"feature":"Pattern","command":"solid.pattern.rectangular","params":{
+            "features":["Hole1"],"dir1":[1,0,0],"count1":2,"spacing1":45,
+            "dir2":[0,1,0],"count2":2,"spacing2":8}}),
+    );
+    assert_eq!(s.model.result(id).unwrap().warning.as_deref(), Some("2 of 3 cut copies remove no material"));
+    assert!(rel(volume(&mut s), 12000.0 - 2.0 * PI * 2.5_f64.powi(2) * 10.0) < 1e-3);
+    run(
+        &mut s,
+        "timeline.redefine",
+        json!({"feature":"Pattern","command":"solid.pattern.rectangular","params":{
+            "features":["Hole1"],"dir1":[1,0,0],"count1":2,"spacing1":15,
+            "dir2":[0,1,0],"count2":2,"spacing2":8}}),
+    );
+    assert!(s.model.result(id).unwrap().warning.is_none());
+    assert!(rel(volume(&mut s), 12000.0 - 4.0 * PI * 2.5_f64.powi(2) * 10.0) < 1e-3);
+}
+
+#[test]
+fn rectangular_cut_pattern_counts_only_target_contacts_and_keeps_landing_copies() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":40,"width":30,"height":10,"corner":[0,0,0],"body_name":"Plate"}));
+    run(&mut s, "solid.box", json!({"length":40,"width":30,"height":10,"corner":[45,0,0],"operation":"new","body_name":"Neighbor"}));
+    run(&mut s, "solid.cylinder", json!({"radius":2,"height":20,"base":[10,15,-5],"operation":"cut","targets":["Plate"],"name":"Cut"}));
+    let reply = run(&mut s, "solid.pattern.rectangular", json!({"features":["Cut"],"dir1":[1,0,0],"count1":4,"spacing1":20}));
+    assert_eq!(reply["warning"], "2 of 3 cut copies remove no material");
+    let state = s.world_state();
+    let plate = &state.body("Plate").unwrap().body;
+    assert!(!plate.contains(solidcraft_geom::Vec3::new(30., 15., 5.)));
+    assert!(state.body("Neighbor").unwrap().body.contains(solidcraft_geom::Vec3::new(50., 15., 5.)));
+    assert!(rel(volume(&mut s), 24000.0 - 2.0 * PI * 4.0 * 10.0) < 1e-3);
+}
+
+#[test]
 fn feature_rectangular_center_flip_and_oblique_direction_keep_source_and_recompute() {
     use solidcraft_geom::Vec3;
     for flipped in [false, true] {
@@ -109,6 +168,55 @@ fn feature_circular_center_flip_uses_partial_arc_endpoints_and_full_circle_spaci
             assert!(rel(volume(&mut reopened), volume(&mut s)) < 1e-8);
         }
     }
+}
+
+/// A pattern made with the timeline rolled back to the start comes before the box it copies and
+/// replays the box from its definition. A change of the box's parameter reaches the copies as it
+/// reaches the box: the pattern's result was kept (its copies the old length) because nothing
+/// before it in the timeline had changed.
+#[test]
+fn a_pattern_before_the_feature_it_copies_follows_that_features_parameter() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "w", "expression": "18 mm"}));
+    run(&mut s, "solid.box", json!({"length": "w", "width": 10, "height": 10}));
+    run(&mut s, "timeline.rollback", json!({"position": 0}));
+    run(&mut s, "solid.pattern.rectangular", json!({"features": ["Box1"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 30}));
+    let lengths = |st: &solidcraft_doc::ModelState| {
+        st.bodies.iter().map(|b| (b.name.clone(), b.body.outline_bounds())).map(|(n, bb)| (n, bb.max.x - bb.min.x)).collect::<Vec<_>>()
+    };
+    let fresh = |s: &Session| {
+        let mut m = solidcraft_doc::Model::new();
+        m.no_cache = true;
+        m.evaluate(&s.doc);
+        lengths(&m.state())
+    };
+    for step in [json!({"name": "w", "expression": "21 mm"}), json!({"name": "w", "expression": "25 mm"})] {
+        run(&mut s, "parameters.change", step);
+        assert_eq!(lengths(&s.model.state()), fresh(&s), "rolled back");
+        run(&mut s, "timeline.rollback", json!({}));
+        assert_eq!(lengths(&s.model.state()), fresh(&s), "rolled forward");
+        run(&mut s, "timeline.rollback", json!({"position": 1}));
+    }
+    run(&mut s, "timeline.rollback", json!({}));
+    let got = lengths(&s.model.state());
+    assert!(got.len() == 2 && got.iter().all(|(_, l)| (l - 25.0).abs() < 1e-9), "the box and its copy, 25 mm: {got:?}");
+}
+
+/// A pattern whose source was deleted copies nothing. A feature made later under the freed name
+/// is found by that name, after the pattern in the timeline: the model is what a fresh evaluation
+/// makes of the design, where the pattern's empty result had been kept.
+#[test]
+fn a_pattern_finds_a_later_feature_that_takes_its_deleted_sources_name() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 2, "height": 15, "axis": "Y", "base": [-16, 6, -5]}));
+    run(&mut s, "solid.pattern.rectangular", json!({"features": ["Cylinder1"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 19}));
+    run(&mut s, "timeline.delete", json!({"feature": "Cylinder1"}));
+    run(&mut s, "solid.cylinder", json!({"radius": 5, "height": 19, "base": [-3, -7, -1]}));
+    let bodies = |st: &solidcraft_doc::ModelState| st.bodies.iter().map(|b| (b.name.clone(), b.body.outline_bounds().min.x)).collect::<Vec<_>>();
+    let mut fresh = solidcraft_doc::Model::new();
+    fresh.no_cache = true;
+    fresh.evaluate(&s.doc);
+    assert_eq!(bodies(&s.model.state()), bodies(&fresh.state()));
 }
 
 #[test]
@@ -228,6 +336,35 @@ fn patterns_of_bodies() {
     run(&mut s, "solid.pattern.rectangular", json!({"bodies": ["Cube"], "dir1": [0, 0, 1], "count1": 3, "spacing1": 20}));
     assert!(rel(volume(&mut s), 6000.0) < 1e-4);
     assert!(s.execute("solid.pattern.rectangular", &json!({"bodies": ["Nope"], "dir1": [1, 0, 0], "count1": 2, "spacing1": 5})).is_err());
+}
+
+/// A construction axis picked in the dialog comes as its name (#2885): the copies turn about it,
+/// and follow it when it is edited.
+#[test]
+fn circular_pattern_about_a_construction_axis_follows_it() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 2, "width": 2, "height": 2, "corner": [40, 0, 0], "body_name": "Cube"}));
+    let axis = |x: f64| json!({"a": {"point": [x, 0, 0]}, "b": {"point": [x, 0, 10]}, "name": "Axis1"});
+    run(&mut s, "construct.axis.two_points", axis(30.0));
+    run(&mut s, "solid.pattern.circular", json!({"bodies": ["Cube"], "axis": "Axis1", "count": 4}));
+    // The x and y extent of the four cubes.
+    let span = |s: &Session| {
+        let st = s.model.state();
+        assert_eq!(st.bodies.len(), 4);
+        let mut out = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+        for b in st.bodies.iter().filter_map(|mb| solidcraft_kernel::measure(&mb.body).ok()).map(|m| m.bbox) {
+            out = [out[0].min(b.min.x), out[1].max(b.max.x), out[2].min(b.min.y), out[3].max(b.max.y)];
+        }
+        out
+    };
+    // About x = 30: the cube at x 40…42 also lands at 18…20, and at y ±(10…12).
+    for (got, want) in span(&s).into_iter().zip([18.0, 42.0, -12.0, 12.0]) {
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    }
+    run(&mut s, "timeline.redefine", json!({"feature": "Axis1", "command": "construct.axis.two_points", "params": axis(35.0)}));
+    for (got, want) in span(&s).into_iter().zip([28.0, 42.0, -7.0, 7.0]) {
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    }
 }
 
 #[test]
@@ -573,5 +710,211 @@ fn copies_of_a_join_that_merged_its_targets_join_the_merged_body() {
         // Every copy adds what the seed spoke added (curved bodies measure to about 0.02 %; a
         // missing or doubled spoke is about 5 %).
         assert!(rel(volume(&mut s), v0 + n * (v1 - v0)) < 1e-3, "{id}: {} vs {}", volume(&mut s), v0 + n * (v1 - v0));
+    }
+}
+
+/// #4593: a rib is the source of a pattern or mirror. Each copy is built again where it is, its
+/// walls run until they meet the body there. An 80 × 80 × 5 plate with a 16 × 16 × 30 boss in the
+/// middle; the rib's triangle (8, 5)-(8, 25)-(30, 5) in the XZ plane, 4 thick, is 880 mm³.
+#[test]
+fn patterns_and_mirrors_of_a_rib() {
+    use solidcraft_geom::Vec3;
+    let rib = 0.5 * 22.0 * 20.0 * 4.0;
+    let ribbed = || {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 80, "width": 80, "height": 5, "corner": [-40, -40, 0]}));
+        run(&mut s, "solid.box", json!({"length": 16, "width": 16, "height": 30, "corner": [-8, -8, 0], "operation": "join"}));
+        run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, 0], "x_dir": [1, 0, 0], "y_dir": [0, 0, 1]}, "name": "RibSketch"}));
+        run(&mut s, "sketch.line", json!({"points": [[8, 25], [30, 5]], "ids": ["l1"]}));
+        run(&mut s, "sketch.finish", json!({}));
+        let before = volume(&mut s);
+        run(&mut s, "solid.rib", json!({"sketch": "RibSketch", "curves": ["l1"], "thickness": 4, "name": "Rib"}));
+        assert!(rel(volume(&mut s), before + rib) < 1e-6, "the rib itself");
+        (s, before)
+    };
+    // The issue's step: a circular pattern of the rib (here four, a quarter turn apart).
+    let (mut s, before) = ribbed();
+    run(&mut s, "solid.pattern.circular", json!({"features": ["Rib"], "axis": {"origin": [0, 0, -100], "dir": [0, 0, 1]}, "count": 4, "angle": 360}));
+    let ribs = [Vec3::new(12.0, 0.0, 8.0), Vec3::new(0.0, 12.0, 8.0), Vec3::new(-12.0, 0.0, 8.0), Vec3::new(0.0, -12.0, 8.0)];
+    let check = |s: &Session, inside: &[Vec3]| {
+        let st = s.world_state();
+        assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results.iter().map(|r| &r.error).collect::<Vec<_>>());
+        assert_eq!(st.bodies.len(), 1);
+        let body = &st.bodies[0].body;
+        for p in inside {
+            assert!(body.contains(*p), "a rib at {p:?}");
+            // Beside it, across its thickness: no material (clear of the boss too).
+            let side = if p.y == 0.0 { Vec3::new(0.0, 3.0, 0.0) } else { Vec3::new(3.0, 0.0, 0.0) };
+            assert!(!body.contains(*p + side), "nothing beside the rib at {p:?}");
+        }
+    };
+    check(&s, &ribs);
+    assert!(rel(volume(&mut s), before + 4.0 * rib) < 1e-6, "four ribs: {} vs {}", volume(&mut s), before + 4.0 * rib);
+    // A mirror of the rib across YZ.
+    let (mut s, before) = ribbed();
+    run(&mut s, "solid.mirror", json!({"features": ["Rib"], "plane": {"origin": [0, 0, 0], "normal": [1, 0, 0]}}));
+    check(&s, &[ribs[0], ribs[2]]);
+    assert!(rel(volume(&mut s), before + 2.0 * rib) < 1e-6, "two ribs: {} vs {}", volume(&mut s), before + 2.0 * rib);
+}
+
+/// #395: a pattern or mirror of features takes a pattern or mirror of features as a source: it
+/// copies what that one made (its copies, not its source). The issue's design: a 40 × 30 × 20
+/// box with a hole `H` at (−15, −10) and `Pat`, two more holes along x at 10 mm steps.
+#[test]
+fn patterns_and_mirrors_of_patterns_and_mirrors() {
+    use solidcraft_geom::Vec3;
+    let hole = PI * 1.5 * 1.5 * 20.0;
+    let design = || {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "corner": [-20, -15, 0], "name": "Box"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Spot"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [-15, -10], "radius": 1.5}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "Spot", "through_all": true, "operation": "cut", "name": "H"}));
+        run(&mut s, "solid.pattern.rectangular", json!({"features": ["H"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 10, "name": "Pat"}));
+        s
+    };
+    let across_xz = json!({"origin": [0, 0, 0], "normal": [0, 1, 0]});
+    let across_yz = json!({"origin": [0, 0, 0], "normal": [1, 0, 0]});
+    // Each case: the steps after `design`, the holes there must be, and the spots that must
+    // stay material.
+    type Case = (Vec<(&'static str, Value)>, Vec<[f64; 2]>, Vec<[f64; 2]>);
+    let cases: Vec<(&str, Case)> = vec![
+        // The issue's step: the mirror of `Pat` is its two copies mirrored.
+        (
+            "mirror of a pattern",
+            (vec![("solid.mirror", json!({"features": ["Pat"], "plane": across_xz}))], vec![[-5.0, 10.0], [5.0, 10.0]], vec![[-15.0, 10.0]]),
+        ),
+        // With its source too: the six holes the issue expects.
+        (
+            "mirror of a hole and its pattern",
+            (
+                vec![("solid.mirror", json!({"features": ["H", "Pat"], "plane": across_xz}))],
+                vec![[-15.0, 10.0], [-5.0, 10.0], [5.0, 10.0]],
+                vec![[15.0, 10.0]],
+            ),
+        ),
+        (
+            "pattern of a pattern",
+            (
+                vec![("solid.pattern.rectangular", json!({"features": ["Pat"], "dir1": [0, 1, 0], "count1": 2, "spacing1": 20}))],
+                vec![[-5.0, 10.0], [5.0, 10.0]],
+                vec![[-15.0, 10.0]],
+            ),
+        ),
+        (
+            "mirror of a mirror",
+            (
+                vec![
+                    ("solid.mirror", json!({"features": ["H"], "plane": across_yz, "name": "Mir"})),
+                    ("solid.mirror", json!({"features": ["Mir"], "plane": across_xz})),
+                ],
+                vec![[15.0, -10.0], [15.0, 10.0]],
+                vec![[-15.0, 10.0]],
+            ),
+        ),
+        (
+            "pattern of a mirror",
+            (
+                vec![
+                    ("solid.mirror", json!({"features": ["H"], "plane": across_yz, "name": "Mir"})),
+                    ("solid.pattern.rectangular", json!({"features": ["Mir"], "dir1": [0, 1, 0], "count1": 2, "spacing1": 20})),
+                ],
+                vec![[15.0, -10.0], [15.0, 10.0]],
+                vec![[-15.0, 10.0]],
+            ),
+        ),
+    ];
+    for (what, (steps, holes, material)) in cases {
+        let mut s = design();
+        let before = volume(&mut s);
+        for (id, p) in steps {
+            run(&mut s, id, p);
+        }
+        for r in &s.model.results {
+            assert!(r.error.is_none(), "{what}: {}: {:?}", r.name, r.error);
+        }
+        let st = s.world_state();
+        assert_eq!(st.bodies.len(), 1, "{what}");
+        let body = &st.bodies[0].body;
+        for [x, y] in &holes {
+            assert!(!body.contains(Vec3::new(*x, *y, 10.0)), "{what}: a hole at ({x}, {y})");
+            assert!(body.contains(Vec3::new(*x, *y + 2.5, 10.0)), "{what}: material beside ({x}, {y})");
+        }
+        for [x, y] in &material {
+            assert!(body.contains(Vec3::new(*x, *y, 10.0)), "{what}: no hole at ({x}, {y})");
+        }
+        // The listed holes the steps added (in the last two cases `Mir` made the first of them).
+        let added = holes.len();
+        // Measured on the body's mesh, like the other tests here: to 1e-5 of the whole body.
+        let after = volume(&mut s);
+        let want = before - added as f64 * hole;
+        assert!(rel(after, want) < 1e-5, "{what}: {after} mm³, {added} more holes than {before} = {want}");
+    }
+}
+
+/// A gear's tooth extruded To Object up to the disc's top, patterned 6 times: after the disc is
+/// made twice as thick, every copy reaches the new top like the tooth itself, so the whole part
+/// doubles (#2121). The copies kept the 5 mm height of the face where it was picked.
+#[test]
+fn copies_of_a_to_object_extrude_follow_the_moved_face() {
+    let mut s = Session::default();
+    for (id, p) in [
+        ("sketch.create", json!({"plane":"XY","name":"Disc"})),
+        ("sketch.circle.center", json!({"center":[0,0],"radius":20})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"distance":5})),
+        ("sketch.create", json!({"plane":"XY","name":"Tooth"})),
+        ("sketch.rectangle.two_point", json!({"p0":[18,-2],"p1":[24,2]})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"sketch":"Tooth","profiles":[0],"to":[0,0,5],"operation":"join"})),
+        ("solid.pattern.circular", json!({"features":["Extrude2"],"axis":"Z","count":6,"angle":"360 deg"})),
+    ] {
+        run(&mut s, id, p);
+    }
+    let thin = volume(&mut s);
+    run(&mut s, "timeline.edit", json!({"feature":"Extrude1","set":{"extent.distance":"10 mm"}}));
+    let thick = volume(&mut s);
+    assert!(rel(thick, 2.0 * thin) < 1e-6, "5 mm: {thin} mm³, 10 mm: {thick} mm³ (expected {})", 2.0 * thin);
+}
+
+/// A disc with an off-centre hole whose top and bottom edges are chamfered.
+fn disc_with_chamfered_hole() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 30, "height": 10, "name": "Disc"}));
+    run(&mut s, "solid.hole", json!({"position": [20, 0, 10], "diameter": 6, "name": "Bore"}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[23, 0, 10]], "distance": 0.5, "name": "TopChamfer"}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[23, 0, 0]], "distance": 0.5, "name": "BottomChamfer"}));
+    s
+}
+
+#[test]
+fn circular_pattern_of_a_hole_and_its_chamfers_copies_all_of_them() {
+    let mut one = disc_with_chamfered_hole();
+    let v1 = volume(&mut one);
+    let mut s = disc_with_chamfered_hole();
+    let v0 = volume(&mut s);
+    assert!(rel(v0, v1) < 1e-9);
+    run(&mut s, "solid.pattern.circular", json!({"features": ["Bore", "TopChamfer", "BottomChamfer"], "axis": "Z", "count": 6, "angle": 360}));
+    let v = volume(&mut s);
+    println!("{v1} -> {v}");
+    assert!(v < v1 - 5.0 * 0.9 * (std::f64::consts::PI * 9.0 * 10.0), "pattern had no effect: {v1} -> {v}");
+}
+
+/// The features are copied in timeline order, not in the order they were picked in: a chamfer
+/// picked before its hole used to find no edge ("no edge near ...").
+#[test]
+fn pattern_of_features_picked_in_any_order_copies_them_in_timeline_order() {
+    let mut reference = disc_with_chamfered_hole();
+    run(
+        &mut reference,
+        "solid.pattern.circular",
+        json!({"features": ["Bore", "TopChamfer", "BottomChamfer"], "axis": "Z", "count": 6, "angle": 360}),
+    );
+    let expected = volume(&mut reference);
+    for picked in [["BottomChamfer", "TopChamfer", "Bore"], ["TopChamfer", "Bore", "BottomChamfer"]] {
+        let mut s = disc_with_chamfered_hole();
+        run(&mut s, "solid.pattern.circular", json!({"features": picked, "axis": "Z", "count": 6, "angle": 360}));
+        assert!(rel(volume(&mut s), expected) < 1e-9, "{picked:?}");
     }
 }

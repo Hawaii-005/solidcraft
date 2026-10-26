@@ -8,22 +8,48 @@ use std::sync::{Arc, Mutex};
 
 use egui_wgpu::wgpu;
 pub use solidcraft_gpu::view::{
-    AccessMap, BlockBytes, Frame, GpuImage, GpuScene, GpuTarget, LINE_SIZE, PBR_SIZE, PlannedBody, Renderer, SceneBlock, SceneSlot, TRI_SIZE,
+    AccessMap, BlockBytes, BlockTris, DrawStats, DrawStatsHandle, Frame, GpuImage, GpuScene, GpuTarget, INSTANCE_SIZE, InstanceLook, InstancedMesh,
+    LINE_SIZE, LOD_PX, PBR_SIZE, PlannedBody, Renderer, SHARED_SIZE, SceneBlock, SceneSlot, SharedTris, TRI_SIZE, level_for, placement_scale,
     supersampled_size,
 };
 
 /// A frame of the viewport as an egui paint callback.
 pub struct ViewportCallback(pub Frame);
 
-/// Create the pipelines. Call once with the app's render state and its depth/stencil/MSAA
-/// settings. Without a stencil the section cap does not hide the inside of cut bodies. Without
-/// `gpu_meshing` (safe mode) bodies are meshed on the CPU.
-pub fn install(rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32, gpu_meshing: bool) -> GpuTarget {
+/// Create the pipelines. Call once with the app's render state, the scene target's depth/stencil/
+/// MSAA settings, and the target of the pass the picture is shown in. Without a stencil the
+/// section cap does not hide the inside of cut bodies. Without `gpu_meshing` (safe mode) bodies
+/// are meshed on the CPU. When the two targets differ, the scene is drawn offscreen and blitted.
+/// Also returns the handle to what each frame drew.
+pub fn install(rs: &egui_wgpu::RenderState, scene: GpuTarget, window: GpuTarget, gpu_meshing: bool) -> (GpuTarget, DrawStatsHandle) {
+    log_uncaptured_errors(&rs.device);
     let tess = if gpu_meshing { solidcraft_gpu::view::tessellation(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER) } else { None };
-    let t = GpuTarget { format: rs.target_format, depth: egui_wgpu::depth_format_from_bits(depth_bits, stencil_bits), samples, tess: tess.is_some() };
-    let res = Renderer::new(&rs.device, t, tess);
+    let scene = GpuTarget { tess: tess.is_some(), ..scene };
+    let window = GpuTarget { tess: tess.is_some(), ..window };
+    let res = Renderer::with_window_target(&rs.device, scene, window, tess);
+    let stats = res.stats();
     rs.renderer.write().callback_resources.insert(res);
-    t
+    (scene, stats)
+}
+
+/// A GPU error no error scope caught is reported, never a panic: a device's default handler
+/// panics with "wgpu error: ...", which would close the app with the open design (#5486 reported
+/// "wgpu error: Out of Memory" from such a panic). The headless picture devices do the same
+/// (`Capturer::headless`). Errors the code expects are caught under error scopes where they
+/// happen, and those take priority over this handler. Errors before [`install`] (egui's own
+/// pipelines at startup) still reach the default handler, so a startup failure stays a crash
+/// report with its startup step.
+pub fn log_uncaptured_errors(device: &wgpu::Device) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let reported = std::sync::Arc::new(AtomicU32::new(0));
+    device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
+        // The first few only: an invalid resource repeats its error on every frame.
+        if reported.fetch_add(1, Ordering::Relaxed) < 8 {
+            log::error!("GPU: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            eprintln!("SolidCraft graphics: {e}");
+        }
+    }));
 }
 
 /// Draw this process's headless pictures (`ui.render`, the agent's view image, thumbnails of
@@ -33,13 +59,7 @@ pub fn install(rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, sa
 #[cfg(not(target_arch = "wasm32"))]
 pub fn install_picture_renderer(rs: &egui_wgpu::RenderState) {
     match solidcraft_gpu::capture::Capturer::new(&rs.adapter, rs.device.clone(), rs.queue.clone()) {
-        Ok(capturer) => {
-            let capturer = std::sync::Arc::new(capturer);
-            solidcraft_engine::capture::install(std::sync::Arc::new(move |scene, cam, w, h| {
-                let rgba = capturer.rgba(scene, cam, w, h).map_err(|e| e.to_string())?;
-                Ok(solidcraft_engine::capture::Picture { rgba, renderer: capturer.renderer() })
-            }));
-        }
+        Ok(capturer) => install_capturer(capturer.watching(rs.device_lost.flag())),
         Err(e) => {
             log::warn!("pictures of the model are drawn by the CPU rasterizer: the GPU cannot draw them: {e}");
             install_cpu_picture_renderer();
@@ -47,14 +67,45 @@ pub fn install_picture_renderer(rs: &egui_wgpu::RenderState) {
     }
 }
 
+/// Draw this process's headless pictures with `capturer`; once its device is lost (the graphics
+/// driver was reset, #4172) the CPU rasterizer draws them, so saving still writes a thumbnail.
+#[cfg(not(target_arch = "wasm32"))]
+fn install_capturer(capturer: solidcraft_gpu::capture::Capturer) {
+    let capturer = std::sync::Arc::new(capturer);
+    solidcraft_engine::capture::install(std::sync::Arc::new(move |scene, cam, w, h| picture(&capturer, scene, cam, w, h)));
+}
+
+/// `scene` drawn by `capturer`, or by the CPU rasterizer once its device is lost.
+#[cfg(not(target_arch = "wasm32"))]
+fn picture(
+    capturer: &solidcraft_gpu::capture::Capturer,
+    scene: &solidcraft_engine::render::Scene,
+    cam: &solidcraft_engine::render::Camera,
+    w: u32,
+    h: u32,
+) -> Result<solidcraft_engine::capture::Picture, String> {
+    match capturer.rgba(scene, cam, w, h) {
+        Ok(rgba) => Ok(solidcraft_engine::capture::Picture { rgba, renderer: capturer.renderer() }),
+        Err(solidcraft_gpu::GpuError::DeviceLost) => Ok(cpu_picture(scene, cam, w, h)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// The last tier: draw this process's headless pictures with the CPU rasterizer, and every
 /// picture says so. The app uses it when its device cannot draw pictures; the web app always
 /// does, since a browser cannot wait for the GPU to hand a picture back.
 pub fn install_cpu_picture_renderer() {
-    solidcraft_engine::capture::install(std::sync::Arc::new(|scene, cam, w, h| {
-        let canvas = solidcraft_engine::render::render(scene, cam, w as usize, h as usize);
-        Ok(solidcraft_engine::capture::Picture { rgba: canvas.rgba, renderer: "cpu" })
-    }));
+    solidcraft_engine::capture::install(std::sync::Arc::new(|scene, cam, w, h| Ok(cpu_picture(scene, cam, w, h))));
+}
+
+fn cpu_picture(
+    scene: &solidcraft_engine::render::Scene,
+    cam: &solidcraft_engine::render::Camera,
+    w: u32,
+    h: u32,
+) -> solidcraft_engine::capture::Picture {
+    let canvas = solidcraft_engine::render::render(scene, cam, w as usize, h as usize);
+    solidcraft_engine::capture::Picture { rgba: canvas.rgba, renderer: "cpu" }
 }
 
 #[cfg(test)]
@@ -134,9 +185,13 @@ pub(crate) fn offscreen_backends() -> wgpu::Backends {
 }
 
 /// A device of its own for an offscreen render or check (`None` without a GPU adapter), on
-/// [`offscreen_backends`].
+/// [`offscreen_backends`]. One test at a time starts its instance, adapter and device: starting an
+/// instance scans the Vulkan drivers, and tests doing that side by side crashed the test process
+/// inside the Vulkan loader (`loader_icd_scan`). Rendering on the devices still runs side by side.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn offscreen_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = STARTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
     desc.backends = offscreen_backends();
     let instance = wgpu::Instance::new(desc);
@@ -185,7 +240,7 @@ pub(crate) fn render_offscreen(
         back,
         eye,
         size,
-        Offscreen { tess, product: false, srgb: false, analysis, analysis_colors: colors, ssaa: 1.0 },
+        Offscreen { tess, product: false, srgb: false, analysis, analysis_colors: colors, ssaa: 1.0, ao_radius: 0.0 },
     )
 }
 
@@ -205,7 +260,7 @@ pub(crate) fn render_product_offscreen(
         back,
         eye,
         size,
-        Offscreen { tess: None, product: true, srgb, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa: 1.0 },
+        Offscreen { tess: None, product: true, srgb, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa: 1.0, ao_radius: 0.0 },
     )
 }
 
@@ -217,6 +272,7 @@ struct Offscreen<'a> {
     analysis: [f32; 8],
     analysis_colors: [f32; 36],
     ssaa: f32,
+    ao_radius: f32,
 }
 
 /// [`render_offscreen`] of a scene supersampled `ssaa` times (1: off).
@@ -236,7 +292,28 @@ pub(crate) fn render_offscreen_ssaa(
         back,
         eye,
         size,
-        Offscreen { tess: None, product: false, srgb: false, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa },
+        Offscreen { tess: None, product: false, srgb: false, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa, ao_radius: 0.0 },
+    )
+}
+
+/// [`render_offscreen`] of a scene with ambient occlusion of `ao_radius` (world units; 0: off).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn render_offscreen_ao(
+    scene: GpuScene,
+    view_proj: [[f32; 4]; 4],
+    back: [f32; 3],
+    eye: [f32; 4],
+    size: u32,
+    ao_radius: f32,
+) -> Option<Vec<u8>> {
+    offscreen(
+        scene,
+        None,
+        view_proj,
+        back,
+        eye,
+        size,
+        Offscreen { tess: None, product: false, srgb: false, analysis: [0.0; 8], analysis_colors: [0.0; 36], ssaa: 1.0, ao_radius },
     )
 }
 
@@ -250,7 +327,7 @@ fn offscreen(
     size: u32,
     options: Offscreen<'_>,
 ) -> Option<Vec<u8>> {
-    let Offscreen { tess, product, srgb, analysis, analysis_colors, ssaa } = options;
+    let Offscreen { tess, product, srgb, analysis, analysis_colors, ssaa, ao_radius } = options;
     let (adapter, device, queue) = offscreen_device()?;
     eprintln!("offscreen adapter: {:?}", adapter.get_info().backend);
     let format = if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
@@ -282,8 +359,10 @@ fn offscreen(
         access: None,
         outline: false,
         eye,
-        ao_radius: 0.0,
+        ao_radius,
         ssaa,
+        hover_tint: [0.0; 3],
+        selection_tint: [0.0; 3],
     });
     let texture = |format, usage| {
         device.create_texture(&wgpu::TextureDescriptor {
@@ -370,5 +449,43 @@ mod tests {
             let used = Backends::from(adapter.get_info().backend);
             assert!(chosen.contains(used), "the offscreen device runs on {used:?}, not on {chosen:?}");
         }
+    }
+    /// A device the driver loses (#4172): its lost callback marks it, the painter's probe sees it
+    /// before the next frame's uploads, those uploads no longer reach the device (they panicked
+    /// inside wgpu when they were the first to meet the loss), and pictures (thumbnails of saves)
+    /// come from the CPU rasterizer. `destroy` loses the device as a driver reset does; wgpu calls
+    /// the lost callback of a destroyed device once it has polled.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_lost_device_stops_drawing_and_pictures_fall_back_to_the_cpu() {
+        use egui_wgpu::wgpu;
+        let Some((adapter, device, queue)) = super::offscreen_device() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let lost = egui_wgpu::DeviceLost::watch(&device);
+        let capturer = solidcraft_gpu::capture::Capturer::new(&adapter, device.clone(), queue.clone()).unwrap().watching(lost.flag());
+        let (scene, cam) = (solidcraft_engine::render::Scene::default(), solidcraft_engine::render::Camera::default());
+        assert_ne!(super::picture(&capturer, &scene, &cam, 16, 16).unwrap().renderer, "cpu");
+        assert!(!lost.probe(&queue), "a working device isn't lost");
+
+        // egui's renderer is made with the window, before any loss (made on a lost device, its
+        // uniform buffer's `create_buffer_init` panics).
+        let mut renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8Unorm, Default::default());
+
+        device.destroy();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        assert!(lost.is_lost() && lost.probe(&queue), "the lost callback marked the device");
+        assert!(lost.reason().is_some_and(|r| r.starts_with("Destroyed")), "{:?}", lost.reason());
+
+        // The next frame's uploads, as the painter would make them were it not skipping: wgpu
+        // knows the device is lost, so they fail quietly instead of panicking.
+        let image = egui::ImageData::Color(std::sync::Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)));
+        let delta = egui::epaint::ImageDelta::full(image, egui::TextureOptions::LINEAR);
+        renderer.update_texture(&device, &queue, egui::TextureId::Managed(0), &delta);
+
+        // A save's thumbnail still comes: from the CPU rasterizer.
+        let picture = super::picture(&capturer, &scene, &cam, 16, 16).unwrap();
+        assert_eq!((picture.renderer, picture.rgba.len()), ("cpu", 16 * 16 * 4));
     }
 }

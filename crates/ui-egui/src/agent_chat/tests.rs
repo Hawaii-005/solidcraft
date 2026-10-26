@@ -7,6 +7,97 @@ fn chat() -> AgentChat {
     c
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn app_with_discovered_login() -> SolveApp {
+    let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+    app.agent_chat.detection = Some(discover::Detection {
+        found: vec![discover::Found {
+            id: "qwen",
+            name: "Qwen Code",
+            argv: vec!["qwen".into(), "--acp".into()],
+            version: None,
+            login: discover::Login::LooksLoggedIn,
+        }],
+        ..Default::default()
+    });
+    app.agent_chat.running_id = "qwen".into();
+    app
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn agent_login_file_does_not_claim_a_verified_sign_in() {
+    let app = app_with_discovered_login();
+    assert_eq!(agents::current(&app).unwrap().login, "login_found");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn agent_login_follows_chat_authentication_results() {
+    let mut app = app_with_discovered_login();
+    app.preferences.agents.push(agents::AgentConfig { id: "other".into(), name: "Other agent".into(), ..Default::default() });
+    app.agent_chat.on_event(Event::AuthRequired { methods: vec![] });
+    assert_eq!(agents::current(&app).unwrap().login, "signed_out");
+    assert_eq!(agents::entries(&app).iter().find(|e| e.id == "other").unwrap().login, "");
+    app.agent_chat.settings.tests.insert("qwen".into(), settings::Test::Done(Err(backend::TestError::AuthRequired)));
+    app.agent_chat.on_event(Event::Ready { agent: "Qwen Code".into(), images: false });
+    assert_eq!(agents::current(&app).unwrap().login, "signed_in");
+    assert!(!app.agent_chat.settings.tests.contains_key("qwen"), "a newer chat clears the stale test error");
+    app.agent_chat.on_event(Event::AuthRequired { methods: vec![] });
+    assert_eq!(agents::current(&app).unwrap().login, "signed_out");
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_login_test_results_override_discovery() {
+    // A real local ACP subprocess: initialize succeeds, session/new rejects the expired login.
+    let script = r#"
+read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"fake","version":"1"}}}'
+read -r session
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"credentials expired"}}'
+while IFS= read -r line; do :; done
+"#;
+    let argv = vec!["sh".into(), "-c".into(), script.into()];
+    let result = acp_client::test_agent(&argv, &std::env::temp_dir());
+    assert_eq!(result, Err(backend::TestError::AuthRequired), "keep the protocol error, not translated text");
+    let mut app = app_with_discovered_login();
+    let complete = |app: &mut SolveApp, result| {
+        let (tx, rx) = channel();
+        app.agent_chat.settings.tests.insert("qwen".into(), settings::Test::Running(rx));
+        tx.send(result).unwrap();
+        frame(app);
+    };
+    complete(&mut app, result);
+    assert_eq!(agents::current(&app).unwrap().login, "signed_out");
+    complete(&mut app, Err(backend::TestError::Other("connection failed".into())));
+    assert_eq!(agents::current(&app).unwrap().login, "signed_out", "transport errors aren't login evidence");
+    let success = script.replace(r#""error":{"code":-32000,"message":"credentials expired"}"#, r#""result":{"sessionId":"test"}"#);
+    let result = acp_client::test_agent(&["sh".into(), "-c".into(), success], &std::env::temp_dir());
+    assert!(result.is_ok(), "{result:?}");
+    complete(&mut app, result);
+    assert_eq!(agents::current(&app).unwrap().login, "signed_in");
+    complete(&mut app, Err(backend::TestError::Other("connection failed".into())));
+    assert_eq!(agents::current(&app).unwrap().login, "signed_in");
+    app.agent_chat.on_event(Event::AuthRequired { methods: vec![] });
+    frame(&mut app);
+    assert_eq!(agents::current(&app).unwrap().login, "signed_out", "an old test cannot overwrite newer chat evidence");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn agent_login_refresh_returns_to_unverified_discovery() {
+    let mut app = app_with_discovered_login();
+    app.agent_chat.on_event(Event::AuthRequired { methods: vec![] });
+    app.agent_chat.settings.tests.insert("qwen".into(), settings::Test::Done(Err(backend::TestError::AuthRequired)));
+    let (tx, rx) = channel();
+    app.agent_chat.detecting = Some(rx);
+    tx.send(app.agent_chat.detection.clone().unwrap()).unwrap();
+    frame(&mut app);
+    assert_eq!(agents::current(&app).unwrap().login, "login_found");
+    assert!(!app.agent_chat.settings.tests.contains_key("qwen"));
+}
+
 #[test]
 fn streamed_text_joins_and_tool_updates_change_their_call() {
     let mut c = chat();
@@ -39,7 +130,7 @@ fn a_sign_in_request_keeps_the_question_for_after_the_login() {
 #[test]
 fn a_plan_update_replaces_the_turns_plan() {
     let mut c = chat();
-    c.push(Item::User { text: "go".into(), image: false, pictures: Vec::new(), files: Vec::new() });
+    c.push(Item::User { text: "go".into(), image: false, pictures: Vec::new(), files: Vec::new(), context: Context::default() });
     c.on_event(Event::Plan(vec![("a".into(), "pending".into())]));
     c.on_event(Event::Text { thought: false, text: "working".into() });
     c.on_event(Event::Plan(vec![("a".into(), "completed".into())]));
@@ -145,6 +236,7 @@ fn file_actions_wait_for_the_user() {
 #[test]
 fn the_gate_refuses_and_limits() {
     let (mut app, tx) = app_in_a_turn();
+    assert_eq!(app.preferences.agent_chat_turn_limit, 0, "no limit by default");
     app.preferences.agent_chat_turn_limit = 2;
     let crash = ask(&tx, "engine.execute", json!({"command": "diagnostics.crash_reports", "params": {}}));
     let quit = ask(&tx, "app.quit", json!({"force": true}));
@@ -175,6 +267,7 @@ fn merging_finds_the_turns_start_when_the_history_was_trimmed() {
         doc: d.clone(),
         active_sketch: None,
         pending_moves: Default::default(),
+        visibility: Default::default(),
     };
     let docs: Vec<_> = (0..6).map(doc).collect();
     // The turn began at depth 3 with docs[3]; the history then lost its oldest step.
@@ -452,7 +545,9 @@ impl ChatBackend for Script {
     fn set_model(&mut self, model: &str) {
         self.calls.lock().unwrap().push(format!("set_model: {model}"));
     }
-    fn answer_permission(&mut self, _: u64, _: Option<&str>) {}
+    fn answer_permission(&mut self, key: u64, option: Option<&str>) {
+        self.calls.lock().unwrap().push(format!("permission: {key} {option:?}"));
+    }
     fn authenticate(&mut self, _: &str) {}
     fn shutdown(&mut self, _: bool) {}
 }
@@ -468,6 +563,262 @@ fn app_with_script() -> (SolveApp, Script, egui::Context) {
 
 fn ended(script: &Script, reason: &str) {
     script.report(Event::TurnEnded { reason: reason.into() });
+}
+
+#[test]
+fn document_tabs_keep_their_conversations_and_backend_context() {
+    let (mut app, first, ctx) = app_with_script();
+    app.agent_chat.open = true;
+    app.agent_chat.control_starter = Some(Box::new(|_| Some(12345)));
+    app.agent_chat.tools_port = Some(12345);
+    app.agent_chat.settings.add = Some(settings::AddState::default());
+    app.agent_chat.agent_id = Some("first-agent".into());
+    app.agent_chat.input = "first draft".into();
+    app.agent_chat.attach_view = true;
+    app.agent_chat.add_file(attach::Attachment::imported("sample.step".into()));
+    send(&mut app, &ctx, "first request".into());
+    send(&mut app, &ctx, "first follow-up".into());
+
+    crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
+    assert!(app.agent_chat.items.is_empty() && app.agent_chat.input.is_empty());
+    assert!(app.agent_chat.pending.is_empty() && app.agent_chat.attachments.is_empty());
+    assert!(app.agent_chat.backend.is_none() && app.agent_chat.agent_id.is_none());
+    assert!(app.agent_chat.tools_port.is_none() && app.agent_chat.tools_rx.is_none());
+    assert!(!app.agent_chat.attach_view);
+    assert!(app.agent_chat.open && app.agent_chat.control_starter.is_some());
+    assert!(app.agent_chat.settings.add.is_some(), "settings belong to the window");
+    assert!(first.calls().iter().any(|c| c == "cancel"));
+
+    let second = Script::default();
+    app.agent_chat.backend = Some(Box::new(second.clone()));
+    app.agent_chat.state = Some(State::Ready);
+    app.agent_chat.input = "second draft".into();
+    send(&mut app, &ctx, "second request".into());
+    ended(&second, "");
+    poll(&mut app, &ctx);
+    ended(&first, "cancelled");
+    crate::documents::switch(&mut app, 0);
+    poll(&mut app, &ctx);
+    assert_eq!(app.agent_chat.input, "first draft");
+    assert_eq!(app.agent_chat.agent_id.as_deref(), Some("first-agent"));
+    assert_eq!(app.agent_chat.tools_port, Some(12345), "the endpoint belongs to its conversation");
+    assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::User { files, .. } if files.iter().any(|name| name == "sample.step"))));
+    assert_eq!(texts(&app), ["first follow-up"]);
+    assert!(app.agent_chat.stopped, "returning must not send the stopped queue");
+    assert_eq!(first.prompts().len(), 1);
+    assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::User { text, .. } if text == "first request")));
+    assert!(!app.agent_chat.items.iter().any(|i| matches!(i, Item::User { text, .. } if text == "second request")));
+    assert!(app.agent_chat.attach_view);
+
+    // Closing an earlier tab shifts indices, but the surviving backend and draft stay together.
+    crate::documents::close(&mut app, 0, true);
+    assert_eq!(app.docs.active, 0);
+    assert_eq!(app.agent_chat.input, "second draft");
+    assert!(!app.agent_chat.stopped, "leaving an idle conversation does not stop a turn");
+    send(&mut app, &ctx, "second continuation".into());
+    assert_eq!(second.prompts().len(), 2, "the same backend retains this tab's context");
+    crate::documents::close(&mut app, 0, true);
+    assert!(app.agent_chat.items.is_empty() && app.agent_chat.backend.is_none());
+    assert!(app.agent_chat.open && app.agent_chat.control_starter.is_some());
+}
+
+#[test]
+fn leaving_during_startup_or_sign_in_keeps_the_unsent_message_for_send() {
+    for state in [State::Starting, State::NeedsAuth] {
+        let (mut app, script, ctx) = app_with_script();
+        app.agent_chat.state = Some(state);
+        app.agent_chat.add_file(attach::Attachment::imported("sample.step".into()));
+        send(&mut app, &ctx, "waiting request".into());
+        assert!(script.prompts().is_empty());
+        assert!(app.agent_chat.queued.is_some());
+        crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
+        // Both events may have been buffered while the original tab was hidden.
+        script.report(Event::AuthRequired { methods: Vec::new() });
+        script.report(Event::Ready { agent: "scripted".into(), images: false });
+        crate::documents::switch(&mut app, 0);
+        poll(&mut app, &ctx);
+        assert!(script.prompts().is_empty(), "returning must not send a startup or sign-in retry");
+        assert!(app.agent_chat.queued.is_none());
+        assert_eq!(texts(&app), ["waiting request"]);
+        assert_eq!(app.agent_chat.pending[0].files[0].name, "sample.step");
+        send_now(&mut app, &ctx);
+        assert_eq!(script.prompts().len(), 1, "an explicit Send resumes the message");
+        assert_eq!(app.agent_chat.items.iter().filter(|i| matches!(i, Item::User { text, .. } if text == "waiting request")).count(), 1);
+    }
+}
+
+#[test]
+fn a_late_sign_in_retry_or_permission_cannot_restart_a_departed_turn() {
+    let (mut app, script, ctx) = app_with_script();
+    send(&mut app, &ctx, "first request".into());
+    crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
+    script.report(Event::Permission {
+        key: 7,
+        title: "mcp__solidcraft__batch".into(),
+        options: vec![PermissionOption { id: "allow".into(), name: "Allow".into(), kind: "allow_once".into() }],
+    });
+    ended(&script, "auth");
+    script.report(Event::AuthRequired { methods: Vec::new() });
+    script.report(Event::Ready { agent: "scripted".into(), images: false });
+    crate::documents::switch(&mut app, 0);
+    poll(&mut app, &ctx);
+    assert!(script.calls().iter().any(|c| c == "permission: 7 None"), "late permission is cancelled even for our own tools");
+    assert_eq!(app.agent_chat.waiting(), 0);
+    assert_eq!(script.prompts().len(), 1, "a cancelled turn must not retry after sign-in");
+    assert!(app.agent_chat.turn.is_none() && app.agent_chat.queued.is_none());
+}
+
+#[test]
+fn programmatic_replacement_clears_the_conversation_and_invalidates_its_requests() {
+    for command in ["file.new", "FILE.NEW"] {
+        let (mut app, script, ctx) = app_with_script();
+        let (tx, rx) = channel();
+        app.agent_chat.tools_rx = Some(rx);
+        send(&mut app, &ctx, "first request".into());
+        let queued = ask(&tx, "engine.execute", boxed(0.0));
+        pump_tools(&mut app);
+        app.run(command, json!({})).unwrap();
+        app.drain_control(&ctx);
+        assert_eq!(queued.try_recv().unwrap()["ok"], false);
+        assert!(app.agent_chat.items.is_empty() && app.agent_chat.backend.is_none());
+        assert!(app.session.doc.features.is_empty() && app.session.undo.is_empty());
+        assert!(script.calls().iter().any(|c| c == "cancel"));
+    }
+}
+
+#[test]
+fn a_script_resets_chat_only_after_a_replacement_succeeds() {
+    for (steps, replaced) in [
+        (json!([{"command": "missing.command"}, {"command": "file.new"}]), false),
+        (json!([{"command": "file.new"}]), true),
+        (json!([{"id": "FILE.NEW"}]), true),
+        (json!([{"command": "file.new"}, {"command": "missing.command"}]), true),
+    ] {
+        for params in [steps.clone(), json!({"commands": steps})] {
+            let (mut app, _script, ctx) = app_with_script();
+            send(&mut app, &ctx, "first request".into());
+            let (req, reply) = ControlRequest::new("engine.script", params);
+            app.run_control(&ctx, req);
+            assert!(reply.try_recv().is_ok());
+            assert_eq!(app.agent_chat.backend.is_none(), replaced);
+            assert_eq!(app.agent_chat.items.is_empty(), replaced);
+            assert_eq!(app.agent_chat.turn.is_none(), replaced);
+        }
+    }
+}
+
+#[test]
+fn leaving_a_tab_refuses_computation_and_export_replies() {
+    // The export deliberately omits its path: even a worker's error must be replaced by
+    // cancellation after leaving, without writing a file or echoing into another document.
+    for params in [boxed(0.0), json!({"command": "file.export", "params": {}})] {
+        let (mut app, tx) = app_in_a_turn();
+        let ctx = crate::fonts::test_context();
+        app.apply_off_thread = Some(std::time::Duration::ZERO);
+        app.preferences.agent_off_thread = true;
+        app.preferences.ai_permissions = agents::Mode::All;
+        let reply = ask(&tx, "engine.execute", params);
+        pump_tools(&mut app);
+        app.drain_control(&ctx);
+        assert!(app.control_job.is_some() || !app.control_answering.is_empty(), "the worker result waits for a later frame");
+        crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
+        let incoming = app.session.doc.clone();
+        let log = app.session.log.clone();
+        app.poll_control_jobs(&ctx);
+        let response = reply.try_recv().expect("cancellation must not wait for the worker");
+        assert_eq!(response["ok"], false);
+        assert!(response["error"].as_str().is_some_and(|e| e.contains("document tab was left")));
+        assert!(app.control_job.is_none() && app.control_answering.is_empty());
+        assert!(Arc::ptr_eq(&app.session.doc, &incoming));
+        assert_eq!(app.session.log, log);
+        assert!(app.session.undo.is_empty());
+        crate::documents::switch(&mut app, 0);
+        assert!(app.session.doc.features.is_empty() && app.session.undo.is_empty());
+    }
+}
+
+#[test]
+fn leaving_a_tab_refuses_admitted_commands_animations_and_screenshots() {
+    for animate in [false, true] {
+        let (mut app, tx) = app_in_a_turn();
+        let ctx = crate::fonts::test_context();
+        app.ui.agent_cursor.show = animate;
+        crate::scenario::publish_handle("toolbar:solid.box", egui::pos2(100.0, 100.0));
+        app.ui.agent_cursor.speed = crate::agent_cursor::Speed::Times(1.0);
+        let change = ask(&tx, "engine.execute", boxed(0.0));
+        let shot = ask(&tx, "ui.screenshot", json!({}));
+        pump_tools(&mut app);
+        // Capture a request already waiting for a frame, as well as a queued command.
+        let screenshot = app.control_held.pop_back().unwrap();
+        app.run_control(&ctx, screenshot);
+        assert_eq!(app.pending_shots.len(), 1);
+        if animate {
+            app.drain_control(&ctx);
+            assert!(app.agent.busy(), "the command is waiting on cursor animation");
+        }
+        crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
+        let other = app.session.doc.clone();
+        app.drain_control(&ctx);
+        crate::agent_cursor::step(&mut app, &ctx);
+        app.collect_screenshots(&ctx);
+        for reply in [change, shot] {
+            let response = reply.try_recv().expect("cancelled requests answer without running");
+            assert_eq!(response["ok"], false);
+            assert!(response["error"].as_str().is_some_and(|e| e.contains("document tab was left")));
+        }
+        assert!(Arc::ptr_eq(&app.session.doc, &other));
+        assert!(app.session.undo.is_empty() && app.pending_shots.is_empty());
+        assert!(app.queued_shots.is_empty(), "a cancelled screenshot must not capture the incoming tab");
+        crate::documents::switch(&mut app, 0);
+        assert!(app.session.doc.features.is_empty() && app.session.undo.is_empty());
+        // Adopting into a blank tab replaces the document and clears its old conversation.
+        app.agent_chat.input = "discarded draft".into();
+        crate::documents::adopt(&mut app, solidcraft_engine::Session::default());
+        assert!(app.agent_chat.input.is_empty() && app.agent_chat.items.is_empty());
+    }
+}
+
+#[test]
+fn late_events_approvals_and_undo_stay_with_the_originating_document() {
+    let (mut app, first, ctx) = app_with_script();
+    let (tx, rx) = channel();
+    app.agent_chat.tools_rx = Some(rx);
+    send(&mut app, &ctx, "make two blocks".into());
+    for x in [0.0, 20.0] {
+        let reply = ask(&tx, "engine.execute", boxed(x));
+        frame(&mut app);
+        assert_eq!(reply.try_recv().unwrap()["ok"], true);
+    }
+    assert_eq!(app.session.undo.len(), 2);
+    app.preferences.ai_permissions = agents::Mode::Ask;
+    let held = ask(&tx, "engine.execute", boxed(40.0));
+    pump_tools(&mut app);
+    assert_eq!(app.agent_chat.waiting(), 1);
+    crate::documents::open_tab(&mut app, solidcraft_engine::Session::default()).unwrap();
+    assert_eq!(held.try_recv().unwrap()["ok"], false);
+    assert_eq!(app.agent_chat.waiting(), 0);
+    first.report(Event::Text { thought: false, text: "Stopped in the first design".into() });
+    ended(&first, "cancelled");
+    let late = ask(&tx, "engine.execute", boxed(60.0));
+    frame(&mut app);
+    assert!(app.agent_chat.items.is_empty());
+    assert!(app.session.doc.features.is_empty() && app.session.undo.is_empty());
+    assert!(matches!(late.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+
+    crate::documents::switch(&mut app, 0);
+    frame(&mut app);
+    assert_eq!(late.try_recv().unwrap()["ok"], false);
+    assert_eq!(app.session.doc.features.len(), 2);
+    assert_eq!(app.session.undo.len(), 1, "the outgoing turn merged only its own undo");
+    let changes = app.agent_chat.items.iter().position(|i| matches!(i, Item::Changes { steps: 2, .. })).unwrap();
+    assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::Agent { text, .. } if text == "Stopped in the first design")));
+    undo_changes(&mut app, changes);
+    assert!(app.session.doc.features.is_empty());
+    crate::documents::switch(&mut app, 1);
+    app.preferences.ai_features = false;
+    poll(&mut app, &ctx);
+    crate::documents::switch(&mut app, 0);
+    assert!(app.agent_chat.backend.is_none(), "disabling AI stops hidden conversations too");
 }
 
 fn texts(app: &SolveApp) -> Vec<String> {
@@ -801,6 +1152,78 @@ fn the_remembered_model_is_set_on_the_next_session() {
     script.report(Event::Ready { agent: "fake".into(), images: false });
     poll(&mut app, &ctx);
     assert_eq!(script.calls().len(), 1);
+}
+
+fn provider_models() -> Vec<acp::ModelInfo> {
+    let m = |id: &str, name: &str, description: &str| acp::ModelInfo { id: id.into(), name: name.into(), description: description.into() };
+    vec![
+        m("nous:anthropic/opus", "Nous Portal · anthropic/opus", "Provider: Nous Portal"),
+        m("nous:deepseek/v4", "Nous Portal · deepseek/v4", "Provider: Nous Portal"),
+        m("custom:host:deepseek-v4.1-flash", "deepseek-v4.1-flash", "Provider: Host • current"),
+        m("custom:host:haiku", "haiku", "Provider: Host"),
+        m("plain", "plain", ""),
+    ]
+}
+
+/// Models from several providers: the header picks a provider, then one of its models, listed
+/// without the provider in front. Picking a provider alone leaves the agent's model as it is.
+#[test]
+fn models_from_several_providers_are_picked_by_provider_first() {
+    let (mut app, script, ctx) = app_with_script();
+    app.agent_chat.running_id = "hermes".into();
+    script.report(Event::Models { current: "custom:host:deepseek-v4.1-flash".into(), available: provider_models() });
+    poll(&mut app, &ctx);
+    let providers = model_providers(&app);
+    assert_eq!(providers, [("Nous Portal".to_string(), 2), ("Host".to_string(), 2), ("Other".to_string(), 1)]);
+    assert_eq!(shown_provider(&app).as_deref(), Some("Host"), "the current model's provider");
+    let names = |app: &SolveApp| listed_models(app).into_iter().map(|(_, n)| n).collect::<Vec<_>>();
+    assert_eq!(names(&app), ["deepseek-v4.1-flash", "haiku"]);
+    set_model_provider(&mut app, "Nous Portal");
+    set_model_provider(&mut app, "nonsense");
+    assert_eq!(names(&app), ["anthropic/opus", "deepseek/v4"]);
+    assert!(script.calls().is_empty(), "picking a provider sends nothing");
+    assert_eq!(app.agent_chat.model, "custom:host:deepseek-v4.1-flash");
+    let s = status(&app);
+    assert_eq!(s["provider"], "Nous Portal");
+    assert_eq!(s["providers"][0], json!({"name": "Nous Portal", "count": 2}));
+    set_model(&mut app, "nous:deepseek/v4");
+    assert_eq!(script.calls(), ["set_model: nous:deepseek/v4"]);
+    assert_eq!(shown_provider(&app).as_deref(), Some("Nous Portal"));
+    // The agent switching to another provider's model shows that provider.
+    set_model_provider(&mut app, "Host");
+    script.report(Event::Models { current: "plain".into(), available: vec![] });
+    poll(&mut app, &ctx);
+    assert_eq!(shown_provider(&app).as_deref(), Some("Other"));
+    assert_eq!(names(&app), ["plain"]);
+}
+
+/// Models from one provider, or with none named: one list, every model as the agent names it.
+#[test]
+fn models_from_one_provider_keep_one_list() {
+    let (mut app, script, ctx) = app_with_script();
+    script.report(models_reply("fast"));
+    poll(&mut app, &ctx);
+    assert!(model_providers(&app).is_empty());
+    assert_eq!(shown_provider(&app), None);
+    assert_eq!(listed_models(&app).into_iter().map(|(_, n)| n).collect::<Vec<_>>(), ["FAST", "SMART"]);
+    assert_eq!(status(&app)["provider"], Value::Null);
+    let one = |name: &str| acp::ModelInfo { id: name.into(), name: format!("Only · {name}"), description: String::new() };
+    script.report(Event::Models { current: "a".into(), available: vec![one("a"), one("b")] });
+    poll(&mut app, &ctx);
+    assert!(model_providers(&app).is_empty(), "a single provider needs no provider picker");
+    assert_eq!(listed_models(&app)[0].1, "Only · a");
+}
+
+/// A provider name from the agent is bounded, and `·` or `Provider:` without a name is no provider.
+#[test]
+fn hostile_provider_names_are_bounded() {
+    let m = |name: String, description: &str| acp::ModelInfo { id: "x".into(), name, description: description.into() };
+    let long = "p".repeat(10_000);
+    let (provider, name) = model_provider(&m(format!("{long} · model"), "")).unwrap();
+    assert_eq!((provider.chars().count(), name.as_str()), (128, "model"));
+    assert_eq!(model_provider(&m(" · model".into(), "")), None);
+    assert_eq!(model_provider(&m("model".into(), "Provider:  ")), None);
+    assert_eq!(model_provider(&m("model".into(), "Provider: A\nsecond line • current")).map(|p| p.0), Some("A".into()));
 }
 
 /// An agent that reports no models gets no picker; another agent's choice is not applied to it.
@@ -1413,6 +1836,122 @@ fn an_agents_markdown_is_drawn_as_blocks() {
     h.frames(3);
 }
 
+// ---- Attach selection (#2286) ----
+
+/// A 40 x 30 x 20 block, its first face and first edge as the selection would hold them, its body
+/// and its feature.
+fn box_selection(app: &mut SolveApp) -> Vec<solidcraft_engine::Sel> {
+    use solidcraft_engine::Sel;
+    app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).expect("a box");
+    let face = app.session.execute("model.faces", &json!({"body": "Body1"})).expect("faces")["faces"][0].clone();
+    let edge = app.session.execute("model.edges", &json!({"body": "Body1"})).expect("edges")["edges"][0].clone();
+    let at = |v: &Value| solidcraft_engine::geom::Vec3::new(v[0].as_f64().unwrap_or(0.0), v[1].as_f64().unwrap_or(0.0), v[2].as_f64().unwrap_or(0.0));
+    vec![
+        Sel::Face { body: "Body1".into(), index: face["index"].as_u64().unwrap_or(0) as usize, point: at(&face["point"]) },
+        Sel::Edge { body: "Body1".into(), index: edge["index"].as_u64().unwrap_or(0) as usize, point: at(&edge["mid"]) },
+        Sel::Feature { id: app.session.doc.features.first().map(|f| f.id).expect("a feature") },
+        Sel::Body { name: "Body1".into() },
+    ]
+}
+
+/// With Attach selection on, the message goes with what is selected: the agent gets it as text
+/// after the message, the conversation shows the message as typed with the items as chips.
+#[test]
+fn an_attached_selection_goes_as_text_for_the_agent_and_as_chips_in_the_conversation() {
+    let (mut app, script, ctx) = app_with_script();
+    app.session.selection = box_selection(&mut app);
+    // Off: the message is just the message.
+    send(&mut app, &ctx, "plain".into());
+    assert_eq!(script.calls(), ["prompt: plain"]);
+    ended(&script, "");
+    poll(&mut app, &ctx);
+
+    app.agent_chat.attach_selection = true;
+    send(&mut app, &ctx, "round this".into());
+    let prompt = script.calls().pop().expect("a prompt");
+    assert!(prompt.starts_with("prompt: round this\n\n[Selected in SolidCraft"), "{prompt}");
+    for want in ["Elements:", "- Flat face ", "planar", "area ", "- Edge ", "length ", "name ", "Features:", "feature id", "Bodies:", "- Body1"] {
+        assert!(prompt.contains(want), "{want:?} missing from {prompt}");
+    }
+    let Some(Item::User { text, context, .. }) = app.agent_chat.items.last() else { panic!("a sent message") };
+    assert_eq!(text, "round this", "the conversation shows what was typed");
+    assert_eq!(context.items.len(), 4);
+    let kinds: Vec<_> = context.items.iter().map(|i| i.kind).collect();
+    assert_eq!(kinds, [context::Kind::Element, context::Kind::Element, context::Kind::Feature, context::Kind::Body]);
+    // Nothing selected: nothing is added, and the box stays ticked.
+    ended(&script, "");
+    poll(&mut app, &ctx);
+    app.session.selection.clear();
+    send(&mut app, &ctx, "nothing".into());
+    assert_eq!(script.calls().pop().as_deref(), Some("prompt: nothing"));
+}
+
+/// A queued message keeps the selection of the moment it was typed; queued messages go as one
+/// prompt with all their items.
+#[test]
+fn queued_messages_keep_the_selection_they_were_typed_with() {
+    use solidcraft_engine::Sel;
+    let (mut app, script, ctx) = app_with_script();
+    app.agent_chat.attach_selection = true;
+    send(&mut app, &ctx, "first".into());
+    app.session.selection = vec![Sel::Body { name: "Alpha".into() }];
+    send(&mut app, &ctx, "second".into());
+    app.session.selection = vec![Sel::Body { name: "Beta".into() }];
+    send(&mut app, &ctx, "third".into());
+    assert_eq!(app.agent_chat.pending.iter().map(|p| p.context.total()).collect::<Vec<_>>(), [1, 1]);
+    ended(&script, "");
+    poll(&mut app, &ctx);
+    let prompt = script.calls().pop().expect("the queue went");
+    assert!(prompt.starts_with("prompt: second\n\nthird\n\n[Selected"), "{prompt}");
+    assert!(prompt.contains("- Alpha") && prompt.contains("- Beta"), "{prompt}");
+    let Some(Item::User { context, .. }) = app.agent_chat.items.last() else { panic!("a sent message") };
+    assert_eq!(context.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["Alpha", "Beta"]);
+}
+
+/// A large selection is capped and says how much is left out; nothing in it can break the prompt.
+#[test]
+fn a_huge_selection_is_counted_not_dropped_silently() {
+    use solidcraft_engine::Sel;
+    let mut session = solidcraft_engine::Session::default();
+    let selection: Vec<Sel> = (0..100).map(|i| Sel::Body { name: format!("Body{i}") }).collect();
+    let context = context::describe(&mut session, &selection);
+    assert_eq!((context.items.len(), context.omitted, context.total()), (context::MAX_ITEMS, 100 - context::MAX_ITEMS, 100));
+    assert!(context.prompt_block().contains("and 36 more, not listed"));
+    // Two such messages together stay capped.
+    let mut both = context.clone();
+    both.merge(context);
+    assert_eq!((both.items.len(), both.total()), (context::MAX_ITEMS, 200));
+    // Unknown bodies, faces and features are described by what is known, without panicking.
+    let odd = [
+        Sel::Face { body: "Nope".into(), index: usize::MAX, point: solidcraft_engine::geom::Vec3::new(f64::NAN, f64::INFINITY, 0.0) },
+        Sel::Edge { body: "Nope".into(), index: 7, point: solidcraft_engine::geom::Vec3::new(0.0, 0.0, 0.0) },
+        Sel::Feature { id: u64::MAX },
+        Sel::Plane { name: "XY".into() },
+        Sel::SketchCurve { id: "c1".into(), sketch: None },
+    ];
+    let described = context::describe(&mut session, &odd);
+    assert_eq!(described.items.len(), 5);
+    assert!(described.prompt_block().contains("Other:"));
+}
+
+/// The checkbox shows the number selected, and the chips of a sent message are drawn grouped.
+#[test]
+fn the_selection_checkbox_and_the_chips_are_drawn() {
+    let mut h = crate::scenario::Harness::new();
+    h.call("ui.agent_chat", json!({"open": true}));
+    h.frames(3);
+    assert!(h.widget("Attach selection").is_some(), "the checkbox is there, with nothing selected");
+    h.app.session.selection = box_selection(&mut h.app);
+    h.frames(3);
+    assert!(h.widget("Attach selection (4)").is_some(), "it counts what is selected");
+    let context = context::describe_selection(&mut h.app.session);
+    h.app.agent_chat.items.push(Item::User { text: "look".into(), image: false, pictures: Vec::new(), context, files: Vec::new() });
+    h.frames(3);
+    for heading in ["Elements 2", "Features 1", "Bodies 1"] {
+        assert!(h.widget(heading).is_some(), "{heading} is drawn");
+    }
+}
+
 #[test]
 fn assistant_marks_follow_chat_login_turns_and_approvals() {
     use AssistantMark::*;
@@ -1468,12 +2007,17 @@ fn a_long_message_keeps_the_buttons_in_the_window() {
     }
     h.frames(4);
     let bottom = |h: &crate::scenario::Harness| f64::from(h.app.agent_chat.panel_rect.map(|r| r.bottom()).expect("the panel is drawn"));
-    let [_, rest] = h.widget("Send").expect("the Send button is drawn");
-    let rest = bottom(&h) - rest;
+    let resting: Vec<_> = ["Send", "Attach view"]
+        .into_iter()
+        .map(|name| {
+            let [_, y] = h.widget(name).unwrap_or_else(|| panic!("{name} is drawn"));
+            (name, bottom(&h) - y)
+        })
+        .collect();
     h.app.agent_chat.input = "Please make the plate thicker and then add a fillet on every outside edge.\n".repeat(60);
     h.frames(8);
     let window = 1000.0;
-    for name in ["Send", "Attach view"] {
+    for (name, rest) in resting {
         let [_, y] = h.widget(name).unwrap_or_else(|| panic!("{name} is drawn"));
         assert!(y < window, "{name} is at {y}, below the window's bottom at {window}");
         // The box is pinned to the bottom and grows upwards: the buttons stay where they were
@@ -1496,7 +2040,13 @@ fn test_png(colour: [u8; 4], width: u32) -> Vec<u8> {
 fn a_messages_pictures_open_in_a_viewer() {
     let mut h = crate::scenario::Harness::new();
     h.call("ui.agent_chat", json!({"open": true}));
-    h.app.agent_chat.items.push(Item::User { text: "waiting".into(), image: true, pictures: Vec::new(), files: Vec::new() });
+    h.app.agent_chat.items.push(Item::User {
+        text: "waiting".into(),
+        image: true,
+        pictures: Vec::new(),
+        files: Vec::new(),
+        context: Context::default(),
+    });
     h.frames(3);
     let [x, y] = h.widget("View attached").expect("the plain caption is drawn");
     h.call("ui.click", json!({"x": x, "y": y}));
@@ -1506,7 +2056,7 @@ fn a_messages_pictures_open_in_a_viewer() {
     h.app.agent_chat.items.clear();
     let pictures = vec![Picture::new(test_png([200, 30, 30, 255], 8), "first view"), Picture::new(test_png([30, 30, 200, 255], 16), "")];
     let ours = pictures.clone();
-    h.app.agent_chat.items.push(Item::User { text: "look".into(), image: true, pictures, files: Vec::new() });
+    h.app.agent_chat.items.push(Item::User { text: "look".into(), image: true, pictures, files: Vec::new(), context: Context::default() });
     h.frames(2);
     // Decoded in the background: let both finish before looking for thumbnails.
     for picture in &ours {
@@ -1550,10 +2100,16 @@ fn a_messages_pictures_open_in_a_viewer() {
 #[test]
 fn the_picture_goes_to_the_message_it_was_taken_for() {
     let mut chat = AgentChat::default();
-    chat.push(Item::User { text: "no picture".into(), image: false, pictures: Vec::new(), files: Vec::new() });
-    chat.push(Item::User { text: "first".into(), image: true, pictures: vec![Picture::new(vec![1], "")], files: Vec::new() });
-    chat.push(Item::User { text: "second".into(), image: true, pictures: Vec::new(), files: Vec::new() });
-    chat.push(Item::User { text: "third".into(), image: true, pictures: Vec::new(), files: Vec::new() });
+    chat.push(Item::User { text: "no picture".into(), image: false, pictures: Vec::new(), files: Vec::new(), context: Context::default() });
+    chat.push(Item::User {
+        text: "first".into(),
+        image: true,
+        pictures: vec![Picture::new(vec![1], "")],
+        files: Vec::new(),
+        context: Context::default(),
+    });
+    chat.push(Item::User { text: "second".into(), image: true, pictures: Vec::new(), files: Vec::new(), context: Context::default() });
+    chat.push(Item::User { text: "third".into(), image: true, pictures: Vec::new(), files: Vec::new(), context: Context::default() });
     let sizes = |chat: &AgentChat| -> Vec<usize> {
         chat.items
             .iter()
@@ -1587,7 +2143,7 @@ fn a_message_sent_again_after_sign_in_stays_the_message_it_was() {
     let (mut app, script, ctx) = app_with_script();
     app.agent_chat.images = true;
     // An older message that wanted a picture and has none.
-    app.agent_chat.push(Item::User { text: "older".into(), image: true, pictures: Vec::new(), files: Vec::new() });
+    app.agent_chat.push(Item::User { text: "older".into(), image: true, pictures: Vec::new(), files: Vec::new(), context: Context::default() });
     app.agent_chat.attach_view = true;
     send(&mut app, &ctx, "the new one".into());
     let place = app.agent_chat.items.len() - 1;
@@ -1618,6 +2174,7 @@ fn the_viewer_opens_in_the_popped_out_window() {
         text: "look".into(),
         image: true,
         pictures: vec![Picture::new(test_png([200, 30, 30, 255], 8), "first view")],
+        context: Context::default(),
         files: Vec::new(),
     });
     h.frames(2);
@@ -1629,6 +2186,163 @@ fn the_viewer_opens_in_the_popped_out_window() {
     h.frames(4);
     assert!(h.app.agent_chat.gallery.is_some(), "the click opened the viewer");
     assert!(crate::scenario::rect_of("agent_chat:gallery_picture").is_some(), "and it is drawn");
+}
+
+// ---- Pick context (#2286) ----
+
+/// Put `sels` into the open picker's inputs the way clicks would: each in the input that takes it.
+fn pick_into_dialog(app: &mut SolveApp, sels: &[solidcraft_engine::Sel]) {
+    use solidcraft_engine::Sel;
+    let mut d = app.dialog.take().expect("the picker is open");
+    for sel in sels {
+        d.active = match sel {
+            Sel::Face { .. } | Sel::Edge { .. } | Sel::Vertex { .. } => 0,
+            Sel::Feature { .. } => 1,
+            _ => 2,
+        };
+        d.pick(&app.session, sel.clone());
+    }
+    app.dialog = Some(d);
+}
+
+/// Pick context opens the picker with Elements, Features and Bodies; OK puts what was picked in the
+/// tray above the message box, as chips with an ×; × takes one out; Cancel keeps what was there.
+#[test]
+fn the_picker_fills_a_tray_of_chips_that_can_be_trimmed() {
+    let mut h = crate::scenario::Harness::new();
+    h.call("ui.agent_chat", json!({"open": true}));
+    let sels = box_selection(&mut h.app);
+    h.frames(3);
+    let [x, y] = h.widget("Pick context").expect("the button is there");
+    h.call("ui.click", json!({"x": x, "y": y}));
+    h.frames(3);
+    assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::ChatContext)), "the picker opened");
+    assert_eq!(h.app.dialog.as_ref().map(|d| d.inputs.iter().map(|i| i.label).collect::<Vec<_>>()), Some(vec!["Elements", "Features", "Bodies"]));
+    pick_into_dialog(&mut h.app, &sels);
+    h.frames(3);
+    let [x, y] = h.widget("OK").expect("OK is offered");
+    h.call("ui.click", json!({"x": x, "y": y}));
+    h.frames(4);
+    assert!(h.app.dialog.is_none(), "OK closed the picker");
+    assert_eq!(h.app.agent_chat.picked.len(), 4);
+    assert_eq!(h.app.agent_chat.picked_context.items.len(), 4);
+    for heading in ["Elements 2", "Features 1", "Bodies 1"] {
+        assert!(h.widget(heading).is_some(), "{heading} is drawn in the tray");
+    }
+    // × takes the body out: the tray and the picks stay in step.
+    let cross = crate::scenario::handle_at("agent_chat:picked_remove:3").expect("every chip has an ×");
+    h.call("ui.click", json!({"x": cross.x, "y": cross.y}));
+    h.frames(4);
+    assert_eq!(h.app.agent_chat.picked.len(), 3);
+    assert!(h.app.agent_chat.picked_context.items.iter().all(|i| i.kind != context::Kind::Body));
+    // Reopened, the picker holds what is in the tray; Cancel leaves it alone.
+    start_pick(&mut h.app);
+    assert_eq!(h.app.dialog.as_ref().map(|d| d.inputs.iter().map(|i| i.items.len()).collect::<Vec<_>>()), Some(vec![2, 1, 0]));
+    pick_into_dialog(&mut h.app, &[solidcraft_engine::Sel::Body { name: "Body1".into() }]);
+    crate::dialogs::cancel(&mut h.app);
+    assert!(h.app.dialog.is_none());
+    assert_eq!(h.app.agent_chat.picked.len(), 3, "Cancel keeps what was picked before");
+    // The control channel opens it too and reports what is picked.
+    let reply = h.call("ui.agent_chat", json!({"pick": true}));
+    assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::ChatContext)));
+    assert_eq!(reply["result"]["picked"].as_array().map(Vec::len), Some(3));
+    crate::dialogs::cancel(&mut h.app);
+    // While another dialog is open, the button does nothing.
+    h.app.start("solid.box");
+    let before = h.app.dialog.is_some();
+    start_pick(&mut h.app);
+    assert!(before && !matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::ChatContext)));
+}
+
+/// What was picked goes with the next message, once, together with an attached selection that does
+/// not repeat it.
+#[test]
+fn the_picks_go_with_the_next_message_once() {
+    let (mut app, script, ctx) = app_with_script();
+    let sels = box_selection(&mut app);
+    start_pick(&mut app);
+    pick_into_dialog(&mut app, &sels[2..]); // the feature and the body
+    let d = app.dialog.take().expect("the picker");
+    pick_done(&mut app, &d).expect("OK");
+    assert_eq!(app.agent_chat.picked_context.items.len(), 2);
+
+    // The same body is also selected and Attach selection is on: it is listed once.
+    app.session.selection = vec![sels[3].clone(), sels[0].clone()];
+    app.agent_chat.attach_selection = true;
+    send(&mut app, &ctx, "look at these".into());
+    let prompt = script.calls().pop().expect("a prompt");
+    assert!(prompt.starts_with("prompt: look at these\n\n[Selected in SolidCraft"), "{prompt}");
+    assert!(prompt.contains("3 item(s)"), "two picked and one more selected: {prompt}");
+    assert_eq!(prompt.matches("- Body1").count(), 1, "{prompt}");
+    let Some(Item::User { context, .. }) = app.agent_chat.items.last() else { panic!("a sent message") };
+    assert_eq!(context.items.len(), 3);
+    assert!(app.agent_chat.picked.is_empty() && app.agent_chat.picked_context.is_empty(), "the tray is empty again");
+    // The next message carries nothing of it.
+    ended(&script, "");
+    poll(&mut app, &ctx);
+    app.agent_chat.attach_selection = false;
+    send(&mut app, &ctx, "and now?".into());
+    assert_eq!(script.calls().pop().as_deref(), Some("prompt: and now?"));
+}
+
+/// Two clicks on two rims are two things, not four edges (a click on a rim selects both halves for
+/// the commands; the chat counts and describes what was clicked).
+#[test]
+fn a_rim_clicked_once_is_one_item_not_its_pieces() {
+    use solidcraft_engine::Sel;
+    let (mut app, script, ctx) = app_with_script();
+    app.run("solid.cylinder", json!({"radius": 10, "height": 20})).expect("a cylinder");
+    let (name, top, bottom, mid_top, mid_bottom) = {
+        let st = app.session.world_state();
+        let body = &st.bodies[0];
+        let mesh = body.mesh();
+        let rim_at = |z: f64| mesh.edges.iter().position(|e| e.len() > 3 && e.iter().all(|p| (p.z - z).abs() < 1e-6)).expect("a rim");
+        let (top, bottom) = (rim_at(20.0), rim_at(0.0));
+        (body.name.clone(), top, bottom, crate::viewport::polyline_mid(&mesh.edges[top]), crate::viewport::polyline_mid(&mesh.edges[bottom]))
+    };
+    crate::viewport::select(&mut app, Some(Sel::Edge { body: name.clone(), index: top, point: mid_top }), false, false);
+    crate::viewport::select(&mut app, Some(Sel::Edge { body: name, index: bottom, point: mid_bottom }), true, false);
+    assert_eq!(app.session.selection.len(), 4, "two clicks selected four halves");
+    assert_eq!(selected_count(&mut app), 2, "the checkbox counts the two clicks");
+
+    app.agent_chat.attach_selection = true;
+    send(&mut app, &ctx, "these two rims".into());
+    let prompt = script.calls().pop().expect("a prompt");
+    assert!(prompt.contains("2 item(s)"), "{prompt}");
+    assert_eq!(prompt.matches("(2 pieces)").count(), 2, "{prompt}");
+    // A rim of radius 10 is about 62.8 mm round (the kernel's own figure), both halves together.
+    assert!(prompt.contains("Edge 62.") && prompt.contains("mm (2 pieces)"), "{prompt}");
+    let Some(Item::User { context, .. }) = app.agent_chat.items.last() else { panic!("a sent message") };
+    assert_eq!(context.items.len(), 2);
+    assert_eq!(context.total(), 2);
+    // The detail still names the piece indices the tools take.
+    assert!(context.items.iter().all(|i| i.detail.contains("indices [")), "{:?}", context.items);
+}
+
+/// The same for a surface the kernel splits at a seam: one click on the cylinder's wall is one item.
+#[test]
+fn a_split_wall_clicked_once_is_one_item() {
+    use solidcraft_engine::Sel;
+    let (mut app, script, ctx) = app_with_script();
+    app.run("solid.cylinder", json!({"radius": 10, "height": 20})).expect("a cylinder");
+    let wall = app.session.execute("model.faces", &json!({"body": "Body1"})).expect("faces")["faces"]
+        .as_array()
+        .and_then(|faces| faces.iter().find(|f| f["cylinder"]["radius"].is_number()).cloned())
+        .expect("the wall");
+    let at = &wall["point"];
+    let point = solidcraft_engine::geom::Vec3::new(at[0].as_f64().unwrap_or(0.0), at[1].as_f64().unwrap_or(0.0), at[2].as_f64().unwrap_or(0.0));
+    crate::viewport::select(
+        &mut app,
+        Some(Sel::Face { body: "Body1".into(), index: wall["index"].as_u64().unwrap_or(0) as usize, point }),
+        false,
+        false,
+    );
+    assert!(!app.session.selection.is_empty());
+    assert_eq!(selected_count(&mut app), 1, "one click, however many patches it selected: {:?}", app.session.selection);
+    app.agent_chat.attach_selection = true;
+    send(&mut app, &ctx, "this wall".into());
+    let prompt = script.calls().pop().expect("a prompt");
+    assert!(prompt.contains("1 item(s)") && prompt.contains("Round face r10"), "{prompt}");
 }
 
 // ---- Attached pictures in the shared viewer ----
@@ -1668,7 +2382,13 @@ fn attached_pictures_of_any_format_are_decoded_in_the_background() {
     for (format, width) in [(image::ImageFormat::Png, 8), (image::ImageFormat::Jpeg, 16), (image::ImageFormat::Gif, 12)] {
         let picture = Picture::new(encoded(format, width), format!("photo.{format:?}"));
         h.app.agent_chat.items.clear();
-        h.app.agent_chat.items.push(Item::User { text: "look".into(), image: false, pictures: vec![picture.clone()], files: Vec::new() });
+        h.app.agent_chat.items.push(Item::User {
+            text: "look".into(),
+            image: false,
+            pictures: vec![picture.clone()],
+            files: Vec::new(),
+            context: Context::default(),
+        });
         h.frames(2);
         assert!(until_decoded(&mut h, &picture), "{format:?} was decoded");
         let texture = picture.decode.texture.get().and_then(|t| t.as_ref()).unwrap_or_else(|| panic!("{format:?} is a texture"));
@@ -1678,7 +2398,13 @@ fn attached_pictures_of_any_format_are_decoded_in_the_background() {
     // Bytes that are no picture: the name where the thumbnail would be, and nothing breaks.
     let broken = Picture::new(b"not a picture at all".to_vec(), "fake.png");
     h.app.agent_chat.items.clear();
-    h.app.agent_chat.items.push(Item::User { text: "look".into(), image: false, pictures: vec![broken.clone()], files: Vec::new() });
+    h.app.agent_chat.items.push(Item::User {
+        text: "look".into(),
+        image: false,
+        pictures: vec![broken.clone()],
+        files: Vec::new(),
+        context: Context::default(),
+    });
     assert!(until_decoded(&mut h, &broken));
     assert!(matches!(broken.decode.texture.get(), Some(None)), "it could not be read");
     assert!(h.widget("fake.png").is_some(), "its name stands in for the thumbnail");
@@ -1690,7 +2416,7 @@ fn attached_pictures_of_any_format_are_decoded_in_the_background() {
 fn an_attached_picture_and_the_views_picture_share_the_viewer() {
     let mut chat = AgentChat::default();
     let attached = Picture::shared(Arc::new(encoded(image::ImageFormat::Jpeg, 16)), "photo.jpg", false);
-    chat.push(Item::User { text: "see".into(), image: true, pictures: vec![attached], files: Vec::new() });
+    chat.push(Item::User { text: "see".into(), image: true, pictures: vec![attached], files: Vec::new(), context: Context::default() });
     chat.keep_picture(Some(0), encoded(image::ImageFormat::Png, 8));
     let Some(Item::User { pictures, .. }) = chat.items.last() else { panic!("a sent message") };
     assert_eq!(pictures.iter().map(|p| (p.note.as_str(), p.view)).collect::<Vec<_>>(), [("photo.jpg", false), ("", true)]);
@@ -1715,4 +2441,100 @@ fn add_agent_opens_its_dialog_from_home() {
     h.frames(4);
     assert!(h.app.agent_chat.settings.add.is_some(), "Add agent opened its dialog");
     assert!(handle_at("ai_add:add").is_some(), "the dialog is drawn over Home");
+}
+
+/// `ui.agent_chat` `add_agent` takes an endpoint's request timeout (rounded and clamped to 30 s
+/// ..= 1 h, 300 s when left out) and the state reports it.
+#[test]
+fn add_agent_takes_a_request_timeout_and_the_state_reports_it() {
+    let ctx = egui::Context::default();
+    let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
+    let timeout = |app: &mut SolveApp, id: &str| {
+        let state = control(app, &ctx, &json!({})).unwrap();
+        state["agents"].as_array().unwrap().iter().find(|a| a["id"] == id).map(|a| a["request_timeout_s"].clone())
+    };
+    let add = |app: &mut SolveApp, t: Value| {
+        let mut a = json!({"id": "slow", "name": "Slow", "kind": "api", "base_url": "http://localhost:11434/v1", "model": "m"});
+        if !t.is_null() {
+            a["request_timeout_s"] = t;
+        }
+        control(app, &ctx, &json!({"add_agent": a}))
+    };
+    add(&mut app, json!(1200)).unwrap();
+    assert_eq!(timeout(&mut app, "slow"), Some(json!(1200)));
+    assert_eq!(app.preferences.agents.iter().find(|a| a.id == "slow").unwrap().request_timeout_s, 1200);
+    add(&mut app, json!(99999.7)).unwrap();
+    assert_eq!(timeout(&mut app, "slow"), Some(json!(3600)));
+    add(&mut app, json!(-3)).unwrap();
+    assert_eq!(timeout(&mut app, "slow"), Some(json!(30)));
+    add(&mut app, Value::Null).unwrap();
+    assert_eq!(timeout(&mut app, "slow"), Some(json!(300)));
+    assert!(add(&mut app, json!("long")).is_err());
+    control(&mut app, &ctx, &json!({"add_agent": {"id": "acp", "name": "A", "command": "x --acp"}})).unwrap();
+    assert_eq!(timeout(&mut app, "acp"), Some(Value::Null), "only endpoints have a request timeout");
+}
+
+#[test]
+fn no_tool_turn_reports_empty_reply_and_unperformed_edit() {
+    for (prompt, reply) in [
+        ("Hello", ""),
+        ("Hello", "   "),
+        ("Make a box", "Here is how to make a box."),
+        ("Can you rename the body?", "I cannot rename bodies."),
+        ("Could you please make a change to the current shape", "Here is the command."),
+        ("Sketch a rectangle", r#"{"name":"batch","arguments":{"commands":[]}}"#),
+    ] {
+        let (mut app, _, _) = app_with_script();
+        app.agent_chat.tools_port = Some(12345);
+        start_turn(&mut app, prompt.into(), false, None, vec![]);
+        if !reply.is_empty() {
+            app.agent_chat.on_event(Event::Text { thought: false, text: reply.into() });
+        }
+        app.agent_chat.on_event(Event::TurnEnded { reason: String::new() });
+        end_turn(&mut app);
+        let expected = tr("ui.agent_chat_no_tool_call");
+        assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::Notice { text, error: false } if text == expected)), "{prompt}");
+        assert_eq!(status(&app)["turnWarning"], expected);
+        assert!(app.session.undo.is_empty());
+        start_turn(&mut app, "What is a fillet?".into(), false, None, vec![]);
+        assert!(status(&app)["turnWarning"].is_null());
+        assert!(app.agent_chat.items.iter().any(|i| matches!(i, Item::Notice { text, .. } if text == expected)));
+        new_chat(&mut app);
+        assert!(status(&app)["turnWarning"].is_null());
+        assert!(app.agent_chat.items.is_empty());
+    }
+}
+
+#[test]
+fn no_tool_turn_warning_does_not_follow_a_tool_call() {
+    let (mut app, _, _) = app_with_script();
+    app.agent_chat.tools_port = Some(12345);
+    start_turn(&mut app, "Make a box".into(), false, None, vec![]);
+    app.agent_chat.on_event(Event::Tool { id: "t".into(), title: Some("batch".into()), kind: None, status: Some(ToolStatus::Failed), output: None });
+    app.agent_chat.on_event(Event::TurnEnded { reason: String::new() });
+    end_turn(&mut app);
+    assert!(status(&app).get("turnWarning").is_some());
+    assert!(status(&app)["turnWarning"].is_null());
+    assert!(!app.agent_chat.items.iter().any(|i| matches!(i, Item::Notice { .. })));
+}
+
+#[test]
+fn no_tool_turn_warning_leaves_answers_and_incomplete_turns_quiet() {
+    for (prompt, reply, reason, tools) in [
+        ("What is a fillet?", "A fillet rounds an edge.", "", true),
+        ("How do I make a box?", "Use the Box command.", "", true),
+        ("Make a box", "", "cancelled", true),
+        ("Make a box", "", "error", true),
+        ("Make a box", "", "", false),
+    ] {
+        let (mut app, _, _) = app_with_script();
+        app.agent_chat.tools_port = tools.then_some(12345);
+        start_turn(&mut app, prompt.into(), false, None, vec![]);
+        app.agent_chat.on_event(Event::Text { thought: false, text: reply.into() });
+        app.agent_chat.on_event(Event::TurnEnded { reason: reason.into() });
+        end_turn(&mut app);
+        assert!(status(&app).get("turnWarning").is_some());
+        assert!(status(&app)["turnWarning"].is_null(), "{prompt}: {reason}");
+        assert!(!app.agent_chat.items.iter().any(|i| matches!(i, Item::Notice { text, .. } if text == tr("ui.agent_chat_no_tool_call"))));
+    }
 }

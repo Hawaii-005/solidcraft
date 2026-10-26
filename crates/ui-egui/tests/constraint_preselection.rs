@@ -11,12 +11,13 @@ fn lines() -> Harness {
 }
 
 fn select_lines(h: &mut Harness) {
+    // These tests select whole edges; the exact centre is now a selectable MID.
     h.run(&json!([
-        {"click":{"sketch":[25,10]}},
-        {"click":{"sketch":[25,32.5]},"shift":true}
+        {"click":{"sketch":[17.5,10]}},
+        {"click":{"sketch":[17.5,31.25]},"shift":true}
     ]))
     .unwrap();
-    assert_eq!(h.app.session.selection, vec![Sel::SketchCurve { id: "l1".into() }, Sel::SketchCurve { id: "l2".into() }]);
+    assert_eq!(h.app.session.selection, vec![Sel::SketchCurve { id: "l1".into(), sketch: None }, Sel::SketchCurve { id: "l2".into(), sketch: None }]);
 }
 
 fn assert_line_geometry(h: &Harness, command: &str) {
@@ -102,12 +103,49 @@ fn selected_circles_apply_constraints() {
     }
 }
 
+/// #4985: Equal with three or more curves selected makes them all equal, in one undo step. With
+/// one circle dimensioned, the others take its size.
+#[test]
+fn selected_circles_all_become_equal() {
+    let mut h = Harness::new();
+    h.run(&json!([
+        {"call":"engine.execute","params":{"command":"sketch.create","params":{"plane":"XY"}}},
+        {"call":"engine.execute","params":{"command":"sketch.circle.center","params":{"center":[0,0],"radius":5}}},
+        {"call":"engine.execute","params":{"command":"sketch.circle.center","params":{"center":[20,0],"radius":3}}},
+        {"call":"engine.execute","params":{"command":"sketch.circle.center","params":{"center":[40,0],"radius":7}}},
+        {"call":"engine.execute","params":{"command":"sketch.circle.center","params":{"center":[60,0],"radius":4}}},
+        {"call":"engine.execute","params":{"command":"sketch.dimension","params":{"entities":["c1"]}}}
+    ]))
+    .unwrap();
+    let radius = |h: &Harness, id: &str| {
+        let sk = &h.app.session.model.state().sketches[0].sketch;
+        sk.radius(sk.curve_index(id).unwrap()).unwrap()
+    };
+    let r1 = radius(&h, "c1");
+    h.app.session.selection = ["c4", "c3", "c2", "c1"].iter().map(|id| Sel::SketchCurve { id: (*id).into(), sketch: None }).collect();
+    let undo = h.app.session.undo.len();
+    h.run(&json!([{"start":"sketch.constraint.equal"}])).unwrap();
+    assert!(!h.app.status.as_ref().is_some_and(|(_, _, error)| *error), "{:?}", h.app.status);
+    assert_eq!(h.app.session.undo.len(), undo + 1, "one undo step");
+    assert!(h.app.tool.is_none(), "applied at once, no pick tool");
+    assert!(h.app.session.selection.is_empty());
+    let sk = &h.app.session.model.state().sketches[0].sketch;
+    assert_eq!(sk.constraints.iter().filter(|c| matches!(c.kind, ConstraintKind::Equal { .. })).count(), 3);
+    for id in ["c1", "c2", "c3", "c4"] {
+        assert!((radius(&h, id) - r1).abs() < 1e-6, "{id}: {} vs the dimensioned {r1}", radius(&h, id));
+    }
+}
+
 #[test]
 fn ambiguous_selection_preserves_tool_first_workflow() {
     for selection in [
         vec![],
-        vec![Sel::SketchCurve { id: "l1".into() }],
-        vec![Sel::SketchCurve { id: "l1".into() }, Sel::SketchCurve { id: "l2".into() }, Sel::SketchPoint { id: "origin".into() }],
+        vec![Sel::SketchCurve { id: "l1".into(), sketch: None }],
+        vec![
+            Sel::SketchCurve { id: "l1".into(), sketch: None },
+            Sel::SketchCurve { id: "l2".into(), sketch: None },
+            Sel::SketchPoint { id: "origin".into() },
+        ],
     ] {
         let mut h = lines();
         h.app.session.selection = selection;
@@ -150,16 +188,16 @@ fn curvature_polygon_and_fix_consume_clicked_operands_atomically() {
             "curvature" => {
                 h.app.run("sketch.line", json!({"points":[[10,10],[30,10]],"infer":false})).unwrap();
                 h.app.run("sketch.spline.control_point", json!({"points":["l1.end",[40,12],[50,16],[60,25]]})).unwrap();
-                vec![[20., 10.], [45., 14.875]]
+                vec![[15., 10.], [45., 14.875]]
             }
             "polygon" => {
                 h.app.run("sketch.line", json!({"points":[[10,10],[40,10],[40,30],[10,30]],"closed":true,"infer":false})).unwrap();
-                vec![[25., 10.], [40., 20.], [25., 30.], [10., 20.]]
+                vec![[17.5, 10.], [40., 15.], [32.5, 30.], [10., 25.]]
             }
             _ => {
                 h.app.run("sketch.line", json!({"points":[[10,10],[40,10]],"infer":false})).unwrap();
                 h.app.run("sketch.point", json!({"point":[20,25],"id":"p"})).unwrap();
-                vec![[25., 10.], [20., 25.]]
+                vec![[17.5, 10.], [20., 25.]]
             }
         };
         h.call("ui.view", json!({"view":"top"}));
@@ -224,7 +262,7 @@ fn remaining_constraints_preserve_mixed_selections_and_rejected_geometry() {
         let mut h = lines();
         let before = h.app.session.doc.to_json();
         let undo = h.app.session.undo.len();
-        let mixed = vec![Sel::SketchCurve { id: "l1".into() }, Sel::Body { name: "missing".into() }];
+        let mixed = vec![Sel::SketchCurve { id: "l1".into(), sketch: None }, Sel::Body { name: "missing".into() }];
         h.app.session.selection = mixed.clone();
         h.step(&json!({"start":format!("sketch.constraint.{command}")})).unwrap();
         assert!(h.app.tool.is_some());
@@ -233,7 +271,7 @@ fn remaining_constraints_preserve_mixed_selections_and_rejected_geometry() {
         assert_eq!(h.app.session.undo.len(), undo);
     }
     let mut h = lines();
-    let selection = vec![Sel::SketchCurve { id: "l1".into() }, Sel::SketchCurve { id: "missing".into() }];
+    let selection = vec![Sel::SketchCurve { id: "l1".into(), sketch: None }, Sel::SketchCurve { id: "missing".into(), sketch: None }];
     h.app.session.selection = selection.clone();
     let before = h.app.session.doc.to_json();
     let undo = h.app.session.undo.len();

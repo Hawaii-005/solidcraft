@@ -3,7 +3,7 @@ use solidcraft_engine::Session;
 
 use super::*;
 use crate::Services;
-use crate::dialogs::{apply_commands, face_sel, preview_commands};
+use crate::dialogs::{apply_commands, edge_sel, face_sel, preview_commands};
 
 /// Components A (grounded) and B: a 20 x 20 x 10 box each, B 30 mm along X.
 fn two_boxes() -> SolveApp {
@@ -31,7 +31,7 @@ fn joint_from_two_snaps() {
     d.pick(&app.session, fb);
     if let Kind::Assembly(Asm::Joint(f)) = &mut d.kind {
         f.kind = 1;
-        f.fit_limits();
+        f.fit_limits(&solidcraft_engine::doc::Document::default());
         f.limits[0] = (true, "-45 deg".into(), "45 deg".into());
     }
     let c = apply_commands(&app, &d).unwrap();
@@ -60,6 +60,98 @@ fn joint_from_two_snaps() {
     assert_eq!(app.session.doc.assembly.joints.len(), 1);
 }
 
+/// A straight edge is the revolute axis, even when both adjacent faces are perpendicular to it.
+#[test]
+fn revolute_joint_uses_the_picked_straight_edges() {
+    let mut app = two_boxes();
+    app.start("joint.create");
+    let mut d = app.dialog.clone().unwrap();
+    for point in [Vec3::new(20.0, 10.0, 10.0), Vec3::new(30.0, 10.0, 10.0)] {
+        let edge = edge_sel(&app.session, point).unwrap();
+        let snap = snap_of(&app.session, &edge).unwrap();
+        assert_eq!(snap.kind, SnapKind::EdgeMid);
+        assert!(snap.at.dist(point) < 1e-9, "{snap:?}");
+        assert!(snap.z.cross(Vec3::Y).len() < 1e-9, "the selected edge runs along Y: {snap:?}");
+        d.pick(&app.session, edge);
+    }
+    if let Kind::Assembly(Asm::Joint(f)) = &mut d.kind {
+        f.kind = 1;
+        f.fit_limits(&app.session.doc);
+    }
+    for (id, p) in apply_commands(&app, &d).unwrap() {
+        app.run(&id, p).unwrap();
+    }
+    let a = app.session.doc.find_component("A").unwrap();
+    let b = app.session.doc.find_component("B").unwrap();
+    let ground = app.session.doc.occurrence_of(a).unwrap().transform;
+    let placed = |app: &SolveApp, p| solidcraft_engine::doc::apply_point(&app.session.doc.occurrence_of(b).unwrap().transform, p);
+    let ends = [Vec3::new(30.0, 0.0, 10.0), Vec3::new(30.0, 20.0, 10.0)];
+    let before = ends.map(|p| placed(&app, p));
+    let off_axis = Vec3::new(50.0, 10.0, 10.0);
+    let off_before = placed(&app, off_axis);
+    let joint = app.session.doc.assembly.joints[0].id;
+    app.run("joint.drive", json!({"joint": joint, "values": ["90 deg"]})).unwrap();
+    for (p, at) in ends.into_iter().zip(before) {
+        assert!(placed(&app, p).dist(at) < 1e-6, "both ends of the hinge edge must stay put");
+    }
+    assert!((placed(&app, off_axis).dist(off_before) - 20.0 * 2.0_f64.sqrt()).abs() < 1e-6, "the box makes a quarter turn");
+    assert_eq!(app.session.doc.occurrence_of(a).unwrap().transform, ground);
+}
+
+/// Two arms (a 100 x 20 x `T` plate with a hole 10 mm in from each end), B jointed by its
+/// bottom to A's top at a round edge, a straight edge or a corner picked in the dialog: when the
+/// arm is made thicker, B sits on A's new top. (These picks were kept as points where they were
+/// picked, so B stayed at the old top, sunk into A.)
+#[test]
+fn arms_jointed_at_edges_and_corners_follow_a_thicker_arm() {
+    let picks: [(&str, Vec3, Vec3, bool); 3] = [
+        ("round edge", Vec3::new(13.0, 0.0, 5.0), Vec3::new(93.0, 60.0, 0.0), false),
+        ("straight edge", Vec3::new(50.0, 10.0, 5.0), Vec3::new(50.0, 70.0, 0.0), false),
+        ("corner", Vec3::new(100.0, 10.0, 5.0), Vec3::new(100.0, 70.0, 0.0), true),
+    ];
+    for (what, pa, pb, corner) in picks {
+        let mut s = Session::default();
+        s.execute("parameters.add", &json!({"name": "T", "expression": "5 mm"})).unwrap();
+        s.execute("component.create", &json!({"name": "Arm"})).unwrap();
+        s.execute("solid.box", &json!({"length": 100, "width": 20, "height": "T", "corner": [0, -10, 0]})).unwrap();
+        for x in [10, 90] {
+            s.execute("solid.cylinder", &json!({"diameter": 6, "height": 100, "base": [x, 0, -50], "operation": "cut"})).unwrap();
+        }
+        s.execute("component.activate", &json!({"component": "root"})).unwrap();
+        let mut app = SolveApp::new(s, Services::default());
+        let a = occ(&app, "Arm");
+        app.run("occurrence.ground", json!({"occurrence": a, "grounded": true})).unwrap();
+        let b = app.run("occurrence.copy", json!({"occurrence": a, "translate": [0, 60, 0]})).unwrap()["occurrence"].as_u64().unwrap();
+        app.start("joint.create");
+        let mut d = app.dialog.clone().unwrap();
+        for p in [pa, pb] {
+            let edge = edge_sel(&app.session, p).unwrap();
+            let sel = match (&edge, corner) {
+                (Sel::Edge { body, .. }, true) => Sel::Vertex { body: body.clone(), point: p },
+                _ => edge,
+            };
+            d.pick(&app.session, sel);
+        }
+        if let Kind::Assembly(Asm::Joint(f)) = &mut d.kind {
+            f.kind = 1;
+            f.fit_limits(&app.session.doc);
+        }
+        for (id, p) in apply_commands(&app, &d).unwrap() {
+            app.run(&id, p).unwrap();
+        }
+        let world = |app: &SolveApp, o: u64, p: Vec3| {
+            solidcraft_engine::doc::apply_point(&solidcraft_engine::doc::joints::occurrence_world(&app.session.doc, o), p)
+        };
+        // The spots: a round edge's centre, else the pick; B's in the arm's own coordinates.
+        let spot = |p: Vec3| if what == "round edge" { Vec3::new(p.x - 3.0, p.y, p.z) } else { p };
+        let (spot_a, spot_b) = (spot(pa), spot(pb) - Vec3::new(0.0, 60.0, 0.0));
+        assert!(world(&app, b, spot_b).dist(spot_a) < 1e-6, "{what}: as made, B's spot is at {:?}", world(&app, b, spot_b));
+        app.run("parameters.change", json!({"name": "T", "expression": "12 mm"})).unwrap();
+        let top = spot_a + Vec3::new(0.0, 0.0, 7.0);
+        assert!(world(&app, b, spot_b).dist(top) < 1e-6, "{what}: B's spot is at {:?}, not on A's new top at {top:?}", world(&app, b, spot_b));
+    }
+}
+
 /// The preview moves B where the joint puts it and plays the motion while animating.
 #[test]
 fn joint_and_drive_preview_on_the_placed_model() {
@@ -74,6 +166,7 @@ fn joint_and_drive_preview_on_the_placed_model() {
         new_body: [2, 2, 2, 255],
         removed: [3, 3, 3, 100],
         edge: [0, 0, 0, 255],
+        ghost: true,
     };
     let cmds = preview_commands(&app, &d).unwrap();
     let b = world_preview(&app.session, &cmds, colors).unwrap().unwrap();
@@ -101,6 +194,12 @@ fn joint_and_drive_preview_on_the_placed_model() {
     assert_eq!(cmds[0].0, "joint.drive");
     let b = world_preview(&app.session, &cmds, colors).unwrap().unwrap();
     assert_eq!(b.replaced, vec!["Body2".to_string()]);
+    // The moved part's old place is the ghost, unless Show ghost is off (#5905).
+    assert!(!b.scene.ghost.is_empty());
+    let hidden = world_preview(&app.session, &cmds, crate::preview::Colors { ghost: false, ..colors }).unwrap().unwrap();
+    assert!(hidden.scene.ghost.is_empty());
+    assert_eq!(hidden.replaced, b.replaced, "the moved part is still shown where it goes");
+    assert_eq!(hidden.scene.tris, b.scene.tris);
     // Features preview as before while nothing is placed away from its frame, and on the
     // placed model once something is (B moved by its joint).
     assert!(world_preview(&two_boxes().session, &[("solid.extrude".into(), json!({}))], colors).is_none());
@@ -132,6 +231,33 @@ fn edit_joint_runs_edit_and_limits() {
     assert!((j.offset - 2.0).abs() < 1e-12);
 }
 
+/// An old edge pick saved as point/z keeps its face-normal axis when reopened and edited.
+#[test]
+fn editing_a_saved_joint_keeps_its_explicit_axis() {
+    let mut app = two_boxes();
+    app.run(
+        "joint.create",
+        json!({"type": "revolute",
+        "a": {"occurrence": occ(&app, "A"), "point": [20, 10, 10], "z": [0, 0, 1]},
+        "b": {"occurrence": occ(&app, "B"), "point": [30, 10, 10], "z": [0, 0, 1]}}),
+    )
+    .unwrap();
+    let joint = app.session.doc.assembly.joints[0].clone();
+    let saved = app.session.doc.to_json();
+    app = SolveApp::new(Session::new(solidcraft_engine::doc::format::read(&saved).unwrap()), Services::default());
+    let mut d = edit_joint(&app, joint.id).unwrap();
+    if let Kind::Assembly(Asm::Joint(f)) = &mut d.kind {
+        f.flip = true;
+    }
+    for (id, p) in apply_commands(&app, &d).unwrap() {
+        app.run(&id, p).unwrap();
+    }
+    let edited = &app.session.doc.assembly.joints[0];
+    assert!(edited.flip);
+    assert_eq!(edited.a, joint.a);
+    assert_eq!(edited.b, joint.b);
+}
+
 /// Edit Joint shows an offset typed as an expression as that expression, and OK keeps it; the
 /// dialog's plain numbers keep no expression.
 #[test]
@@ -155,6 +281,45 @@ fn edit_joint_keeps_an_offset_typed_as_an_expression() {
     assert_eq!((j.exprs.offset.as_deref(), j.exprs.angle.as_deref()), (Some("gap"), None));
 }
 
+#[test]
+fn as_built_animation_drives_the_new_shared_id_and_handles_exhaustion() {
+    let mut app = two_boxes();
+    app.session.doc_mut().next_id = 500;
+    app.session.selection = vec![Sel::Body { name: "Body1".into() }, Sel::Body { name: "Body2".into() }];
+    app.start("joint.as_built");
+    let mut d = app.dialog.take().unwrap();
+    let Kind::Assembly(Asm::Joint(f)) = &mut d.kind else { panic!("expected joint dialog") };
+    f.kind = 1;
+    f.animate = true;
+    f.phase = 0.25;
+    let cmds = preview_commands(&app, &d).unwrap();
+    assert_eq!(cmds[1].0, "joint.drive");
+    assert_eq!(cmds[1].1["joint"], 500);
+    let mut preview = app.session.scratch();
+    for (command, params) in &cmds {
+        preview.execute(command, params).unwrap();
+    }
+    let joint = &preview.doc.assembly.joints[0];
+    assert_eq!(joint.id, 500);
+    assert!((joint.values[0] - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    assert_eq!(app.session.doc.next_id, 500, "a preview must not reserve live ids");
+
+    app.session.doc_mut().next_id = u64::MAX;
+    let cmds = preview_commands(&app, &d).unwrap();
+    let result = app.session.scratch().execute(&cmds[0].0, &cmds[0].1);
+    assert!(result.is_err() && !matches!(result, Err(solidcraft_engine::EngineError::Internal(..))), "{result:?}");
+
+    // A programmatic document can also contain the largest possible joint id. The old
+    // preview added one to that id without checking, before the engine's panic guard.
+    let mut largest = joint.clone();
+    largest.id = u64::MAX;
+    app.session.doc_mut().assembly.joints.push(largest);
+    let cmds = preview_commands(&app, &d).unwrap();
+    assert_eq!(cmds.len(), 1, "an exhausted preview must not invent a drive target");
+    let result = app.session.scratch().execute(&cmds[0].0, &cmds[0].1);
+    assert!(result.is_err() && !matches!(result, Err(solidcraft_engine::EngineError::Internal(..))), "{result:?}");
+}
+
 /// As-built joints and rigid groups take components from body picks; New Component makes one
 /// from bodies when bodies are picked.
 #[test]
@@ -176,6 +341,19 @@ fn component_picks_become_occurrences() {
     assert_eq!(c[0].0, "component.create");
 }
 
+/// A body of a further instance of a component belongs to that instance, not the first (#3857).
+#[test]
+fn body_of_a_further_instance_is_its_own_occurrence() {
+    let mut app = two_boxes();
+    let copy = app.session.execute("occurrence.copy", &json!({"component": "B", "translate": [0, 40, 0]})).unwrap()["occurrence"].as_u64().unwrap();
+    let first = occ(&app, "B");
+    assert_ne!(copy, first);
+    let frames = app.session.doc.body_frames(&app.session.model.state());
+    let of = |o: u64| frames.iter().find(|f| f.2.last() == Some(&o)).map(|f| f.0.clone()).unwrap();
+    assert_eq!(occurrence_of_body(&app.session, &of(first)), Some(first));
+    assert_eq!(occurrence_of_body(&app.session, &of(copy)), Some(copy));
+}
+
 /// Round edges snap to their centre; straight ones are not circles.
 #[test]
 fn circles_from_edge_polylines() {
@@ -185,6 +363,47 @@ fn circles_from_edge_polylines() {
     assert!(c.dist(Vec3::new(5.0, 2.0, 7.0)) < 1e-9 && n.cross(Vec3::Z).len() < 1e-9);
     let line: Vec<Vec3> = (0..10).map(|i| Vec3::new(f64::from(i), 0.0, 0.0)).collect();
     assert!(circle_of(&line).is_none());
+}
+
+/// A moved component's edge axis is measured in the displayed world frame.
+#[test]
+fn straight_edge_snap_follows_a_rotated_occurrence() {
+    let mut app = two_boxes();
+    let b = app.session.doc.find_component("B").unwrap();
+    app.run("occurrence.move", json!({"occurrence": occ(&app, "B"), "axis": [1, 2, 3], "angle": "37 deg", "translate": [50, 20, 10]})).unwrap();
+    let transform = app.session.doc.occurrence_of(b).unwrap().transform;
+    let mid = solidcraft_engine::doc::apply_point(&transform, Vec3::new(30.0, 10.0, 10.0));
+    let axis = solidcraft_engine::doc::apply_vector(&transform, Vec3::Y);
+    let st = app.session.world_state();
+    let mesh = st.body("Body2").unwrap().mesh();
+    let index = mesh.edges.iter().position(|e| polyline_mid(e).dist(mid) < 1e-6).unwrap();
+    let snap = snap_of(&app.session, &Sel::Edge { body: "Body2".into(), index, point: mid }).unwrap();
+    assert!(snap.at.dist(mid) < 1e-6);
+    assert!(snap.z.cross(axis).len() < 1e-9, "{snap:?}");
+    assert_eq!(snap.param["occurrence"], occ(&app, "B"));
+}
+
+/// Only finite straight polylines supply an axis; reversing their samples keeps its direction.
+#[test]
+fn straight_edge_axes_reject_curves_and_degenerate_samples() {
+    for dir in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(-2.0, 3.0, 1.0)] {
+        let mut pts = vec![Vec3::ZERO, dir * 0.5, dir];
+        let axis = straight_edge_axis(&pts).unwrap();
+        assert!(axis.cross(dir).len() < 1e-9);
+        assert!((axis.len() - 1.0).abs() < 1e-9);
+        pts.reverse();
+        assert_eq!(straight_edge_axis(&pts), Some(axis));
+    }
+    for pts in [
+        vec![],
+        vec![Vec3::X],
+        vec![Vec3::X, Vec3::X],
+        vec![Vec3::ZERO, Vec3::Y, Vec3::X],
+        vec![Vec3::ZERO, Vec3::new(f64::NAN, 0.0, 0.0), Vec3::X],
+        vec![Vec3::ZERO, Vec3::X * f64::INFINITY],
+    ] {
+        assert!(straight_edge_axis(&pts).is_none(), "{pts:?}");
+    }
 }
 
 /// The centre of the first text shape reading `text` in a frame's output.
@@ -288,6 +507,45 @@ fn picks_on_one_component_say_why_and_offer_components() {
     assert_eq!((c[0].1["a"]["occurrence"].clone(), c[0].1["b"]["occurrence"].clone()), (json!(occ(&app, "Body1")), json!(occ(&app, "Body2"))));
     let out = frame(&mut app, vec![]);
     assert!(text_at(&out, &why).is_none(), "nothing left to say");
+}
+
+#[test]
+fn rigid_group_bodies_in_one_component_explain_how_to_separate_them() {
+    for component in [None, Some("Part")] {
+        let mut s = Session::default();
+        if let Some(name) = component {
+            s.execute("component.create", &json!({"name": name})).unwrap();
+        }
+        for x in [0, 30, 60, 90, 120] {
+            s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10, "corner": [x, 0, 0]})).unwrap();
+        }
+        let mut app = SolveApp::new(s, Services::default());
+        app.session.selection = (1..=5).map(|i| Sel::Body { name: format!("Body{i}") }).collect();
+        app.start("joint.rigid_group");
+        let d = app.dialog.take().unwrap();
+        assert_eq!(
+            apply_commands(&app, &d).unwrap_err(),
+            "These 5 bodies are all in one component (or in the design itself): use Create Components from Bodies first."
+        );
+        app.run("component.from_bodies", json!({"bodies": ["Body1", "Body2", "Body3", "Body4", "Body5"]})).unwrap();
+        assert_eq!(apply_commands(&app, &d).unwrap()[0].1["occurrences"].as_array().unwrap().len(), 5);
+    }
+}
+
+#[test]
+fn rigid_group_preserves_two_instances_of_one_component() {
+    let mut s = Session::default();
+    let first = s.execute("component.create", &json!({"name": "Part"})).unwrap()["occurrence"].as_u64().unwrap();
+    s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10})).unwrap();
+    let second = s.execute("occurrence.copy", &json!({"occurrence": first, "translate": [30, 0, 0]})).unwrap()["occurrence"].as_u64().unwrap();
+    s.selection = [first, second].into_iter().map(|id| Sel::Body { name: s.occurrence_bodies(&[id], false).unwrap()[0].clone() }).collect();
+    let mut app = SolveApp::new(s, Services::default());
+    app.start("joint.rigid_group");
+    let d = app.dialog.take().unwrap();
+    let commands = apply_commands(&app, &d).unwrap();
+    assert_eq!(commands, vec![("joint.rigid_group".into(), json!({"occurrences": [first, second]}))]);
+    crate::dialogs::run_dialog(&mut app, &d).unwrap();
+    assert_eq!(app.session.doc.assembly.joints.len(), 1);
 }
 
 /// Two top faces mate face to face: B ends up upside down on A, not inside it;
@@ -411,6 +669,59 @@ fn drive_slider_previews_intermediate_positions_before_release() {
     assert_eq!(h.app.session.doc, before, "cancel leaves the joint at its original angle");
 }
 
+/// Dragging the slider rewrites the value box, which keeps its focus (a drag is not a click) and
+/// its selection: the rewritten text must not open the parameter suggestions over the slider.
+#[test]
+fn slider_drag_does_not_open_suggestions_over_the_slider() {
+    let mut h = crate::scenario::Harness::new();
+    h.app = two_boxes();
+    for name in ["depth", "drop"] {
+        h.app.run("parameters.add", json!({"name": name, "expression": "5 mm"})).unwrap();
+    }
+    let (a, b) = (occ(&h.app, "A"), occ(&h.app, "B"));
+    h.app
+        .run(
+            "joint.create",
+            json!({"type": "revolute", "a": {"occurrence": a, "face": [10, 10, 10]},
+        "b": {"occurrence": b, "face": [40, 10, 0]}, "limits": [[-90, 90]]}),
+        )
+        .unwrap();
+    h.app.start("joint.drive");
+    h.frames(4);
+    let editor = egui::Id::new("sc_drive_value");
+    let bounds = h
+        .output
+        .accesskit_update
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .find_map(|(_, n)| (n.role() == egui::accesskit::Role::Slider).then(|| n.bounds()).flatten())
+        .expect("drive slider");
+    let at = |fraction: f64| egui::pos2((bounds.x0 + fraction * (bounds.x1 - bounds.x0)) as f32, ((bounds.y0 + bounds.y1) / 2.0) as f32);
+    h.app.synthetic.extend([
+        egui::Event::PointerMoved(at(0.3)),
+        egui::Event::PointerButton { pos: at(0.3), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+    ]);
+    // Past 0 deg the selection left from "0 deg" ends after the "d" of "6.0 deg": a word.
+    for step in 0..=10 {
+        h.app.synthetic.push(egui::Event::PointerMoved(at(0.3 + 0.023 * step as f64)));
+        h.frames(2);
+        assert!(!crate::expression_complete::showing(&h.ctx, editor), "suggestions opened during the drag (step {step})");
+    }
+    h.app.synthetic.push(egui::Event::PointerButton {
+        pos: at(0.53),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
+    h.frames(3);
+    assert!(h.ctx.memory(|m| m.has_focus(editor)), "the value box kept its focus through the drag");
+    assert!(!crate::expression_complete::showing(&h.ctx, editor), "suggestions opened after the drag");
+    let Some(Dialog { kind: Kind::Assembly(Asm::Drive { values, .. }), .. }) = h.app.dialog.as_ref() else { panic!("drive dialog") };
+    assert_eq!(values[0].get(3..5), Some(" d"), "the caret ends after a \"d\": {values:?}");
+}
+
 /// Named joint origins are drawn where their component is: a drive of the occurrence, or a free
 /// move not captured yet, carries them along.
 #[test]
@@ -490,6 +801,7 @@ fn drive_says_where_a_loop_stopped_it() {
         new_body: [2, 2, 2, 255],
         removed: [3, 3, 3, 100],
         edge: [0, 0, 0, 255],
+        ghost: true,
     };
     let rocker = app.session.doc.assembly.joints.iter().position(|j| j.name == "Rocker").unwrap();
     let mut d = drive_joint(&app, app.session.doc.assembly.joints[rocker].id).unwrap();
@@ -549,6 +861,7 @@ fn drive_says_when_its_joint_is_joined_to_nothing_grounded() {
         new_body: [2, 2, 2, 255],
         removed: [3, 3, 3, 100],
         edge: [0, 0, 0, 255],
+        ghost: true,
     };
     let b = world_preview(&app.session, &apply_commands(&app, &d).unwrap(), colors).unwrap().unwrap();
     let why = b.stopped.as_ref().and_then(drive_stop).unwrap();
@@ -635,4 +948,56 @@ fn motion_trace_keeps_the_picked_point_path() {
         apply_point(&seen, apply_point(&mat_inverse(&put).unwrap(), at(&json!({"point": start}))))
     };
     assert!(drawn.dist(shown) < 1e-6, "{drawn:?} wants {shown:?}");
+    // The dialog retained the picked face, rather than its old coordinates. Resizing that
+    // part raises its top face and the whole saved trajectory by the same amount.
+    let component = app.session.doc.find_component("Coupler").unwrap();
+    let height = app
+        .session
+        .doc
+        .features
+        .iter()
+        .find(|f| f.component == component && matches!(f.kind, solidcraft_engine::doc::FeatureKind::Box { .. }))
+        .unwrap()
+        .param_names[2]
+        .clone();
+    app.run("parameters.change", json!({"name":height,"expression":"4 mm"})).unwrap();
+    let updated = &app.session.doc.sketch(sketch).unwrap().wires[0].fit;
+    assert!(updated.len() == wire.fit.len() && updated.iter().zip(&wire.fit).all(|(a, b)| (*a - *b - Vec3::new(0.0, 0.0, 2.0)).len() < 1e-6));
+}
+
+#[test]
+fn inch_joint_offsets_limits_and_drive_values_keep_their_units() {
+    let mut app = two_boxes();
+    app.run("document.units", json!({"units":"in"})).unwrap();
+    app.start("joint.create");
+    let mut d = app.dialog.clone().unwrap();
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(10.0, 10.0, 10.0)).unwrap());
+    d.pick(&app.session, face_sel(&app.session, Vec3::new(40.0, 10.0, 0.0)).unwrap());
+    let Kind::Assembly(Asm::Joint(f)) = &mut d.kind else { panic!("no joint") };
+    f.kind = TYPES.iter().position(|t| *t == "slider").unwrap();
+    f.fit_limits(&app.session.doc);
+    assert_eq!((f.limits[0].1.as_str(), f.limits[0].2.as_str()), ("0 in", "20 in"));
+    f.offset[0] = "0.25".into();
+    f.offset[2] = "2 mm".into();
+    f.limits[0] = (true, "0".into(), "0.5".into());
+    let (_, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!(p["offset"], json!("2 mm"));
+    assert_eq!(p["limits"], json!([["0 in", "0.5 in"]]));
+    let origin = &p["a"]["frame"]["origin"];
+    let at = Vec3::new(origin[0].as_f64().unwrap(), origin[1].as_f64().unwrap(), origin[2].as_f64().unwrap());
+    assert!((at.dist(Vec3::new(10.0, 10.0, 10.0)) - 6.35).abs() < 1e-9);
+    app.run("joint.create", p).unwrap();
+    let joint = app.session.doc.assembly.joints[0].id;
+    app.start("joint.drive");
+    let mut d = app.dialog.clone().unwrap();
+    let Kind::Assembly(Asm::Drive { values, .. }) = &mut d.kind else { panic!("no drive") };
+    values[0] = "0.25".into();
+    let (_, p) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!(p["values"], json!(["0.25 in"]));
+    app.run("joint.drive", p).unwrap();
+    let actual = app.session.doc.assembly.joints.iter().find(|j| j.id == joint).unwrap().values[0];
+    assert!((actual - 6.35).abs() < 1e-9, "{actual}");
+    let edit = edit_joint(&app, joint).unwrap();
+    let Kind::Assembly(Asm::Joint(f)) = edit.kind else { panic!("no edit") };
+    assert_eq!((f.limits[0].1.as_str(), f.limits[0].2.as_str()), ("0 in", "0.5 in"));
 }

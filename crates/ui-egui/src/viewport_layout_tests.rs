@@ -1,5 +1,6 @@
 use super::*;
 use crate::scenario::Harness;
+use crate::viewport::NavMode;
 use serde_json::json;
 use solidcraft_engine::render::StandardView;
 
@@ -308,6 +309,81 @@ fn opening_different_command_dialogs_keeps_published_navigation_positions() {
     }
 }
 
+/// OK and Cancel in the view's corner (#6709): the pair holds the content's top right corner and
+/// the axis view or cube moves down below it, clear of the pair and the navigation bar; without
+/// the pair (or without room for it) nothing moves.
+#[test]
+fn the_corner_pair_takes_the_top_right_and_the_view_navigator_moves_below_it() {
+    let corner = vec2(92.0, 48.0);
+    for style in [crate::prefs::NavigatorStyle::Axes, crate::prefs::NavigatorStyle::Cube] {
+        for (width, height) in [(1400.0, 900.0), (700.0, 450.0), (310.0, 240.0), (160.0, 160.0), (90.0, 50.0)] {
+            let vp = Rect::from_min_size(pos2(20.0, 30.0), vec2(width, height));
+            let content = Rect::from_min_max(pos2(vp.left() + width * 0.25, vp.top()), vp.max);
+            let plain = Layout::with_content(vp, content, &[], 1.0, style, egui::Vec2::ZERO);
+            let held = Layout::with_content(vp, content, &[], 1.0, style, corner);
+            assert!(!plain.confirm.is_positive(), "{plain:?}");
+            assert_eq!(held.navigation, plain.navigation, "the navigation bar never moves");
+            assert!(!held.axis_view.intersect(held.navigation).is_positive(), "{held:?}");
+            if !held.confirm.is_positive() {
+                assert_eq!(held.axis_view, plain.axis_view, "no room for the pair: {held:?}");
+                continue;
+            }
+            assert_eq!(held.confirm.size(), corner);
+            assert!(content.contains_rect(held.confirm), "{held:?}");
+            assert_eq!((held.confirm.right(), held.confirm.top()), (content.right() - 8.0, content.top() + 8.0));
+            assert!(!held.drawable.intersect(held.confirm).is_positive(), "fit keeps the model clear of it");
+            if held.axis_view.is_positive() {
+                assert!(held.axis_view.top() >= held.confirm.bottom(), "{style:?} {width}x{height}: {held:?}");
+                assert_eq!(held.axis_view.right(), content.right());
+                assert!(content.contains_rect(held.axis_view));
+            }
+        }
+    }
+    let roomy = Layout::with_content(
+        Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0)),
+        Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0)),
+        &[],
+        1.0,
+        crate::prefs::NavigatorStyle::Axes,
+        corner,
+    );
+    assert!(roomy.confirm.is_positive() && roomy.axis_view.is_positive(), "{roomy:?}");
+}
+
+/// The pair in the running app: shown only with the preference and while a dialog is open, the
+/// axis view below it, and the pointer over it reaching neither picking nor navigation.
+#[test]
+fn the_corner_pair_follows_the_dialog_and_keeps_the_pointer_from_the_model() {
+    for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+        let mut h = Harness::new();
+        h.call("ui.set", json!({"layout":mode}));
+        h.app.run("solid.box", json!({"length":40,"width":30,"height":20})).unwrap();
+        h.settle();
+        let axis = crate::scenario::rect_of("axis_view:outer").unwrap();
+        h.app.start("solid.fillet");
+        h.settle();
+        assert!(crate::scenario::rect_of("view:confirm").is_none(), "off by default");
+        assert_eq!(crate::scenario::rect_of("axis_view:outer"), Some(axis));
+        h.call("ui.prefs", json!({"view_confirm_corner": true}));
+        h.settle();
+        let pair = crate::scenario::rect_of("view:confirm").expect("the pair while a dialog is open");
+        let moved = crate::scenario::rect_of("axis_view:outer").unwrap();
+        assert!(moved.top() >= pair.bottom() && moved.right() == axis.right(), "{mode:?}: {moved:?} below {pair:?}");
+        assert!(crate::shell::covered(&h.app, pair.center()), "one of the shell's covered rects");
+        let dialog = h.app.viewport.dialog_rect.unwrap();
+        assert!(!dialog.intersects(pair), "{mode:?}: {dialog:?} / {pair:?}");
+        let (ok, cancel) = (crate::scenario::rect_of("view:confirm:ok").unwrap(), crate::scenario::rect_of("view:confirm:cancel").unwrap());
+        assert!(pair.contains_rect(ok) && pair.contains_rect(cancel) && ok.right() < cancel.left(), "the check, then the cross in the corner");
+        assert!(ok.width() >= 40.0 && ok.height() >= 40.0, "large enough to hit easily");
+        h.step(&json!({"move":[pair.center().x, pair.center().y]})).unwrap();
+        assert_eq!(h.app.viewport.mouse, None, "{mode:?}: the model under the pair never sees the pointer");
+        h.app.dialog = None;
+        h.settle();
+        assert!(crate::scenario::rect_of("view:confirm").is_none(), "gone with the dialog");
+        assert_eq!(crate::scenario::rect_of("axis_view:outer"), Some(axis), "{mode:?}: the axis view returns");
+    }
+}
+
 #[test]
 fn tiny_viewports_never_overlap_navigation_and_axis_view() {
     for width in [39.0, 40.0, 90.0, 120.0, 160.0, 310.0] {
@@ -351,4 +427,79 @@ fn floating_fit_uses_the_measured_browser_and_history_cards_at_each_size() {
             }
         }
     }
+}
+
+fn click_nav_mode(h: &mut Harness, mode: NavMode) {
+    let nav = crate::scenario::rect_of("nav:outer").unwrap();
+    let column = match mode {
+        NavMode::Orbit => 0,
+        NavMode::Pan => 2,
+        NavMode::Zoom => 3,
+    };
+    let p = pos2(nav.left() + 5.0 + column as f32 * 30.0 + 13.0, nav.top() + 15.0);
+    h.call("ui.click", json!({"x":p.x,"y":p.y}));
+}
+
+#[test]
+fn escape_ends_nav_bar_modes_and_left_drag_stops_moving_the_camera() {
+    for mode in [NavMode::Pan, NavMode::Orbit, NavMode::Zoom] {
+        let mut h = Harness::new();
+        h.settle();
+        click_nav_mode(&mut h, mode);
+        assert_eq!(h.app.viewport.nav, Some(mode));
+        click_nav_mode(&mut h, mode);
+        assert_eq!(h.app.viewport.nav, None, "clicking the active button still toggles it off");
+        click_nav_mode(&mut h, mode);
+        let p = h.app.viewport.layout.as_ref().unwrap().drawable.center();
+        let drag = json!({"x0":p.x,"y0":p.y,"x1":p.x+40.0,"y1":p.y+25.0,"steps":8});
+        let before = h.app.cam;
+        h.call("ui.drag", drag.clone());
+        assert_ne!(h.app.cam, before, "{mode:?}: the active mode moves the camera");
+        h.step(&json!({"key":"Escape"})).unwrap();
+        assert_eq!(h.app.viewport.nav, None, "{mode:?}");
+        let stopped = h.app.cam;
+        h.call("ui.drag", drag);
+        assert_eq!(h.app.cam, stopped, "{mode:?}: Escape restores normal left-drag behavior");
+    }
+}
+
+#[test]
+fn escape_ends_navigation_before_cancelling_a_dialog() {
+    let mut h = Harness::new();
+    h.app.start("inspect.measure");
+    h.settle();
+    assert!(h.app.dialog.is_some());
+    click_nav_mode(&mut h, NavMode::Pan);
+    assert_eq!(h.app.viewport.nav, Some(NavMode::Pan));
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert_eq!(h.app.viewport.nav, None);
+    assert!(h.app.dialog.is_some(), "ending navigation keeps the dialog open");
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert!(h.app.dialog.is_none(), "Escape without navigation still cancels the dialog");
+}
+
+#[test]
+fn escape_ends_navigation_before_sketch_tools_and_does_not_count_as_a_finish_press() {
+    let mut h = Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[0,0],[10,0]]})).unwrap();
+    h.app.start("sketch.line");
+    h.settle();
+    let sketch = h.app.session.active_sketch;
+    click_nav_mode(&mut h, NavMode::Pan);
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert_eq!(h.app.viewport.nav, None);
+    assert!(h.app.tool.is_some(), "ending navigation leaves the sketch tool active");
+    assert!(h.app.last_escape.is_none());
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert!(h.app.tool.is_none(), "Escape without navigation still cancels the tool");
+    assert_eq!(h.app.session.active_sketch, sketch);
+    // Cancel navigation with no tool: the next Escape must not finish the sketch.
+    click_nav_mode(&mut h, NavMode::Pan);
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert_eq!(h.app.session.active_sketch, sketch);
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert_eq!(h.app.session.active_sketch, sketch);
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert!(h.app.session.active_sketch.is_none(), "two ordinary quick Escapes still finish the sketch");
 }

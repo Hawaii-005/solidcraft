@@ -3,14 +3,18 @@
 //! belong to their feature's component unless moved; occurrences place components (instances
 //! share contents, "paste new" copies them) and can be grounded and moved.
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
-use solidcraft_doc::{FeatureKind, Mat, Occurrence};
+use solidcraft_doc::{Feature, FeatureKind, Mat, Occurrence};
 use solidcraft_geom::Vec3;
 
 use super::CommandSpec;
 use crate::params::{bad, bool_, str_, string_list, vec3};
 use crate::{Result, Session};
 
+#[path = "component_drag.rs"]
+mod drag;
 #[path = "component_matrix.rs"]
 pub(super) mod matrix;
 #[path = "component_properties.rs"]
@@ -24,10 +28,13 @@ mod transfer;
 mod occurrence_tests;
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("component.cycle_color", "Cycle Component Color", cycle_color)
+        .icon("colored_components").doc_only()
+        .params("component: id or name; saves the next identification colour and enables Component Colors; shared by every instance, separate from appearances"),
     CommandSpec::new("component.create", "New Component", new_component)
         .at("SOLID", "ASSEMBLE")
         .icon("component")
-        .params("name?, parent?: component id or name (default: the active one); parent_path?: exact parent placement; activate?: bool (default true)"),
+        .params("name?, parent?: component id or name (default: the active one); parent_path?: exact parent placement; activate?: bool (default true); grounded?: bool (default: true for the design's first part, false otherwise)"),
     CommandSpec::new("component.from_bodies", "Create Components from Bodies", from_bodies)
         .icon("component")
         .params("bodies: [names] → one new component per body, named after it"),
@@ -38,10 +45,10 @@ pub static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new("component.properties", "Component Physical Properties", properties::component)
         .icon("measure").noundo()
-        .params("component?: id or name (default active); descendants?: bool (default true). Measures the first placement, or all placements for root, including pending moves; material-aware mass and center of mass in world coordinates"),
+        .params("component?: id or name (default active); descendants?: bool (default true). Measures the first placement, or all placements for root, including pending moves; material-aware mass and center of mass in world coordinates; volume, density, mass and center of mass only for closed, consistently oriented bodies; total.open_bodies_skipped counts open bodies excluded from volume/mass totals"),
     CommandSpec::new("occurrence.properties", "Occurrence Physical Properties", properties::occurrence)
         .icon("measure").noundo()
-        .params("occurrence: id or name; path?: [occurrence ids] (required if nested under multiple instances); descendants?: bool (default true). Physical properties of this placement in world coordinates, including pending moves"),
+        .params("occurrence: id or name; path?: [occurrence ids] (required if nested under multiple instances); descendants?: bool (default true). Physical properties of this placement in world coordinates, including pending moves; volume, density, mass and center of mass only for closed, consistently oriented bodies; total.open_bodies_skipped counts open bodies excluded from volume/mass totals"),
     CommandSpec::new("component.rename", "Rename Component", rename).icon("rename").params("component, name"),
     CommandSpec::new("component.delete", "Delete Component", delete).icon("delete").params("component: deletes it, its subcomponents, occurrences and features"),
     CommandSpec::new("component.unlock", "Unlock Contents", unlock).icon("rigid_group").params(
@@ -54,7 +61,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("component (or occurrence): what to place again; path?: validates selected occurrence; parent?: component (default: the same parent); translate?: [x,y,z]. Copies the selected effective transform, including pending moves"),
     CommandSpec::new("component.paste_new", "Paste New", paste_new).icon("paste").params("component: independently copy its nested definition graph and history, materials and styles; occurrence?, path?: selected source placement; translate?: [x,y,z]. Reassigned external bodies become base geometry; retained external links and omitted boundary joints are reported"),
     CommandSpec::new("occurrence.move", "Move Occurrence", move_occurrence).icon("move")
-        .params("occurrence; path?: exact placement; space?: local|world (default local); translate?: [x,y,z]; axis?: [x,y,z], angle?: radians or \"30 deg\", origin?: [x,y,z]; matrix?: [12 or 16 numbers] (instead of translate/axis/angle/origin: a rigid move as a row-major 3x4 rotation-and-translation or 4x4 matrix, flat or as rows; one that is a rotation only up to rounding is orthonormalised, a scale, shear or mirror is refused); tolerance?: largest accepted |RᵀR − I| (default 1e-9, at most 1e-3); capture?: bool (default true; false keeps it pending until Capture Position). Nested occurrence definitions remain shared"),
+        .params("occurrence; path?: exact placement; space?: local|world (default local); translate?: [x,y,z]; axis?: [x,y,z], angle?: radians or \"30 deg\", origin?: [x,y,z]; matrix?: [12 or 16 numbers] (instead of translate/axis/angle/origin: a rigid move as a row-major 3x4 rotation-and-translation or 4x4 matrix, flat or as rows; one that is a rotation only up to rounding is orthonormalised, a scale, shear or mirror is refused); tolerance?: largest accepted |RᵀR − I| (default 1e-9, at most 1e-3); capture?: bool (default true; false keeps it pending until Capture Position); move_grounded?: bool (default false: a grounded occurrence refuses; true moves it and it stays grounded). Nested occurrence definitions remain shared"),
+    CommandSpec::new("occurrence.drag", "Drag Occurrence", drag::drag).icon("move").params(
+        "occurrence or path: exact placement; at: [x,y,z] world point on it; point: [x,y,z] where it goes. Moves the placement by \
+         point - at (with any chain of joints it is in that is joined to nothing grounded) and captures its position; other pending \
+         moves stay pending. Shared definitions move in all placements. Grounded parts and parts joints hold to something fixed are refused (joint.reach moves those)",
+    ),
     CommandSpec::new("occurrence.ground", "Ground", ground).icon("ground").params("occurrence; grounded?: bool (default toggles)"),
     CommandSpec::new("component.capture_position", "Capture Position", capture).at("SOLID", "POSITION").icon("capture").params("keeps pending occurrence moves"),
     CommandSpec::new("component.revert_position", "Revert Position", revert).at("SOLID", "POSITION").icon("revert").noundo().params("occurrences?: [ids] (default all); drops selected pending occurrence moves"),
@@ -109,6 +121,12 @@ pub(super) fn valid_position(m: &Mat) -> bool {
 
 pub(super) fn new_component(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "component.create";
+    if let Some(params) = p.as_object()
+        && let Some(key) = params.keys().find(|key| !matches!(key.as_str(), "name" | "parent" | "parent_path" | "activate" | "grounded"))
+    {
+        let hint = if params.contains_key("bodies") { "; use component.move_bodies or component.from_bodies to move bodies" } else { "" };
+        return Err(bad(cmd, format!("unknown parameter `{key}`; accepted parameters: name, parent, parent_path, activate, grounded{hint}")));
+    }
     let parent = if p.get("parent").is_some() { component(s, p, "parent", cmd)? } else { s.active_component };
     let parent_path = if let Some(value) = p.get("parent_path") {
         let path = value
@@ -129,7 +147,16 @@ pub(super) fn new_component(s: &mut Session, p: &Value) -> Result<Value> {
     if parent_path.len() >= 64 {
         return Err(bad(cmd, "new component exceeds occurrence depth limit"));
     }
+    let grounded = match p.get("grounded") {
+        None => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| bad(cmd, "grounded must be true or false"))?),
+    };
     let id = s.doc_mut().add_component(str_(p, "name"), parent)?;
+    if let Some(grounded) = grounded
+        && let Some(o) = s.doc_mut().occurrences.iter_mut().find(|o| o.component == id)
+    {
+        o.grounded = grounded;
+    }
     if p.get("activate").and_then(Value::as_bool).unwrap_or(true) {
         let mut path = parent_path;
         if let Some(o) = s.doc.occurrence_of(id) {
@@ -139,8 +166,8 @@ pub(super) fn new_component(s: &mut Session, p: &Value) -> Result<Value> {
         s.active_occurrence_path = Some(path);
     }
     let name = s.doc.components.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_default();
-    let occ = s.doc.occurrence_of(id).map(|o| o.id);
-    Ok(json!({"component": id, "name": name, "parent": parent, "occurrence": occ}))
+    let occ = s.doc.occurrence_of(id);
+    Ok(json!({"component": id, "name": name, "parent": parent, "occurrence": occ.map(|o| o.id), "grounded": occ.is_some_and(|o| o.grounded)}))
 }
 
 fn from_bodies(s: &mut Session, p: &Value) -> Result<Value> {
@@ -182,24 +209,30 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         }
         v
     };
+    // Each component's bodies, features, occurrences and children, grouped once rather than
+    // searched for every component (thousands of each in a design with many components).
+    let mut bodies_of: HashMap<u64, Vec<&str>> = HashMap::new();
+    for b in &st.bodies {
+        bodies_of.entry(doc.model_body_component(b)).or_default().push(b.name.as_str());
+    }
+    let mut features_of: HashMap<u64, Vec<&Feature>> = HashMap::new();
+    for f in &doc.features {
+        features_of.entry(f.component).or_default().push(f);
+    }
+    let (mut occurrences_of, mut children_of): (HashMap<u64, Vec<&Occurrence>>, HashMap<u64, Vec<&Occurrence>>) = Default::default();
+    for o in &doc.occurrences {
+        occurrences_of.entry(o.component).or_default().push(o);
+        children_of.entry(o.parent).or_default().push(o);
+    }
     let node = |id: u64, name: &str, parent: Option<u64>| {
-        let bodies: Vec<&str> = st.bodies.iter().filter(|b| doc.model_body_component(b) == id).map(|b| b.name.as_str()).collect();
-        let features: Vec<&str> = doc
-            .features
-            .iter()
-            .filter(|f| f.component == id && !matches!(f.kind, FeatureKind::Sketch { .. } | FeatureKind::ConstructionPlane { .. }))
-            .map(|f| f.name.as_str())
-            .collect();
-        let sketches: Vec<&str> =
-            doc.features.iter().filter(|f| f.component == id && matches!(f.kind, FeatureKind::Sketch { .. })).map(|f| f.name.as_str()).collect();
-        let construction: Vec<&str> = doc
-            .features
-            .iter()
-            .filter(|f| f.component == id && matches!(f.kind, FeatureKind::ConstructionPlane { .. }))
-            .map(|f| f.name.as_str())
-            .collect();
-        let occurrences: Vec<Value> = doc.occurrences.iter().filter(|o| o.component == id).map(placement).collect();
-        let children: Vec<Value> = doc.occurrences.iter().filter(|o| o.parent == id).map(|o| if compact { json!(o.id) } else { json!(o) }).collect();
+        let bodies = bodies_of.get(&id).cloned().unwrap_or_default();
+        let features = features_of.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let named = |keep: fn(&FeatureKind) -> bool| -> Vec<&str> { features.iter().filter(|f| keep(&f.kind)).map(|f| f.name.as_str()).collect() };
+        let sketches = named(|k| matches!(k, FeatureKind::Sketch { .. }));
+        let construction = named(|k| matches!(k, FeatureKind::ConstructionPlane { .. }));
+        let features = named(|k| !matches!(k, FeatureKind::Sketch { .. } | FeatureKind::ConstructionPlane { .. }));
+        let occurrences: Vec<Value> = occurrences_of.get(&id).into_iter().flatten().map(|o| placement(o)).collect();
+        let children: Vec<Value> = children_of.get(&id).into_iter().flatten().map(|o| if compact { json!(o.id) } else { json!(o) }).collect();
         let bodies = if body_names { json!(bodies) } else { json!(bodies.len()) };
         json!({"id": id, "name": name, "parent": parent, "bodies": bodies, "features": names(features), "sketches": names(sketches),
             "construction": names(construction), "occurrences": occurrences, "children": children})
@@ -238,31 +271,15 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     if id == 0 {
         return Err(bad(cmd, "the design itself can't be deleted"));
     }
-    let gone: Vec<u64> = s.doc.components.iter().filter(|c| s.doc.component_within(c.id, id)).map(|c| c.id).collect();
-    if s.doc.features.iter().any(|feature| {
-        !gone.contains(&feature.component)
-            && matches!(&feature.kind, FeatureKind::BodyTransfer { from, to, .. } if gone.contains(from) || gone.contains(to))
-    }) {
-        return Err(bad(
-            cmd,
-            "component supplies a recorded body transfer outside this subtree; remove that transfer history before deleting its source",
-        ));
-    }
-    let feats: Vec<u64> = s.doc.features.iter().filter(|f| gone.contains(&f.component)).map(|f| f.id).collect();
-    let d = s.doc_mut();
-    for f in &feats {
-        let _ = d.delete_feature(*f);
-    }
-    d.components.retain(|c| !gone.contains(&c.id));
-    d.remove_configuration_components(&gone);
-    d.occurrences.retain(|o| !gone.contains(&o.component) && !gone.contains(&o.parent));
-    let moved_out: Vec<String> = d.body_components.iter().filter(|(_, c)| gone.contains(c)).map(|(b, _)| b.clone()).collect();
-    d.body_components.retain(|_, c| !gone.contains(c));
-    d.body_offsets.retain(|b, _| !moved_out.contains(b));
+    let removed = s.doc_mut().remove_component_tree(id).map_err(|e| match e {
+        solidcraft_doc::DocError::Invalid(msg) => bad(cmd, msg),
+        e => e.into(),
+    })?;
+    let gone = removed.components;
     if gone.contains(&s.active_component) {
         s.active_component = 0;
     }
-    Ok(json!({"deleted": gone, "features": feats}))
+    Ok(json!({"deleted": gone, "features": removed.features}))
 }
 
 fn unlock(s: &mut Session, p: &Value) -> Result<Value> {
@@ -404,8 +421,11 @@ fn move_occurrence(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "occurrence.move";
     let id = occurrence(s, p, cmd)?;
     let o = s.doc.occurrences.iter().find(|o| o.id == id).cloned().ok_or_else(|| bad(cmd, "occurrence"))?;
-    if o.grounded {
-        return Err(bad(cmd, format!("{} is grounded", o.name)));
+    if o.grounded && bool_(p, "move_grounded") != Some(true) {
+        return Err(bad(
+            cmd,
+            format!("{} is grounded: unground it first (occurrence.ground; a design's first part is grounded when it is made)", o.name),
+        ));
     }
     if let Some(mut group) = s.held_by_rigid_group(id) {
         // The outermost component the group holds it in moves it.
@@ -547,4 +567,14 @@ pub fn to_active_frame(s: &Session, kind: &mut FeatureKind) {
     if let Some(inv) = solidcraft_doc::mat_inverse(&m) {
         kind.transform_geometry(&inv);
     }
+}
+
+fn cycle_color(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "component.cycle_color";
+    let id = component(s, p, "component", cmd)?;
+    let next = solidcraft_doc::component_color::next_color(s.doc.component_identification_color(id));
+    let c = s.doc_mut().components.iter_mut().find(|c| c.id == id).ok_or_else(|| bad(cmd, "choose a component below the design root"))?;
+    c.identification_color = Some(next);
+    s.colored_components = Some(());
+    Ok(json!({"component": id, "color": next}))
 }

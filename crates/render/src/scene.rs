@@ -58,6 +58,9 @@ pub const MIN_ALPHA: f64 = 0.05;
 pub struct SceneLine {
     pub points: Vec<Vec3>,
     pub color: Rgb,
+    /// How opaque the line is: 1 is solid, below 1 it is blended with what is under it (the
+    /// grid fades out with the distance, #4214).
+    pub alpha: f32,
     /// Width in output pixels.
     pub width: f64,
     /// Draw over everything (sketch geometry being edited).
@@ -79,6 +82,8 @@ pub struct Scene {
     pub clip: Option<(Vec3, f64)>,
     /// The colour the section cap is tinted toward (default: [`SECTION_CAP`]).
     pub cap: Option<Rgb>,
+    /// The section cap without its hatch: plain, in the body's own colour.
+    pub plain_cap: bool,
     /// A surface analysis shading the meshes (zebra, draft, curvature map, ...).
     pub analysis: Option<SceneAnalysis>,
 }

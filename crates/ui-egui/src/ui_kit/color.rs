@@ -1,5 +1,6 @@
 //! Opaque document RGB editing. Interface paint uses tokens; the gradients are colour data.
 use super::{layout::label, metrics::dimension};
+use crate::ui_kit::{Container, Surface};
 use crate::{i18n, scenario, theme::Tokens};
 use egui::{Color32, Response, Sense, Ui, ecolor::HsvaGamma, pos2, vec2};
 
@@ -16,19 +17,20 @@ pub(crate) fn color_field(ui: &mut Ui, rgb: &mut [u8; 3]) -> Response {
         rect,
         t.control_radius,
         crate::theme::srgb(rgb.map(|c| f32::from(c) / 255.0)),
-        egui::Stroke::new(1.0, t.control_border),
+        t.control_border_stroke(t.control_border),
         egui::StrokeKind::Inside,
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, ui.is_enabled(), i18n::tr("color.edit")));
     publish(&format!("dialog:color:{}", label(ui)), &response);
     let mut edited = false;
-    egui::Popup::menu(&response)
+    Container::new(ui.ctx(), Surface::Popup)
+        .menu(&response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(t.form_card_width + t.space_24 + t.space_12)
         .frame(
-            egui::Frame::popup(ui.style())
+            Container::popup_frame(ui.style())
                 .fill(t.control_fill)
-                .stroke(egui::Stroke::new(1.0, t.border))
+                .stroke(t.control_border_stroke(t.border))
                 .corner_radius(t.radius_xl)
                 .inner_margin(t.space_12),
         )
@@ -163,7 +165,7 @@ pub(crate) fn color_popover(ui: &mut Ui, rgb: &mut [u8; 3]) -> bool {
             strip,
             t.control_radius,
             crate::theme::srgb(rgb.map(|c| f32::from(c) / 255.0)),
-            egui::Stroke::new(1.0, t.control_border),
+            t.control_border_stroke(t.control_border),
             egui::StrokeKind::Inside,
         );
         publish("color:current", &response);
@@ -208,7 +210,12 @@ fn gradient(ui: &Ui, rect: egui::Rect, color: impl Fn(f32, f32) -> Color32) {
         }
     }
     ui.painter().add(egui::Shape::mesh(mesh));
-    ui.painter().rect_stroke(rect, Tokens::get().control_radius, egui::Stroke::new(1.0, Tokens::get().control_border), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(
+        rect,
+        Tokens::get().control_radius,
+        Tokens::get().control_border_stroke(Tokens::get().control_border),
+        egui::StrokeKind::Inside,
+    );
 }
 
 #[cfg(test)]

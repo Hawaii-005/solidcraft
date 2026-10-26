@@ -76,6 +76,10 @@ impl FeatureKind {
             ExprRole::Placement => placement.push(e.as_str()),
         });
         inputs.extend(placement);
+        if let FeatureKind::Sketch { sketch, .. } = self {
+            inputs.extend(sketch.patterns.iter().filter_map(|p| p.count_expression.as_deref()));
+            inputs.extend(sketch.patterns.iter().flat_map(|p| p.expressions.values().map(String::as_str)));
+        }
         inputs
     }
 }
@@ -100,6 +104,9 @@ pub struct ParamRow {
     /// Names this one's expression uses, and names whose expressions use this one.
     pub uses: Vec<String>,
     pub used_by: Vec<String>,
+    /// A text parameter's text (its unit is `text`, its value none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 fn unit_of(k: Kind) -> &'static str {
@@ -126,23 +133,19 @@ impl Document {
     }
 
     pub(crate) fn name_taken(&self, n: &str) -> bool {
-        self.param(n).is_some() || self.features.iter().any(|f| f.param_names.iter().any(|x| x == n))
+        self.param(n).is_some() || self.text_param(n).is_some() || self.features.iter().any(|f| f.param_names.iter().any(|x| x == n))
     }
 
     /// The next free `dN` name.
     pub fn next_d_name(&self) -> String {
         // Every taken name at once: asking `name_taken` for d1, d2, … searched the whole
         // design once per number, quadratic in the number of named inputs.
-        let taken: std::collections::HashSet<&str> =
-            self.params.iter().map(|p| p.name.as_str()).chain(self.features.iter().flat_map(|f| f.param_names.iter().map(String::as_str))).collect();
-        let mut n = 1;
-        loop {
-            let c = format!("d{n}");
-            if !taken.contains(c.as_str()) {
-                return c;
-            }
-            n += 1;
-        }
+        // Their numbers, so trying d1, d2 … writes no names: a design with thousands of named
+        // inputs wrote that many for every new one.
+        let names = self.params.iter().map(|p| p.name.as_str()).chain(self.features.iter().flat_map(|f| f.param_names.iter().map(String::as_str)));
+        let taken = numbers_after("d", names);
+        let n = (1..).find(|n| !taken.contains(n)).unwrap_or(1);
+        format!("d{n}")
     }
 
     /// Give a feature's inputs parameter names (keeping existing names in place).
@@ -231,6 +234,22 @@ impl Document {
         }
     }
 
+    /// A measured length (mm) written as a value in the design's units, with its unit: `1 in`
+    /// for 25.4 mm in an inch design. Kept to the micrometre, as a millimetre value would be, so
+    /// a dimension that restates the geometry moves nothing. Returns (unit, expression).
+    pub fn design_length(&self, mm: f64) -> (String, String) {
+        let u = self.units.trim();
+        let per_unit = match expr::unit_info(u) {
+            Some((Kind::Length, s)) if u != "mm" && s.is_finite() && s > 0.0 => s,
+            _ => return ("mm".into(), format!("{} mm", (mm * 1e6).round() / 1e6)),
+        };
+        let decimals = (-(1e-6 / per_unit).log10()).ceil().clamp(0.0, 12.0) as usize;
+        let text = format!("{:.*}", decimals, mm / per_unit);
+        let text = if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.') } else { &text };
+        let text = if text == "-0" { "0" } else { text };
+        (u.into(), format!("{text} {u}"))
+    }
+
     /// Every length input of every feature as the geometry reads it (mm; a unit-less result is
     /// in the design's units), for checking that an edit moves nothing.
     pub fn length_inputs(&self) -> Vec<Option<f64>> {
@@ -289,6 +308,14 @@ impl Document {
             }
             if expression.len() > 4096 || expression.trim().is_empty() {
                 return Err(DocError::Expr("expression is empty or too long".into()));
+            }
+            if let Some(p) = next.text_params.iter_mut().find(|p| p.name == *name) {
+                let text = crate::text_params::unquote(expression);
+                if p.text != text {
+                    changed.insert(name.clone());
+                }
+                p.text = text;
+                continue;
             }
             if let Some(p) = next.params.iter_mut().find(|p| p.name == *name) {
                 if p.expr != expression.trim() {
@@ -350,6 +377,7 @@ impl Document {
                 favorite: self.favorites.contains(&p.name),
                 uses: refs.get(&p.name).cloned().unwrap_or_default(),
                 used_by: used_by(&p.name),
+                text: None,
             });
         }
         for f in &self.features {
@@ -370,8 +398,27 @@ impl Document {
                     favorite: self.favorites.contains(name),
                     uses: refs.get(name).cloned().unwrap_or_default(),
                     used_by: used_by(name),
+                    text: None,
                 });
             }
+        }
+        for p in &self.text_params {
+            let readers = self.features_reading_texts(&BTreeSet::from([p.name.clone()]));
+            rows.push(ParamRow {
+                name: p.name.clone(),
+                expression: p.text.clone(),
+                unit: crate::text_params::TEXT_UNIT.into(),
+                value: None,
+                error: None,
+                comment: p.comment.clone(),
+                source: "user",
+                feature: None,
+                input: None,
+                favorite: self.favorites.contains(&p.name),
+                uses: Vec::new(),
+                used_by: readers.iter().filter_map(|id| self.feature(*id)).map(|f| format!("Feature:{}", f.name)).collect(),
+                text: Some(p.text.clone()),
+            });
         }
         rows
     }
@@ -499,6 +546,9 @@ impl Document {
             }
             return Ok(());
         }
+        if unit.map_or(self.text_param(name).is_some(), crate::text_params::is_text_unit) {
+            return self.set_text_param(name, expr_s, comment);
+        }
         if let Some(p) = Self::param_name_problem(name) {
             return Err(DocError::Invalid(p));
         }
@@ -567,6 +617,10 @@ pub enum ParamUser {
     /// A joint's offset, angle or value, or a motion link's gear, rack or screw length (`input`
     /// says which; a link is named by the joint it drives).
     Joint { joint: u64, name: String, input: String },
+    /// A sheet metal or plastic rule's value (`kind` says which, `field` which value).
+    Rule { kind: String, name: String, field: String },
+    /// The plane a canvas lies on (`input` is its label, e.g. `Offset`).
+    Canvas { canvas: u64, name: String, input: String },
 }
 
 impl ParamUser {
@@ -580,6 +634,8 @@ impl ParamUser {
                 None => format!("configuration column {column}"),
             },
             ParamUser::Joint { name, input, .. } => format!("joint {name} ({input})"),
+            ParamUser::Rule { kind, name, field } => format!("{kind} rule {name} ({field})"),
+            ParamUser::Canvas { name, input, .. } => format!("canvas {name} ({input})"),
         }
     }
 }
@@ -694,10 +750,20 @@ impl Document {
                         out.push(ParamUser::Dimension { feature: f.id, name: f.name.clone(), constraint: c.id.clone() });
                     }
                 }
-                for (what, e) in sketch.text_exprs() {
+                for pattern in &sketch.patterns {
+                    if pattern.count_expression.as_ref().is_some_and(|e| expr::references(e).iter().any(|r| r == name)) {
+                        out.push(ParamUser::Feature { feature: f.id, name: f.name.clone(), input: format!("{} Quantity", pattern.id) });
+                    }
+                }
+                for (what, e) in
+                    sketch.text_exprs().into_iter().chain(sketch.patterns.iter().flat_map(|p| p.expressions.iter().map(|(k, e)| (k.as_str(), e))))
+                {
                     if expr::references(e).iter().any(|r| r == name) {
                         out.push(ParamUser::Feature { feature: f.id, name: f.name.clone(), input: what.to_string() });
                     }
+                }
+                if sketch.text_word_exprs().iter().any(|e| crate::text_params::references(e).iter().any(|r| r == name)) {
+                    out.push(ParamUser::Feature { feature: f.id, name: f.name.clone(), input: "Text".into() });
                 }
             }
         }
@@ -707,11 +773,32 @@ impl Document {
                 out.push(ParamUser::Joint { joint, name: jname, input });
             }
         }
+        let uses = |e: &str| expr::references(e).iter().any(|r| r == name);
+        for r in &self.sheet.rules {
+            for (field, _, _) in r.fields().into_iter().filter(|(_, e, _)| uses(e)) {
+                out.push(ParamUser::Rule { kind: "sheet metal".into(), name: r.name.clone(), field: field.into() });
+            }
+        }
+        for r in &self.plastic.rules {
+            for (field, _, _) in r.fields().into_iter().filter(|(_, e, _)| uses(e)) {
+                out.push(ParamUser::Rule { kind: "plastic".into(), name: r.name.clone(), field: field.into() });
+            }
+        }
+        for c in &self.canvases {
+            c.plane.walk_exprs(&mut |(label, e, _, _)| {
+                if uses(e) {
+                    out.push(ParamUser::Canvas { canvas: c.id, name: c.name.clone(), input: label.into() });
+                }
+            });
+        }
         out
     }
 
     /// Remove a stored parameter; refused while something uses it (the error lists the users).
     pub fn remove_param(&mut self, name: &str) -> Result<()> {
+        if self.text_param(name).is_some() {
+            return self.remove_text_param(name);
+        }
         if self.param(name).is_none() {
             if self.features.iter().any(|f| f.param_names.iter().any(|n| n == name)) {
                 return Err(DocError::Invalid(format!("`{name}` is a feature's input: delete or edit the feature instead")));
@@ -746,6 +833,12 @@ impl Document {
             return Err(DocError::Invalid(format!("there is already a parameter `{new}`")));
         }
         let mut n = 0;
+        let text = self.text_param(old).is_some();
+        for p in &mut self.text_params {
+            if p.name == old {
+                p.name = new.to_string();
+            }
+        }
         for p in &mut self.params {
             if p.name == old {
                 p.name = new.to_string();
@@ -783,8 +876,22 @@ impl Document {
                         n += 1;
                     }
                 }
+                for e in sketch.patterns.iter_mut().flat_map(|p| p.count_expression.iter_mut().chain(p.expressions.values_mut())) {
+                    let r = expr::rename_reference(e, old, new);
+                    if r != *e {
+                        *e = r;
+                        n += 1;
+                    }
+                }
                 for e in sketch.text_exprs_mut() {
                     let r = expr::rename_reference(e, old, new);
+                    if r != *e {
+                        *e = r;
+                        n += 1;
+                    }
+                }
+                for e in sketch.text_word_exprs_mut() {
+                    let r = crate::text_params::rename_reference(e, old, new);
                     if r != *e {
                         *e = r;
                         n += 1;
@@ -804,9 +911,11 @@ impl Document {
         for rule in &mut self.configs.rules {
             rule.rename_parameter(old, new);
         }
+        // A text parameter's cells are texts, not expressions.
+        let texts: BTreeSet<String> = self.text_params.iter().map(|p| p.name.clone()).collect();
         for r in &mut self.configs.rows {
             for (column, cell) in self.configs.columns.iter().zip(&mut r.cells) {
-                if matches!(column, crate::config::Column::Param(_)) {
+                if !text && matches!(column, crate::config::Column::Param(c) if !texts.contains(c)) {
                     *cell = expr::rename_reference(cell, old, new);
                 }
             }
@@ -817,6 +926,24 @@ impl Document {
                 *e = r;
                 n += 1;
             }
+        }
+        // Sheet metal and plastic rules and canvas planes hold expressions too (#4420).
+        let rules = self.sheet.rules.iter_mut().flat_map(|r| r.fields_mut()).chain(self.plastic.rules.iter_mut().flat_map(|r| r.fields_mut()));
+        for (_, e) in rules {
+            let r = expr::rename_reference(e, old, new);
+            if r != *e {
+                *e = r;
+                n += 1;
+            }
+        }
+        for c in &mut self.canvases {
+            c.plane.walk_exprs_mut(&mut |(_, e, _, _)| {
+                let r = expr::rename_reference(e, old, new);
+                if r != *e {
+                    *e = r.into();
+                    n += 1;
+                }
+            });
         }
         if let Some(c) = self.param_comments.remove(old) {
             self.param_comments.insert(new.to_string(), c);
@@ -830,6 +957,10 @@ impl Document {
             return Err(DocError::Invalid("comment too long".into()));
         }
         if let Some(p) = self.params.iter_mut().find(|p| p.name == name) {
+            p.comment = comment.to_string();
+            return Ok(());
+        }
+        if let Some(p) = self.text_params.iter_mut().find(|p| p.name == name) {
             p.comment = comment.to_string();
             return Ok(());
         }
@@ -852,7 +983,17 @@ impl Document {
             let mut names: BTreeSet<String> = f.param_names.iter().filter(|n| !n.is_empty()).cloned().collect();
             if let FeatureKind::Sketch { sketch, .. } = &f.kind {
                 names.extend(sketch.constraints.iter().filter_map(|c| c.param.clone()));
+                names.extend(sketch.patterns.iter().flat_map(|p| p.expressions.values()).flat_map(|e| expr::references(e)));
                 names.extend(sketch.text_exprs().into_iter().flat_map(|(_, e)| expr::references(e)));
+                names.extend(sketch.patterns.iter().filter_map(|p| p.count_expression.as_deref()).flat_map(expr::references));
+                names.extend(sketch.text_word_exprs().into_iter().flat_map(|e| crate::text_params::references(e)));
+            }
+            // Sheet metal and plastic features rebuild when their rules' parameters change (#4420).
+            if f.kind.is_sheet() {
+                names.extend(self.sheet.rules.iter().flat_map(|r| r.fields()).flat_map(|(_, e, _)| expr::references(e)));
+            }
+            if f.kind.is_plastic() {
+                names.extend(self.plastic.rules.iter().flat_map(|r| r.fields()).flat_map(|(_, e, _)| expr::references(e)));
             }
             out.extend(names.into_iter().map(|n| (format!("Feature:{}", f.name), n)));
         }
@@ -874,13 +1015,21 @@ impl Document {
                 break;
             }
         }
+        // A rule that uses it changes every sheet metal (or plastic) feature: the evaluation
+        // hashes the rules into their fingerprint.
+        let uses = |e: &String| expr::references(e).iter().any(|r| affected.contains(r));
+        let sheet = self.sheet.rules.iter().any(|r| r.fields().iter().any(|(_, e, _)| uses(e)));
+        let plastic = self.plastic.rules.iter().any(|r| r.fields().iter().any(|(_, e, _)| uses(e)));
         let mut out = Vec::new();
         for f in &self.features {
             let mut hit = f.param_names.iter().any(|n| affected.contains(n));
+            hit |= (sheet && f.kind.is_sheet()) || (plastic && f.kind.is_plastic());
             hit |= f.kind.expressions().iter().any(|e| expr::references(e).iter().any(|r| affected.contains(r)));
             if let FeatureKind::Sketch { sketch, .. } = &f.kind {
                 hit |= sketch.constraints.iter().any(|c| c.param.as_ref().is_some_and(|p| affected.contains(p)));
+                hit |= sketch.patterns.iter().flat_map(|p| p.expressions.values()).any(|e| expr::references(e).iter().any(|r| affected.contains(r)));
                 hit |= sketch.text_exprs().iter().any(|(_, e)| expr::references(e).iter().any(|r| affected.contains(r)));
+                hit |= sketch.text_word_exprs().iter().any(|e| crate::text_params::references(e).iter().any(|r| affected.contains(r)));
             }
             if hit {
                 out.push(f.id);
@@ -944,4 +1093,54 @@ pub fn cycles(list: &[(String, String, Kind)]) -> BTreeSet<String> {
         }
     }
     bad
+}
+
+/// The numbers `n` for which `{base}{n}` is among `names` (written as `n` is: no sign or
+/// leading zeros).
+pub(crate) fn numbers_after<'a>(base: &str, names: impl Iterator<Item = &'a str>) -> std::collections::HashSet<u64> {
+    names
+        .filter_map(|name| name.strip_prefix(base))
+        .filter(|digits| !digits.is_empty() && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|digits| digits.parse().ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod design_length_tests {
+    use crate::Document;
+
+    fn written(units: &str, mm: f64) -> (String, String) {
+        let mut doc = Document::new("Units");
+        doc.units = units.into();
+        doc.design_length(mm)
+    }
+
+    #[test]
+    fn a_measured_length_is_written_in_the_design_units() {
+        let w = |u: &str, e: &str| (u.to_string(), e.to_string());
+        assert_eq!(written("in", 25.4), w("in", "1 in"));
+        assert_eq!(written("in", 12.7), w("in", "0.5 in"));
+        assert_eq!(written("in", 10.0), w("in", "0.39370079 in"));
+        assert_eq!(written("cm", 12.34), w("cm", "1.234 cm"));
+        assert_eq!(written("mm", 12.3456789), w("mm", "12.345679 mm"));
+        assert_eq!(written("in", -25.4), w("in", "-1 in"));
+        assert_eq!(written("in", -1e-12), w("in", "0 in"));
+        // Unknown or non-length units keep millimetres.
+        assert_eq!(written("parsec", 5.0), w("mm", "5 mm"));
+        assert_eq!(written("deg", 5.0), w("mm", "5 mm"));
+        assert_eq!(written("", 5.0), w("mm", "5 mm"));
+    }
+
+    #[test]
+    fn the_written_value_reads_back_within_a_micrometre() {
+        for units in ["mm", "cm", "m", "in", "ft"] {
+            let mut doc = Document::new("Units");
+            doc.units = units.into();
+            for mm in [0.001, 1.0, 12.345_678_9, 25.4, 999.999, 12_345.678] {
+                let (_, e) = doc.design_length(mm);
+                let back = doc.eval(&e, crate::expr::Kind::Length).unwrap();
+                assert!((back - mm).abs() <= 1e-6, "{units} {mm}: {e} reads {back}");
+            }
+        }
+    }
 }

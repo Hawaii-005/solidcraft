@@ -28,7 +28,7 @@ fn block_boss_hole() -> Harness {
 /// Frames until nothing computes or waits (a few seconds at most).
 fn until_settled(h: &mut Harness) {
     for _ in 0..500 {
-        if h.app.deferred.is_none() && h.app.deferred_queue.is_empty() && h.app.delete_check.is_none() {
+        if h.app.deferred.is_none() && h.app.deferred_queue.is_empty() && h.app.delete_check.is_none() && h.app.pending_feature_edit.is_none() {
             break;
         }
         h.frames(1);
@@ -57,6 +57,67 @@ fn the_marker_moved_computes_off_the_window_thread_then_moves() {
     let hole = std::f64::consts::PI * 4.0 * 15.0;
     let v = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
     assert!((v - (12500.0 - hole)).abs() < 1.0, "{v}");
+}
+
+/// The command runs for real with what was evaluated off the window thread: nothing is
+/// evaluated twice, even once the evaluation cache no longer holds it (a large design's states
+/// are past its budget, and the window thread evaluated the whole command again).
+#[test]
+fn a_command_computed_off_the_thread_is_not_evaluated_again() {
+    let mut h = block_boss_hole();
+    h.app.run_heavy("timeline.roll_to", json!({"position": 1})).unwrap();
+    until_settled(&mut h);
+    h.app.session.model.cache = Default::default();
+    h.app.run_heavy("timeline.roll_to", json!({})).unwrap();
+    for _ in 0..500 {
+        if h.app.deferred.as_mut().is_some_and(crate::deferred::Deferred::finished) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // What it evaluated is gone from the cache.
+    h.app.session.model.cache = Default::default();
+    until_settled(&mut h);
+    assert_eq!(marker(&h), None);
+    assert_eq!((h.app.session.model.last_recomputed, h.app.session.model.last_restored), (0, 2), "the boss and the hole as evaluated off the thread");
+    let hole = std::f64::consts::PI * 4.0 * 15.0;
+    let v = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((v - (12500.0 - hole)).abs() < 1.0, "{v}");
+}
+
+/// A parameter change computed off the window thread runs here without computing a feature
+/// again, even with the evaluation cache emptied meanwhile (a design whose states pass its
+/// budget): it evaluates once before its sketch stores the new solution and once after, and the
+/// first of those is kept for the run here too, not only the last.
+#[test]
+fn a_parameter_change_computed_off_the_thread_is_not_evaluated_again() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    for (id, p) in [
+        ("parameters.add", json!({"name": "W", "expression": "40 mm"})),
+        ("sketch.create", json!({"plane": "XY", "name": "Base"})),
+        ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 20]})),
+        ("sketch.dimension", json!({"entities": ["l1"], "value": "W"})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"distance": 10})),
+        ("solid.box", json!({"corner": [5, 5, 10], "length": 10, "width": 10, "height": 5, "operation": "join"})),
+    ] {
+        h.app.run(id, p).unwrap();
+    }
+    h.app.apply_off_thread = Some(Duration::ZERO);
+    h.app.run_heavy("parameters.change", json!({"name": "W", "expression": "50 mm"})).unwrap();
+    for _ in 0..500 {
+        if h.app.deferred.as_mut().is_some_and(crate::deferred::Deferred::finished) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.app.session.model.cache = Default::default();
+    let before = h.app.session.model.recomputed;
+    until_settled(&mut h);
+    assert_eq!(h.app.session.model.recomputed - before, 0, "nothing computed again on the window thread, in either evaluation");
+    let v = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((v - (50.0 * 20.0 * 10.0 + 500.0)).abs() < 1.0, "{v}");
 }
 
 #[test]
@@ -100,6 +161,237 @@ fn a_design_changed_while_a_move_computes_is_computed_again() {
     assert_eq!(marker(&h), Some(2));
 }
 
+fn sketches_with_later_bodies() -> (Harness, Vec<u64>) {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    let mut sketches = Vec::new();
+    for x in [0, 20] {
+        let sketch = h.app.run("sketch.create", json!({"plane": "XY"})).unwrap()["sketch"].as_u64().unwrap();
+        sketches.push(sketch);
+        h.app.run("sketch.line", json!({"points": [[x, 0], [x + 10, 0]]})).unwrap();
+        h.app.finish_sketch();
+        h.app.run("solid.box", json!({"corner": [x, 0, 0], "length": 10, "width": 10, "height": 10})).unwrap();
+    }
+    h.app.run("solid.box", json!({"corner": [40, 0, 0], "length": 10, "width": 10, "height": 10})).unwrap();
+    h.app.apply_off_thread = Some(Duration::ZERO);
+    (h, sketches)
+}
+
+/// #5435: switching editors must not leave a background restore from the first sketch that
+/// moves the second editor's marker, or make Finish restore to the first sketch's rollback.
+#[test]
+fn switching_sketches_keeps_the_original_marker_with_background_rebuilds() {
+    for original_marker in [None, Some(4)] {
+        for cancel in [false, true] {
+            let (mut h, sketches) = sketches_with_later_bodies();
+            h.app.run("timeline.roll_to", json!({"position": original_marker})).unwrap();
+            let bodies = h.app.session.model.state().bodies.len();
+            h.app.edit_sketch(sketches[0]);
+            h.app.edit_sketch(sketches[1]);
+            until_settled(&mut h);
+            assert_eq!(h.app.session.active_sketch, Some(sketches[1]));
+            assert_eq!(marker(&h), Some(3), "stay at the sketch being edited");
+            if cancel {
+                h.app.cancel_sketch();
+            } else {
+                h.app.finish_sketch();
+            }
+            until_settled(&mut h);
+            assert_eq!(marker(&h), original_marker, "restore the marker from before either edit");
+            assert_eq!(h.app.session.model.state().bodies.len(), bodies, "all later bodies return");
+        }
+    }
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_keeps_the_original_marker_with_background_rebuilds() {
+    let (mut h, sketches) = sketches_with_later_bodies();
+    let feature = h.app.session.doc.features[3].id;
+    let bodies = h.app.session.model.state().bodies.len();
+    h.app.edit_sketch(sketches[0]);
+    h.app.edit_feature(feature);
+    until_settled(&mut h);
+    assert_eq!(h.app.session.active_sketch, None);
+    assert_eq!(marker(&h), Some(3), "stay just before the feature being edited");
+    assert_eq!(h.app.dialog.as_ref().and_then(|d| d.editing), Some((feature, None)));
+    crate::dialogs::cancel(&mut h.app);
+    until_settled(&mut h);
+    assert_eq!(marker(&h), None);
+    assert_eq!(h.app.session.model.state().bodies.len(), bodies, "all later bodies return");
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_restores_partial_markers_and_sketch_changes() {
+    for original_marker in [None, Some(4)] {
+        let (mut h, sketches) = sketches_with_later_bodies();
+        h.app.run("timeline.roll_to", json!({"position": original_marker})).unwrap();
+        let bodies = h.app.session.model.state().bodies.len();
+        let feature = h.app.session.doc.features[3].id;
+        h.app.edit_sketch(sketches[0]);
+        h.app.run("sketch.line", json!({"points": [[0, 2], [10, 2]]})).unwrap();
+        h.app.edit_feature(feature);
+        let history = (h.app.session.undo.len(), h.app.session.redo.len());
+        let changed = h.app.session.doc.sketch(sketches[0]).unwrap().clone();
+        until_settled(&mut h);
+        assert!(h.app.dialog.is_some());
+        h.app.session.selection = vec![solidcraft_engine::Sel::Axis { name: "X".into() }];
+        *h.app.session.model.cache.lock().unwrap() = Default::default();
+        let window = std::sync::Arc::new(solidcraft_engine::doc::progress::Progress::default());
+        solidcraft_engine::doc::progress::watch(window.clone(), || crate::dialogs::cancel(&mut h.app));
+        assert_eq!(window.features(), (0, 0), "Cancel uses the pinned matching model");
+        assert_eq!(marker(&h), original_marker);
+        assert_eq!(h.app.session.model.state().bodies.len(), bodies);
+        assert_eq!(h.app.session.doc.sketch(sketches[0]).unwrap(), &changed);
+        assert_eq!((h.app.session.undo.len(), h.app.session.redo.len()), history);
+        assert_eq!(h.app.session.selection, vec![solidcraft_engine::Sel::Axis { name: "X".into() }]);
+    }
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_rejects_replaced_or_changed_documents() {
+    for action in ["new", "change"] {
+        let (mut h, sketches) = sketches_with_later_bodies();
+        let feature = h.app.session.doc.features[3].id;
+        h.app.edit_sketch(sketches[0]);
+        h.app.edit_feature(feature);
+        assert!(h.app.computing_since().is_some());
+        match action {
+            "new" => {
+                h.app.run("file.new", json!({})).unwrap();
+            }
+            "change" => {
+                h.app.run("solid.box", json!({"corner": [80, 0, 0], "length": 2, "width": 2, "height": 2})).unwrap();
+            }
+            _ => assert_eq!(action, "change", "unexpected test action"),
+        }
+        let current = h.app.session.doc.clone();
+        let sketch = h.app.session.active_sketch;
+        until_settled(&mut h);
+        assert!(h.app.dialog.is_none(), "{action} must not open the obsolete editor");
+        assert!(std::sync::Arc::ptr_eq(&current, &h.app.session.doc), "{action} must preserve the current document");
+        assert_eq!(h.app.session.active_sketch, sketch);
+    }
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_applies_with_one_undo_and_redo() {
+    let (mut h, sketches) = sketches_with_later_bodies();
+    let feature = h.app.session.doc.features[3].id;
+    let before = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    h.app.edit_sketch(sketches[0]);
+    h.app.edit_feature(feature);
+    let undo = h.app.session.undo.len();
+    until_settled(&mut h);
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"dialog:length"}})).unwrap();
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    h.step(&json!({"text":"12 mm"})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    for _ in 0..500 {
+        if h.app.dialog.is_none() {
+            break;
+        }
+        h.frames(1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(h.app.dialog.is_none(), "the edit must finish");
+    assert_eq!(marker(&h), None);
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+    let after = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((after - before - 200.0).abs() < 0.001);
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(marker(&h), None);
+    let restored = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((restored - before).abs() < 0.001);
+    h.app.run("edit.redo", json!({})).unwrap();
+    let redone = h.app.run("inspect.measure", json!({})).unwrap()["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((redone - after).abs() < 0.001);
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_preserves_the_marker_through_cancel_and_superseding_editors() {
+    for next in ["cancel", "escape", "sketch", "feature", "tab", "tab_back_pending"] {
+        let (mut h, sketches) = sketches_with_later_bodies();
+        let feature = h.app.session.doc.features[3].id;
+        h.app.edit_sketch(sketches[0]);
+        h.app.edit_feature(feature);
+        match next {
+            "cancel" => crate::dialogs::cancel(&mut h.app),
+            "escape" => {
+                h.step(&json!({"key":"Escape"})).unwrap();
+            }
+            "sketch" => {
+                h.app.edit_sketch(sketches[1]);
+                h.app.finish_sketch();
+            }
+            "feature" => {
+                h.app.edit_feature(feature);
+                until_settled(&mut h);
+                crate::dialogs::cancel(&mut h.app);
+            }
+            _ => {
+                let other = solidcraft_engine::Session::new(Default::default());
+                crate::documents::open_tab(&mut h.app, other).unwrap();
+                if next == "tab" {
+                    h.frames(10);
+                }
+                assert!(h.app.session.doc.features.is_empty());
+                crate::documents::switch(&mut h.app, 0);
+            }
+        }
+        until_settled(&mut h);
+        assert!(h.app.dialog.is_none(), "{next} must leave no feature editor");
+        assert_eq!(marker(&h), None, "{next} must restore the original marker");
+        assert_eq!(h.app.session.model.state().bodies.len(), 3);
+    }
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_defers_a_new_command_until_restoration() {
+    let (mut h, sketches) = sketches_with_later_bodies();
+    let feature = h.app.session.doc.features[3].id;
+    let count = h.app.session.doc.features.len();
+    h.app.edit_sketch(sketches[0]);
+    h.app.edit_feature(feature);
+    h.app.start("solid.box");
+    assert!(h.app.dialog.is_none(), "the next dialog waits for the matching model");
+    until_settled(&mut h);
+    assert_eq!(marker(&h), None);
+    assert_eq!(h.app.dialog.as_ref().unwrap().editing, None);
+    let undo = h.app.session.undo.len();
+    h.frames(2);
+    h.step(&json!({"click":{"handle":"dialog:OK"}})).unwrap();
+    for _ in 0..500 {
+        if h.app.dialog.is_none() {
+            break;
+        }
+        h.frames(1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(h.app.dialog.is_none());
+    assert_eq!(marker(&h), None);
+    assert_eq!(h.app.session.doc.features.len(), count + 1);
+    assert_eq!(h.app.session.undo.len(), undo + 1);
+}
+
+#[test]
+fn switching_from_a_sketch_to_a_feature_defers_press_pull_with_its_pick_contract() {
+    let (mut h, sketches) = sketches_with_later_bodies();
+    let feature = h.app.session.doc.features[3].id;
+    h.app.edit_sketch(sketches[0]);
+    h.app.edit_feature(feature);
+    h.app.session.selection.clear();
+    h.app.start("solid.press_pull");
+    assert!(h.app.dialog.is_none());
+    until_settled(&mut h);
+    assert_eq!(marker(&h), None);
+    let dialog = h.app.dialog.as_ref().unwrap();
+    assert!(dialog.press_pull);
+    let picks = dialog.inputs[0].accept;
+    assert_ne!(picks & crate::selection::FACES, 0);
+    assert_ne!(picks & crate::selection::EDGES, 0);
+}
+
 /// A control request for the app, and where its reply lands.
 fn ask(tx: &std::sync::mpsc::Sender<crate::ControlRequest>, method: &str, params: serde_json::Value) -> std::sync::mpsc::Receiver<serde_json::Value> {
     let (req, reply) = crate::ControlRequest::new(method, params);
@@ -132,6 +424,34 @@ fn second_hole() -> serde_json::Value {
     json!({"command": "solid.cylinder", "params": {"base": [50, 10, -1], "axis": [0, 0, 1], "radius": 3, "height": 20, "operation": "cut"}})
 }
 
+/// While an agent's batch computes, the chip says which step it is on, of how many, and that
+/// step's command (`2/3 · Cylinder`); a single command shows just its name.
+#[test]
+fn a_computing_batch_says_its_step() {
+    let (mut h, tx) = agent_harness();
+    let hole = |x: f64| json!({"command": "solid.cylinder", "params": {"base": [x, 10, -1], "axis": [0, 0, 1], "radius": 3, "height": 20, "operation": "cut"}});
+    let batch = ask(&tx, "engine.batch", json!({"commands": [hole(50.0), hole(30.0), hole(70.0)]}));
+    h.frames(1);
+    let (_, label) = h.app.agent_computing().expect("the batch computes");
+    let (step, command) = label.split_once(" · ").expect(&label);
+    assert!(["1/3", "2/3", "3/3"].contains(&step), "{label}");
+    assert!(!command.is_empty() && !command.contains('.'), "the toolbar's name, not the id: {label}");
+    // Centred on the navigation bar and above it, clear of the window's own toasts.
+    let chip = crate::scenario::rect_of("agent:chip").expect("the chip is drawn");
+    let nav = h.app.viewport.layout.as_ref().expect("laid out").navigation;
+    assert!((chip.center().x - nav.center().x).abs() < 1.0 && chip.bottom() < nav.top(), "{chip:?} not centred above {nav:?}");
+    for toast in ["toast", "toast:computing"].into_iter().filter_map(crate::scenario::rect_of) {
+        assert!(!chip.intersects(toast), "{chip:?} over {toast:?}");
+    }
+    assert_eq!(reply_to(&mut h, &batch)["ok"], true);
+    let single = ask(&tx, "engine.execute", second_hole());
+    h.frames(1);
+    if let Some((_, label)) = h.app.agent_computing() {
+        assert!(!label.contains('/'), "{label}");
+    }
+    assert_eq!(reply_to(&mut h, &single)["ok"], true);
+}
+
 /// #1989: an agent's design change computes off the window thread. The window keeps answering
 /// (`ui.*`, inspection) while it computes and shows which command it is; the agent's next
 /// design change waits its turn; each lands as its own undo step with its usual reply.
@@ -151,10 +471,11 @@ fn an_agent_design_change_computes_off_the_window_thread() {
     h.frames(1);
     assert!(h.app.agent_computing().is_some_and(|(_, label)| !label.is_empty()), "the window says the agent's command computes");
     assert!(view.try_recv().is_ok_and(|v| v["ok"] == true), "ui.* answered while it computes");
-    let seen = inspect.try_recv().expect("inspection answered while it computes");
-    assert_eq!(seen["result"]["timeline"].as_array().map(Vec::len), Some(features), "the design as it was: {seen}");
     assert!(boss.try_recv().is_err(), "the next design change waits its turn");
     assert_eq!(h.app.session.doc.features.len(), features, "nothing applied yet");
+    // The inspection reads a copy of the design as it was when asked, off the window thread.
+    let seen = reply_to(&mut h, &inspect);
+    assert_eq!(seen["result"]["timeline"].as_array().map(Vec::len), Some(features), "the design as it was: {seen}");
     let r = reply_to(&mut h, &hole);
     assert_eq!(r["ok"], true, "{r}");
     let r = reply_to(&mut h, &boss);
@@ -257,6 +578,63 @@ fn an_agent_export_runs_on_a_copy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #4604: measuring the whole design (an inspection measures every body) reads a copy off the
+/// window thread, preference or not: on a large assembly it took a minute, the window answered
+/// nothing meanwhile and was closed as not responding. The window answers `ui.*` while it
+/// measures, and the measure comes back as when it runs here.
+#[test]
+fn a_measure_reads_a_copy_off_the_window_thread_preference_or_not() {
+    let (mut h, tx) = agent_harness();
+    h.app.preferences.agent_off_thread = false;
+    let here = h.app.run("inspect.measure", json!({})).unwrap();
+    let log = h.app.session.log.len();
+    let measure = ask(&tx, "engine.execute", json!({"command": "inspect.measure", "params": {}}));
+    let inspect = ask(&tx, "document.inspect", json!({"measure": true}));
+    let command = ask(&tx, "command", json!({"command": "document.inspect", "params": {"measure": true}}));
+    let view = ask(&tx, "ui.inspect", json!({}));
+    h.frames(1);
+    assert!(view.try_recv().is_ok_and(|v| v["ok"] == true), "ui.* answered meanwhile");
+    assert_eq!(h.app.control_answering.len(), 3, "all three read a copy");
+    let r = reply_to(&mut h, &measure);
+    assert_eq!(r["result"]["total"], here["total"], "{r}");
+    for reply in [inspect, command] {
+        let r = reply_to(&mut h, &reply);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r["result"]["timeline"].is_array(), "{r}");
+    }
+    assert!(h.app.control_answering.is_empty());
+    assert_eq!(h.app.session.log.len(), log, "a reading leaves no echo: {:?}", h.app.session.log);
+}
+
+/// A clearance or interference check of every pair of bodies reads a copy off the window thread
+/// too: on an assembly of 150 bodies it computed for minutes with the window not responding. The
+/// answers are the ones running it here gives.
+#[test]
+fn a_clearance_check_reads_a_copy_off_the_window_thread() {
+    let (mut h, tx) = agent_harness();
+    h.app.preferences.agent_off_thread = false;
+    // The answers but their timing.
+    let untimed = |mut v: serde_json::Value| {
+        if let Some(o) = v.as_object_mut() {
+            o.remove("ms");
+        }
+        v
+    };
+    let clearance_here = untimed(h.app.run("inspect.clearance", json!({})).unwrap());
+    let interference_here = untimed(h.app.run("inspect.interference", json!({})).unwrap());
+    let clearance = ask(&tx, "engine.execute", json!({"command": "inspect.clearance", "params": {}}));
+    let interference = ask(&tx, "engine.execute", json!({"command": "inspect.interference", "params": {}}));
+    let view = ask(&tx, "ui.inspect", json!({}));
+    h.frames(1);
+    assert!(view.try_recv().is_ok_and(|v| v["ok"] == true), "ui.* answered meanwhile");
+    assert_eq!(h.app.control_answering.len(), 2, "both read a copy");
+    let r = reply_to(&mut h, &clearance);
+    assert_eq!(untimed(r["result"].clone()), clearance_here, "{r}");
+    let r = reply_to(&mut h, &interference);
+    assert_eq!(untimed(r["result"].clone()), interference_here, "{r}");
+    assert!(h.app.control_answering.is_empty());
+}
+
 /// With the preference off (Preferences > AI, the default) an agent's design change runs on the
 /// window thread, as before: answered in the frame it arrives.
 #[test]
@@ -294,9 +672,9 @@ fn the_window_answers_while_the_agent_cursor_acts_out_a_design_change() {
     h.frames(1);
     assert!(h.app.agent.busy());
     assert!(view.try_recv().is_ok_and(|v| v["ok"] == true), "ui.* answered while the pointer acts out the command");
-    assert!(inspect.try_recv().is_ok_and(|v| v["ok"] == true), "inspection answered too");
     assert!(boss.try_recv().is_err(), "the next design change waits its turn");
     assert_eq!(h.app.session.doc.features.len(), features, "nothing applied yet");
+    assert!(reply_to(&mut h, &inspect)["ok"] == true, "inspection answered too, from a copy");
     let r = reply_to(&mut h, &hole);
     assert_eq!(r["ok"], true, "{r}");
     let r = reply_to(&mut h, &boss);
@@ -419,4 +797,45 @@ fn without_a_wait_the_delete_checks_in_place() {
     crate::timeline::delete_features(&mut h.app, vec![boss]);
     assert!(h.app.delete_check.is_none());
     assert!(h.app.session.doc.feature(boss).is_none());
+}
+
+/// A body renamed in its rename box (#2467): off the window thread, the features after the one
+/// that made it (a pattern, a chamfer) kept as they are, and the body's lock following the new
+/// name.
+#[test]
+fn a_body_renamed_in_the_browser_keeps_the_pattern_after_it() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    for (id, p) in [
+        ("sketch.create", json!({"plane": "XY"})),
+        ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [80, 50]})),
+        ("sketch.finish", json!({})),
+        ("solid.extrude", json!({"distance": 10})),
+        ("solid.hole", json!({"position": [15, 12, 10], "diameter": 5, "name": "Hole1"})),
+        (
+            "solid.pattern.rectangular",
+            json!({"features": ["Hole1"], "dir1": [1, 0, 0], "count1": 3, "spacing1": 25, "dir2": [0, 1, 0], "count2": 2, "spacing2": 25}),
+        ),
+        ("solid.chamfer", json!({"edges": [[40, 0, 10]], "distance": 1})),
+    ] {
+        h.app.run(id, p).unwrap();
+    }
+    h.app.session.visibility.locked_bodies.push("Body1".into());
+    h.app.apply_off_thread = Some(Duration::ZERO);
+    crate::context_menu::start_rename(&mut h.app, crate::context_menu::RenameWhat::Body("Body1".into()), egui::pos2(0.0, 0.0));
+    h.frames(2);
+    h.step(&json!({"text": "Plate"})).unwrap();
+    let names = |h: &Harness| h.app.session.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    let mesh = |h: &Harness| h.app.session.model.state().bodies.first().map(|b| b.mesh());
+    let before = mesh(&h);
+    // What Enter does, without the frames after it that would see the rename in.
+    let rename = h.app.menu.rename.take().unwrap();
+    crate::context_menu::commit_rename(&mut h.app, &rename);
+    assert!(h.app.computing_since().is_some(), "computing");
+    assert_eq!(names(&h), ["Body1"], "the design is as it was while it computes");
+    until_settled(&mut h);
+    assert_eq!(names(&h), ["Plate"]);
+    let kept = before.zip(mesh(&h)).is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a, &b));
+    assert!(kept, "no feature computed again");
+    assert_eq!(h.app.session.visibility.locked_bodies, ["Plate"]);
 }

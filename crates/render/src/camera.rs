@@ -222,7 +222,7 @@ pub struct Camera {
     pub target: Vec3,
     /// Rotation about Z; 0 = looking along +Y (from the front).
     pub yaw: f64,
-    /// Elevation above the XY plane, in (−π/2, π/2].
+    /// Elevation above the XY plane, in [−π/2, π/2]. Roll preserves orientation across poles.
     pub pitch: f64,
     /// Rotation about the viewing direction. Zero keeps the world's up axis vertical.
     #[serde(default)]
@@ -290,6 +290,37 @@ impl Camera {
             (self.distance - r * 4.0 - 1.0, self.distance + r * 4.0 + 1.0)
         }
     }
+    /// Clip a known scene, retaining the radius-based margin for grids and overlays.
+    /// In perspective the orbit distance is not the nearest geometry's depth: a deep assembly
+    /// can reach almost to the eye. Cap the usual near plane at half that nearest depth so the
+    /// distance-based precision floor cannot clip its front components after a projection change.
+    pub fn clip_bounds(&self, bounds: &Aabb3) -> (f64, f64) {
+        let fallback = self.clip((self.half_height() * 2.0).max(50.0));
+        if bounds.is_empty() || !bounds.min.is_finite() || !bounds.max.is_finite() {
+            return fallback;
+        }
+        let radius = bounds.diagonal() * 0.5 + bounds.center().dist(self.target);
+        if !radius.is_finite() {
+            return fallback;
+        }
+        let (near, far) = self.clip(radius.max(self.half_height() * 2.0).max(10.0));
+        if self.fov <= 0.0 {
+            return (near, far);
+        }
+        let back = self.back();
+        let nearest = Vec3::new(
+            if back.x >= 0.0 { bounds.max.x } else { bounds.min.x },
+            if back.y >= 0.0 { bounds.max.y } else { bounds.min.y },
+            if back.z >= 0.0 { bounds.max.z } else { bounds.min.z },
+        );
+        let depth = self.distance + (self.target - nearest).dot(back);
+        if !depth.is_finite() {
+            return (near, far);
+        }
+        // A box crossing the eye uses the minimum positive near plane; points behind the eye
+        // still cannot be projected. Keep the existing one-micrometre lower limit.
+        (near.min((depth * 0.5).max(1e-3)), far)
+    }
     /// Projection to clip space (OpenGL/wgpu style, depth 0..1).
     pub fn proj(&self, aspect: f64, near: f64, far: f64) -> Mat4 {
         let aspect = if aspect.is_finite() && aspect > 1e-6 { aspect } else { 1.0 };
@@ -305,6 +336,11 @@ impl Camera {
     }
     pub fn view_proj(&self, aspect: f64, radius: f64) -> Mat4 {
         let (n, f) = self.clip(radius);
+        self.proj(aspect, n, f).mul(&self.view())
+    }
+    /// View-projection using the current scene bounds to admit nearby components.
+    pub fn view_proj_bounds(&self, aspect: f64, bounds: &Aabb3) -> Mat4 {
+        let (n, f) = self.clip_bounds(bounds);
         self.proj(aspect, n, f).mul(&self.view())
     }
     /// World point → pixel coordinates (x right, y down) and depth (0 near … 1 far).
@@ -378,12 +414,71 @@ impl Camera {
             self.roll = (self.roll + radians) % std::f64::consts::TAU;
         }
     }
+    /// Rotate about the current screen right, up and back axes (radians), without a pole
+    /// limit. Reconstruct both heading and roll so crossing a pole keeps the image continuous.
+    pub fn rotate_in_view(&mut self, radians: Vec3) {
+        if !self.is_valid() || !radians.is_finite() {
+            return;
+        }
+        let angle = radians.x.hypot(radians.y).hypot(radians.z);
+        if !(angle > 1e-12) || !angle.is_finite() {
+            return;
+        }
+        let (right, up, back) = self.basis();
+        let Some(axis) = (right * (radians.x / angle) + up * (radians.y / angle) + back * (radians.z / angle)).normalized() else { return };
+        let (sin, cos) = angle.sin_cos();
+        let rotate = |v: Vec3| v * cos + axis.cross(v) * sin + axis * (axis.dot(v) * (1.0 - cos));
+        let rotated_right = rotate(right);
+        let Some(rotated_back) = rotate(back).normalized() else { return };
+        let framed = self.up.to_frame(rotated_back);
+        let yaw = if framed.x.hypot(framed.y) < 1e-10 { self.yaw } else { (-framed.x).atan2(-framed.y) };
+        let pitch = framed.z.clamp(-1.0, 1.0).asin();
+        let base_right = self.up.from_frame(Vec3::new(yaw.cos(), -yaw.sin(), 0.0));
+        let Some(base_up) = rotated_back.cross(base_right).normalized() else { return };
+        let roll = rotated_right.dot(base_up).atan2(rotated_right.dot(base_right));
+        if yaw.is_finite() && pitch.is_finite() && roll.is_finite() {
+            self.yaw = yaw;
+            self.pitch = pitch;
+            self.roll = roll;
+        }
+    }
     pub fn set_view(&mut self, v: StandardView) {
         let lim = std::f64::consts::FRAC_PI_2 - 1e-6;
         let (y, p) = v.angles();
         self.yaw = y;
         self.pitch = p.clamp(-lim, lim);
         self.roll = 0.0;
+    }
+    /// The standard axis view this camera faces, if its view direction is within `tol` radians
+    /// of one of the six axis views (Front, Back, Left, Right, Top, Bottom). Iso is never
+    /// reported. At the poles (Top/Bottom) the yaw is degenerate, so any yaw counts as aligned.
+    /// Used by the "perspective while orbiting, orthographic on faces" view mode (#2682).
+    pub fn aligned_standard_view(&self, tol: f64) -> Option<StandardView> {
+        use std::f64::consts::FRAC_PI_2;
+        if !self.yaw.is_finite() || !self.pitch.is_finite() || !(tol > 0.0) {
+            return None;
+        }
+        // Top / Bottom: aligned when the elevation reaches the pole within the tolerance
+        // (`set_view` stops a hair short of pi/2, so the slack covers the exact views too).
+        if FRAC_PI_2 - self.pitch.abs() <= tol {
+            return Some(if self.pitch >= 0.0 { StandardView::Top } else { StandardView::Bottom });
+        }
+        // The four side views sit at pitch 0 with yaw on a multiple of pi/2.
+        if self.pitch.abs() > tol {
+            return None;
+        }
+        let quarter = (self.yaw / FRAC_PI_2).round().rem_euclid(4.0);
+        let off = (self.yaw / FRAC_PI_2).rem_euclid(1.0);
+        let off = off.min(1.0 - off) * FRAC_PI_2;
+        if off > tol {
+            return None;
+        }
+        Some(match quarter as i32 {
+            0 => StandardView::Front,
+            1 => StandardView::Left,
+            2 => StandardView::Back,
+            _ => StandardView::Right,
+        })
     }
     /// Frame a bounding box.
     pub fn fit(&mut self, b: &Aabb3) {
@@ -467,6 +562,47 @@ mod tests {
                 assert!((cam.eye() - pivot).len() > 1.0);
             }
         }
+    }
+
+    #[test]
+    fn screen_rotation_crosses_both_poles_and_returns_after_a_full_turn() {
+        for up in [UpAxis::Z, UpAxis::Y] {
+            for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                let mut cam = Camera { yaw: 0.0, pitch: 0.0, up, ..Default::default() };
+                let initial = cam;
+                let step = std::f64::consts::TAU / 256.0;
+                for _ in 0..256 {
+                    let before = cam.basis();
+                    cam.rotate_in_view(axis * step);
+                    let after = cam.basis();
+                    assert!(cam.is_valid());
+                    // An X or Y turn moves the viewing direction every step, including at a pole.
+                    if axis != Vec3::Z {
+                        assert!((before.2.dot(after.2) - step.cos()).abs() < 1e-10);
+                    }
+                    assert!(before.0.dot(after.0) > 0.999 && before.1.dot(after.1) > 0.999);
+                    assert!(after.0.cross(after.1).dist(after.2) < 1e-10);
+                }
+                let (r, u, b) = initial.basis();
+                let (rr, uu, bb) = cam.basis();
+                assert!(r.dist(rr) < 1e-9 && u.dist(uu) < 1e-9 && b.dist(bb) < 1e-9, "{up:?} {axis:?}: {cam:?}");
+                assert_eq!((cam.target, cam.distance, cam.fov, cam.up), (initial.target, initial.distance, initial.fov, initial.up));
+            }
+        }
+    }
+
+    #[test]
+    fn screen_rotation_ignores_invalid_motion_and_reverses_combined_axes() {
+        let initial = Camera { roll: 1.2, ..Default::default() };
+        let mut cam = initial;
+        for motion in [Vec3::ZERO, Vec3::new(f64::NAN, 0.0, 0.0), Vec3::new(0.0, f64::INFINITY, 0.0), Vec3::new(f64::MAX, f64::MAX, 0.0)] {
+            cam.rotate_in_view(motion);
+            assert_eq!(cam, initial);
+        }
+        let motion = Vec3::new(0.3, -0.4, 0.2);
+        cam.rotate_in_view(motion);
+        cam.rotate_in_view(-motion);
+        assert!(cam.basis().0.dist(initial.basis().0) < 1e-12 && cam.back().dist(initial.back()) < 1e-12);
     }
 
     #[test]
@@ -559,6 +695,101 @@ mod tests {
         let hit = o + d * (o.z / -d.z);
         let (sx, sy, _) = c.to_screen(hit, 800.0, 600.0, 20.0).unwrap();
         assert!((sx - 600.0).abs() < 1e-6 && (sy - 300.0).abs() < 1e-6);
+    }
+
+    /// The #2682 alignment policy: each axis view is detected, off-axis and iso are not, and
+    /// the tolerance admits near-aligned cameras (set_view's Top stops a hair short of pi/2).
+    #[test]
+    fn aligned_standard_view_detects_axis_views_within_tolerance() {
+        let tol = 1.0_f64.to_radians();
+        for v in [StandardView::Front, StandardView::Back, StandardView::Top, StandardView::Bottom, StandardView::Left, StandardView::Right] {
+            let mut cam = Camera::default();
+            cam.set_view(v);
+            assert_eq!(cam.aligned_standard_view(tol), Some(v), "{v:?}");
+        }
+        // Iso and off-axis orientations are never aligned.
+        let iso = Camera { yaw: StandardView::Iso.angles().0, pitch: StandardView::Iso.angles().1, ..Camera::default() };
+        assert_eq!(iso.aligned_standard_view(tol), None);
+        let off = Camera { yaw: 0.5, pitch: 0.3, ..Camera::default() };
+        assert_eq!(off.aligned_standard_view(tol), None);
+        // Within tolerance of Front (yaw and pitch each a half-degree off) it still counts.
+        let near = Camera { yaw: 0.5_f64.to_radians(), pitch: 0.5_f64.to_radians(), ..Camera::default() };
+        assert_eq!(near.aligned_standard_view(tol), Some(StandardView::Front));
+        // Just outside the tolerance it does not.
+        let past = Camera { yaw: 2.0_f64.to_radians(), pitch: 0.0, ..Camera::default() };
+        assert_eq!(past.aligned_standard_view(tol), None);
+        // Yaw wraps: 3*pi/2 is Right, negative yaw works, and at the poles any yaw counts.
+        assert_eq!(
+            Camera { yaw: 3.0 * std::f64::consts::FRAC_PI_2, pitch: 0.0, ..Camera::default() }.aligned_standard_view(tol),
+            Some(StandardView::Right)
+        );
+        assert_eq!(
+            Camera { yaw: -std::f64::consts::FRAC_PI_2, pitch: 0.0, ..Camera::default() }.aligned_standard_view(tol),
+            Some(StandardView::Right)
+        );
+        assert_eq!(
+            Camera { yaw: 2.0, pitch: std::f64::consts::FRAC_PI_2 - 1e-6, ..Camera::default() }.aligned_standard_view(tol),
+            Some(StandardView::Top)
+        );
+        assert_eq!(
+            Camera { yaw: 2.0, pitch: -std::f64::consts::FRAC_PI_2 + 1e-6, ..Camera::default() }.aligned_standard_view(tol),
+            Some(StandardView::Bottom)
+        );
+        // Non-finite angles and a zero tolerance never align.
+        assert_eq!(Camera { yaw: f64::NAN, pitch: 0.0, ..Camera::default() }.aligned_standard_view(tol), None);
+        assert_eq!(Camera::default().aligned_standard_view(0.0), None);
+    }
+
+    #[test]
+    fn large_scene_projection_toggle_keeps_near_and_far_components_in_clip_range() {
+        for scale in [1.0, 100.0] {
+            let bounds = Aabb3 { min: Vec3::new(-0.25, -10_000.0, -0.25) * scale, max: Vec3::new(0.25, 10_000.0, 0.25) * scale };
+            let mut cam = Camera { yaw: 0.0, pitch: 0.0, distance: 10_002.0 * scale, ..Default::default() };
+            let original = cam.view_proj_bounds(16.0 / 9.0, &bounds);
+            for fov in [0.0, 0.6, 0.0, 0.6, 0.0] {
+                cam.fov = fov;
+                let vp = cam.view_proj_bounds(16.0 / 9.0, &bounds);
+                let gpu = vp.to_f32();
+                assert!(gpu.iter().flatten().all(|v| v.is_finite()));
+                for x in [bounds.min.x, bounds.max.x] {
+                    for y in [bounds.min.y, bounds.max.y] {
+                        for z in [bounds.min.z, bounds.max.z] {
+                            let p = Vec3::new(x, y, z);
+                            let c = vp.apply(p);
+                            assert!(c[3] > 0.0 && (0.0..=c[3]).contains(&c[2]), "scale={scale}, fov={fov}, {p:?}: {c:?}");
+                            assert!(c[0].abs() <= c[3] && c[1].abs() <= c[3]);
+                            let p = p.to_f32();
+                            let c: [f32; 4] = std::array::from_fn(|r| gpu[0][r] * p[0] + gpu[1][r] * p[1] + gpu[2][r] * p[2] + gpu[3][r]);
+                            assert!(c[3] > 0.0 && (0.0..=c[3]).contains(&c[2]), "GPU scale={scale}, fov={fov}: {c:?}");
+                        }
+                    }
+                }
+                if fov == 0.0 {
+                    assert_eq!(vp, original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounds_clipping_handles_eye_crossing_and_invalid_bounds() {
+        let cam = Camera { yaw: 0.0, pitch: 0.0, distance: 10_000.0, fov: 0.6, ..Default::default() };
+        let crossing = Aabb3 { min: Vec3::new(-1.0, -10_001.0, -1.0), max: Vec3::new(1.0, 10_001.0, 1.0) };
+        let (near, far) = cam.clip_bounds(&crossing);
+        assert_eq!(near, 1e-3);
+        assert!(far.is_finite() && far > near);
+        let c = cam.view_proj_bounds(1.0, &crossing).apply(Vec3::new(0.0, -9_999.0, 0.0));
+        assert!(c[3] > 0.0 && (0.0..=c[3]).contains(&c[2]));
+        let fallback = cam.clip((cam.half_height() * 2.0).max(50.0));
+        for bounds in [
+            Aabb3::EMPTY,
+            Aabb3 { min: Vec3::new(f64::NAN, 0.0, 0.0), max: Vec3::ZERO },
+            Aabb3 { min: Vec3::ZERO, max: Vec3::new(f64::INFINITY, 1.0, 1.0) },
+            Aabb3 { min: Vec3::new(-f64::MAX, -1.0, -1.0), max: Vec3::new(f64::MAX, 1.0, 1.0) },
+        ] {
+            assert_eq!(cam.clip_bounds(&bounds), fallback);
+            assert!(cam.view_proj_bounds(1.0, &bounds).0.iter().flatten().all(|v| v.is_finite()));
+        }
     }
 
     #[test]

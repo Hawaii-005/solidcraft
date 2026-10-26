@@ -80,3 +80,114 @@ fn offset_plane_rejects_bad_face_picks_without_panicking() {
         assert_eq!(s.doc.features.len(), features, "{base}");
     }
 }
+
+/// #3567: an Offset Plane redefined with itself as its base was accepted while the old plane
+/// stood beside the new one, and then failed with "plane offsets nested too deeply". It is
+/// refused with a plain message, and the plane is left as it was.
+#[test]
+fn offset_plane_redefined_on_itself_is_refused() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "corner": [10, 0, 0]}));
+    run(&mut s, "construct.plane.offset", json!({"base": {"face": [30, 0, 10]}, "offset": 10, "name": "Side"}));
+    assert!((plane(&s, "Side").origin.y + 10.0).abs() < 1e-9, "{:?}", plane(&s, "Side"));
+    let saved = s.doc.to_json();
+    let redefine = |base: Value| json!({"feature": "Side", "command": "construct.plane.offset", "params": {"base": base, "offset": "7"}});
+    let e = s.execute("timeline.redefine", &redefine(json!("Side"))).unwrap_err().to_string();
+    assert!(e.contains("can't be built on itself"), "{e}");
+    assert_eq!(s.doc.to_json(), saved);
+    // The same edit on the face it was built on works.
+    run(&mut s, "timeline.redefine", redefine(json!({"face": [30, 0, 10]})));
+    assert!((plane(&s, "Side").origin.y + 7.0).abs() < 1e-9, "{:?}", plane(&s, "Side"));
+}
+
+/// A flat face of a sheet is kept by its sheet face name, as a sketch on it is: the plane follows
+/// the flange when the sheet changes (it stayed where the face was picked).
+#[test]
+fn offset_plane_from_a_sheet_flange_face_follows_the_flange() {
+    let mut s = Session::default();
+    run(&mut s, "sheet.manage_rules", json!({"name": "R1", "thickness": "1 mm", "bend_radius": "1 mm", "active": true}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Base"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [320, 200]}));
+    let d = run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 320}));
+    let width = d["param"].as_str().or_else(|| d["name"].as_str()).unwrap_or("d1").to_string();
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sheet.flange", json!({"sketch": "Base"}));
+    run(&mut s, "sheet.flange", json!({"edges": [[320, 100, 1]], "height": 30}));
+    let flange = s.doc.features.last().map_or(0, |f| f.id);
+    // The flange's inner face, picked as model.faces lists it (body and index), 5 mm out along its normal.
+    let name = format!("sheet:Body1:F{flange}.0:top");
+    let faces = run(&mut s, "model.faces", json!({"body": "Body1"}));
+    let face = faces["faces"].as_array().unwrap().iter().find(|f| f["sheet_face"].as_str() == Some(name.as_str())).unwrap().clone();
+    run(
+        &mut s,
+        "construct.plane.offset",
+        json!({"base": {"face": face["point"], "body": "Body1", "index": face["index"]}, "offset": 5, "name": "Out"}),
+    );
+    let out = plane(&s, "Out");
+    assert!((out.normal().x.abs() - 1.0).abs() < 1e-9, "{out:?}");
+    let x0 = out.origin.x;
+    // 80 mm wider: the flange moves 80 mm along x, and the plane with it.
+    run(&mut s, "parameters.change", json!({"name": width, "expression": "400"}));
+    let moved = plane(&s, "Out");
+    assert!((moved.origin.x - x0 - 80.0).abs() < 1e-9, "{x0} -> {moved:?}");
+    assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
+    // Reopened, the attachment still resolves where the face is.
+    let reopened = Session::new(Document::from_json(&s.doc.to_json()).unwrap());
+    assert!((plane(&reopened, "Out").origin.x - x0 - 80.0).abs() < 1e-9);
+}
+
+#[test]
+fn plane_at_angle_from_a_planar_face_follows_the_face() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "name": "Base"}));
+
+    // Top face (z = 20), 45 degrees about X axis.
+    run(&mut s, "construct.plane.at_angle", json!({"base": {"face": [5, 5, 20]}, "axis": "X", "angle": "45 deg", "name": "Slanted"}));
+    let slanted = plane(&s, "Slanted");
+    // Base plane has normal Z and its origin on the top face, (0, 0, 20). Rotated 45 degrees
+    // about X: the origin is (0, -20/sqrt(2), 20/sqrt(2)) and the normal [0, -sin(45), cos(45)].
+    let half = 1.0_f64 / 2.0_f64.sqrt();
+    assert!(slanted.origin.x.abs() < 1e-9, "{slanted:?}");
+    assert!((slanted.origin.y - -20.0 * half).abs() < 1e-9, "{slanted:?}");
+    assert!((slanted.origin.z - 20.0 * half).abs() < 1e-9, "{slanted:?}");
+    assert!((slanted.normal().y - (-half)).abs() < 1e-9, "{slanted:?}");
+    assert!((slanted.normal().z - half).abs() < 1e-9, "{slanted:?}");
+
+    let feature = s.doc.find_feature("Slanted").unwrap();
+    let FeatureKind::ConstructionPlane { plane: PlaneRef::AtAngle { base, .. } } = &feature.kind else { panic!("at_angle plane") };
+    assert!(matches!(base.as_ref(), PlaneRef::Face { anchor: Some(_), .. }), "{base:?}");
+
+    // Height changes: the slanted plane moves with the top face (0, 0, 30).
+    run(&mut s, "timeline.edit", json!({"feature": "Base", "set": {"height": "30"}}));
+    let slanted2 = plane(&s, "Slanted");
+    assert!(slanted2.origin.x.abs() < 1e-9, "{slanted2:?}");
+    assert!((slanted2.origin.y - -30.0 * half).abs() < 1e-9, "{slanted2:?}");
+    assert!((slanted2.origin.z - 30.0 * half).abs() < 1e-9, "{slanted2:?}");
+    assert!((slanted2.normal().y - (-half)).abs() < 1e-9, "{slanted2:?}");
+    assert!((slanted2.normal().z - half).abs() < 1e-9, "{slanted2:?}");
+
+    // Saved and reopened, the attachment still resolves.
+    let reopened = Session::new(Document::from_json(&s.doc.to_json()).unwrap());
+    let reopened_slanted = plane(&reopened, "Slanted");
+    assert!((reopened_slanted.origin.y - -30.0 * half).abs() < 1e-9, "{reopened_slanted:?}");
+    assert!((reopened_slanted.origin.z - 30.0 * half).abs() < 1e-9, "{reopened_slanted:?}");
+    assert!((reopened_slanted.normal().y - (-half)).abs() < 1e-9, "{reopened_slanted:?}");
+}
+
+#[test]
+fn plane_at_angle_rejects_bad_face_picks_without_panicking() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
+    for base in [
+        json!({"face": [100, 100, 100]}),
+        json!({"face": [1e300, 0, 0]}),
+        json!({"face": "top"}),
+        json!({"face": [5, 5]}),
+        json!({"face": [5, 5, 20], "index": 0}),
+        json!({"face": [5, 5, 20], "body": 7, "index": 0}),
+    ] {
+        let features = s.doc.features.len();
+        assert!(s.execute("construct.plane.at_angle", &json!({"base": base, "axis": "X", "angle": "45 deg"})).is_err(), "{base}");
+        assert_eq!(s.doc.features.len(), features, "{base}");
+    }
+}

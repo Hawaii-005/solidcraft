@@ -72,7 +72,7 @@ fn compass_negative_ends_are_hollow_and_positive_ends_are_chunkier() {
             let circles: Vec<_> = output.shapes.iter().filter_map(|s| if let Shape::Circle(c) = &s.shape { Some(c) } else { None }).collect();
             let end = circles.iter().find(|circle| circle.center == painted).unwrap();
             if positive {
-                assert_eq!(end.fill, t.triad[0]);
+                assert_eq!(end.fill, t.axis_x);
                 assert_eq!(end.radius, 11.0);
                 let letters: Vec<_> = output
                     .shapes
@@ -317,7 +317,7 @@ fn a_hovered_compass_end_turns_white_and_its_letter_takes_the_axis_colour() {
             if !dark {
                 // White would vanish on the light compass: an axis-coloured outline keeps it visible.
                 assert!(
-                    circles.iter().any(|circle| circle.center == painted && circle.stroke.color == t.triad[0] && circle.stroke.width >= 2.0),
+                    circles.iter().any(|circle| circle.center == painted && circle.stroke.color == t.axis_x && circle.stroke.width >= 2.0),
                     "{name}: the hovered end is outlined in its axis colour on the light theme"
                 );
             }
@@ -325,8 +325,10 @@ fn a_hovered_compass_end_turns_white_and_its_letter_takes_the_axis_colour() {
             if positive {
                 assert!(
                     !letters.is_empty()
-                        && letters.iter().all(|text| text.override_text_color == Some(t.triad[0])
-                            || text.galley.job.sections.iter().all(|s| s.format.color == t.triad[0])),
+                        && letters
+                            .iter()
+                            .all(|text| text.override_text_color == Some(t.axis_x)
+                                || text.galley.job.sections.iter().all(|s| s.format.color == t.axis_x)),
                     "the letter takes the axis colour"
                 );
             } else {
@@ -355,4 +357,253 @@ fn compass_circle_grabs_on_hover_and_the_home_chip_points() {
     h.call("ui.move", json!({"x": centre.x - 200.0, "y": centre.y + 200.0}));
     h.settle();
     assert_ne!(h.output.cursor_icon, egui::CursorIcon::Grab, "no hand away from the compass");
+}
+
+/// The status and computing toasts keep the size and place they always had: the text's size plus
+/// 40 by 16, centred at the bottom of the free rect.
+#[test]
+fn the_shared_toast_draws_old_callers_exactly_as_before() {
+    let ctx = crate::fonts::test_context();
+    for width in [200.0_f32, 300.0, 500.0, 900.0] {
+        let free = Rect::from_min_size(pos2(10.0, 20.0), vec2(width, 200.0));
+        for (error, computing) in [(false, false), (true, false), (false, true)] {
+            draw(&ctx, |ui| {
+                let t = Tokens::get();
+                let text = "A message that is long enough to wrap in the narrow cases, and not in the wide ones".to_string();
+                let galley = ui.painter().layout(text.clone(), crate::fonts::medium(t.font_label), t.text, (free.width() - 40.0).min(440.0));
+                let size = galley.size() + vec2(40.0, 16.0);
+                let expected = Rect::from_center_size(pos2(free.center().x, free.bottom() - size.y * 0.5), size);
+                let got = paint_toast(ui, free, text, error, computing);
+                if size.x > free.width() || size.y > free.height() {
+                    assert!(got.is_none());
+                } else {
+                    assert_eq!(got, Some(expected), "width {width} error {error} computing {computing}");
+                }
+            });
+        }
+    }
+}
+
+/// The toast's buttons stay inside its card at narrow widths, and do nothing while an issue report
+/// holds CAD input.
+#[test]
+fn toast_buttons_wrap_inside_the_card_and_are_dead_behind_an_issue_report() {
+    let labels = [
+        ("Calibrate…", ToastKind::Primary),
+        ("Swap to Hidraw (Direct Driver)", ToastKind::Secondary),
+        ("Close", ToastKind::Dismiss),
+        ("Never show again", ToastKind::Dismiss),
+    ];
+    for width in [260.0_f32, 360.0, 600.0, 1000.0] {
+        for blocked in [false, true] {
+            crate::issue_report::set_cad_input_blocked_for_test(blocked);
+            let ctx = crate::fonts::test_context();
+            let free = Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 300.0));
+            let run = |events: Vec<egui::Event>| {
+                let mut seen = None;
+                let mut output = ctx.run_ui(egui::RawInput { events, screen_rect: Some(free), focused: true, ..Default::default() }, |ui| {
+                    seen = paint_toast_with(ui, free, "Your 3D mouse isn't calibrated.".into(), ToastLead::Dot(false), &labels);
+                });
+                output.textures_delta.clear();
+                seen
+            };
+            run(vec![]);
+            let (card, _) = run(vec![]).unwrap_or_else(|| panic!("width {width}: no card"));
+            assert!(free.contains_rect(card), "width {width}: {card:?}");
+            let mut hits = Vec::new();
+            for step_x in 1..12 {
+                for step_y in 1..16 {
+                    let at = pos2(card.left() + card.width() * step_x as f32 / 12.0, card.top() + card.height() * step_y as f32 / 16.0);
+                    run(vec![egui::Event::PointerMoved(at)]);
+                    run(vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    }]);
+                    let clicked = run(vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    }]);
+                    if let Some((_, Some(index))) = clicked {
+                        hits.push(index);
+                    }
+                }
+            }
+            crate::issue_report::set_cad_input_blocked_for_test(false);
+            if blocked {
+                assert!(hits.is_empty(), "width {width}: a button worked behind a report: {hits:?}");
+            } else {
+                hits.sort_unstable();
+                hits.dedup();
+                assert_eq!(hits, [0, 1, 2, 3], "width {width}: every button can be clicked inside the card");
+            }
+        }
+    }
+}
+
+/// The toast's buttons group by purpose and wrap as whole groups: the main action first, then the
+/// alternative, then the dismissals; no button stands alone on a row while its group-mate fits.
+#[test]
+fn toast_buttons_group_by_purpose_and_wrap_as_groups() {
+    use ToastKind::{Dismiss, Primary, Secondary};
+    let four = [(110.0, Primary), (220.0, Secondary), (60.0, Dismiss), (140.0, Dismiss)];
+    let three = [(110.0, Primary), (60.0, Dismiss), (140.0, Dismiss)];
+    for card in [260.0_f32, 360.0, 460.0, 560.0, 700.0, 1000.0] {
+        let row_width = (card - 40.0).min(440.0);
+        for buttons in [&four[..], &three[..]] {
+            let spots = toast_action_spots(buttons, row_width, 8.0, 28.0);
+            let widest = buttons.iter().map(|b| b.0).fold(0.0, f32::max);
+            // Nothing leaves the row (a button wider than the row is cut to it by the painter), and none overlaps.
+            for (i, spot) in spots.iter().enumerate() {
+                assert!(spot.left() >= 0.0 && spot.right() <= row_width.max(widest) + 0.01, "card {card}: {spot:?}");
+                for other in &spots[i + 1..] {
+                    assert!(!spot.intersects(*other), "card {card}: {spot:?} overlaps {other:?}");
+                }
+            }
+            // The primary is first: top left, and no button is above it or left of it on its row.
+            assert!(spots.iter().all(|s| s.top() > spots[0].top() || s.left() >= spots[0].left()), "card {card}: primary first");
+            let mut rows: std::collections::BTreeMap<i32, usize> = Default::default();
+            for spot in &spots {
+                *rows.entry(spot.top() as i32).or_default() += 1;
+            }
+            // Whole groups fit the row: then no row has a button on its own, except the primary of the
+            // three-button set (its group is only itself).
+            let group_fits = if buttons.len() == 4 { 110.0 + 8.0 + 220.0 <= row_width } else { 140.0 + 8.0 + 60.0 <= row_width };
+            if group_fits {
+                let singles = rows.values().filter(|&&n| n == 1).count();
+                assert!(singles <= usize::from(buttons.len() == 3), "card {card}, {} buttons: a button is left alone: {rows:?}", buttons.len());
+            }
+            if row_width >= 110.0 + 8.0 + 220.0 + 8.0 + 60.0 + 8.0 + 140.0 {
+                assert_eq!(rows.len(), 1, "card {card}: one row when everything fits");
+            }
+        }
+    }
+}
+
+#[test]
+fn bottom_readouts_clear_floating_history_on_the_first_frame() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.ui.layout = LayoutMode::Floating;
+    h.app.preferences.timeline_left = false;
+    h.app.preferences.show_frame_rate = true;
+    for command in ["inspect.draft", "inspect.accessibility", "inspect.curvature_map"] {
+        h.app.session.analysis = None;
+        h.app.run(command, json!({})).unwrap();
+        for shown in [false, true, false, true] {
+            h.app.ui.show_timeline = shown;
+            h.frame();
+            let viewport = h.app.viewport.layout.as_ref().unwrap().viewport;
+            let history = crate::scenario::rect_of("history:card");
+            assert_eq!(history.is_some(), shown);
+            for name in ["analysis:legend", "viewport:frame_rate"] {
+                let readout = crate::scenario::rect_of(name).unwrap();
+                assert!(viewport.contains_rect(readout), "{name}: {readout:?}");
+                if let Some(history) = history {
+                    assert!(!readout.intersects(history), "{name}: {readout:?} overlaps {history:?}");
+                } else {
+                    assert!((readout.bottom() - (viewport.bottom() - 12.0)).abs() < 0.01);
+                }
+            }
+        }
+    }
+    h.app.session.analysis = None;
+    h.app.run("inspect.draft", json!({})).unwrap();
+    // Start with a measured floating card, then switch without a settling frame.
+    h.app.ui.layout = LayoutMode::Floating;
+    h.app.ui.show_timeline = true;
+    h.frame();
+    h.app.ui.layout = LayoutMode::Docked;
+    h.frame();
+    let viewport = h.app.viewport.layout.as_ref().unwrap().viewport;
+    let history = crate::scenario::rect_of("history:strip").unwrap();
+    for name in ["analysis:legend", "viewport:frame_rate"] {
+        let readout = crate::scenario::rect_of(name).unwrap();
+        assert!(!readout.intersects(history));
+        assert!((readout.bottom() - (viewport.bottom() - 12.0)).abs() < 0.01);
+    }
+}
+
+#[test]
+fn continuity_legend_clears_floating_history() {
+    let mut h = Harness::new();
+    h.app.ui.layout = LayoutMode::Floating;
+    h.app.preferences.timeline_left = false;
+    h.app.ui.show_timeline = true;
+    h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+    h.app.start("inspect.continuity");
+    h.frame();
+    let legend = crate::scenario::rect_of("continuity_legend").unwrap();
+    let history = crate::scenario::rect_of("history:card").unwrap();
+    assert!(!legend.intersects(history), "{legend:?} overlaps {history:?}");
+}
+
+#[test]
+fn left_history_sidebar_leaves_bottom_readouts_at_the_bottom() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.ui.layout = LayoutMode::Floating;
+    h.app.preferences.timeline_left = true;
+    h.app.preferences.show_frame_rate = true;
+    h.app.ui.show_timeline = true;
+    h.app.run("inspect.draft", json!({})).unwrap();
+    h.frame();
+    let viewport = h.app.viewport.layout.as_ref().unwrap().viewport;
+    for name in ["analysis:legend", "viewport:frame_rate"] {
+        let readout = crate::scenario::rect_of(name).unwrap();
+        assert!((readout.bottom() - (viewport.bottom() - 12.0)).abs() < 0.01, "{name}: {readout:?} in {viewport:?}");
+    }
+}
+
+/// The frame-rate readout and its details sit just left of a pane over the view's bottom-right
+/// corner (the Assistant), follow it as it opens, changes width and closes, and stay in the
+/// visible view; with the pane on the left they keep the corner (#6755).
+#[test]
+fn frame_rate_readout_stays_beside_a_right_pane() {
+    use crate::scenario::{handle_at, rect_of};
+    for mode in [LayoutMode::Floating, LayoutMode::Docked] {
+        let mut h = Harness::new();
+        h.app.home.open = false;
+        h.call("ui.set", json!({"layout": mode}));
+        h.app.preferences.show_frame_rate = true;
+        h.app.preferences.frame_rate_details = true;
+        h.app.preferences.agent_chat_side = "right".into();
+        h.frames(3);
+        let in_corner = |h: &Harness| {
+            let viewport = h.app.viewport.layout.as_ref().unwrap().viewport;
+            let readout = rect_of("viewport:frame_rate").expect("the readout is drawn");
+            assert!((readout.right() - (viewport.right() - 12.0)).abs() < 0.01, "{mode:?}: {readout:?} in {viewport:?}");
+        };
+        in_corner(&h);
+        // The Assistant's narrowest, a middle and its widest width.
+        for width in [280.0, 480.0, 760.0] {
+            h.call("ui.agent_chat", json!({"open": true, "picker": false, "side": "right", "width": width}));
+            h.frames(3);
+            let viewport = h.app.viewport.layout.as_ref().unwrap().viewport;
+            let pane = rect_of("agent_chat:panel").expect("the Assistant is drawn");
+            let readout = rect_of("viewport:frame_rate").expect("the readout is drawn");
+            assert!(viewport.contains_rect(readout), "{mode:?}, {width}: {readout:?} outside {viewport:?}");
+            assert!(readout.right() <= pane.left() - 12.0 + 0.01, "{mode:?}, {width}: {readout:?} under {pane:?}");
+            if mode == LayoutMode::Floating {
+                assert!((readout.right() - (pane.left() - 12.0)).abs() < 0.01, "{width}: {readout:?} not just left of {pane:?}");
+            }
+            for covered in crate::shell::covered_rects(&h.app) {
+                assert!(!readout.intersects(covered), "{mode:?}, {width}: {readout:?} under {covered:?}");
+            }
+            let details = handle_at("viewport:frame_details").expect("the details are drawn");
+            assert!(viewport.contains(details) && details.x < pane.left(), "{mode:?}, {width}: details at {details:?}, pane {pane:?}");
+        }
+        h.call("ui.agent_chat", json!({"open": false}));
+        h.frames(3);
+        assert!(rect_of("agent_chat:panel").is_none());
+        in_corner(&h);
+        // On the left the pane leaves the corner free.
+        h.call("ui.agent_chat", json!({"open": true, "side": "left"}));
+        h.frames(3);
+        assert!(rect_of("agent_chat:panel").is_some());
+        in_corner(&h);
+    }
 }

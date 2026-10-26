@@ -1,6 +1,6 @@
 //! Status heading and constraint meter; Tokens: font_label, text, text_dim, accent, dialog_rule, sketch_accent, spacing.
 use crate::{fonts::RichTextExt as _, theme::Tokens};
-use egui::{RichText, Stroke, vec2};
+use egui::{RichText, vec2};
 
 /// Status content for a named card. `key` is the scenario namespace, `fraction` is clamped.
 pub(crate) struct StatusHeader<'a> {
@@ -23,7 +23,7 @@ pub(crate) fn status_header(ui: &mut egui::Ui, key: &str, name: &str, status: St
             ui.spacing_mut().interact_size.y = t.form_icon_size;
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(t.form_icon_size, t.form_icon_size), egui::Sense::hover());
-                crate::icons::paint(ui.painter(), rect, status.icon, t.icon, t.icon_fill, t.sketch_accent);
+                crate::icons::paint_icon(ui.painter(), rect, status.icon, f32::from(t.icon.a()) / 255.0);
                 ui.add(egui::Label::new(RichText::new(name).semibold().size(t.font_label)).truncate()).on_hover_text(name);
             });
             ui.horizontal(|ui| {
@@ -40,7 +40,7 @@ pub(crate) fn status_header(ui: &mut egui::Ui, key: &str, name: &str, status: St
             crate::scenario::publish_count(&format!("{key}:constrained_fraction"), f64::from(fraction));
         })
         .response;
-    ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, t.dialog_rule));
+    t.secondary_hline(ui.painter(), ui.max_rect().x_range(), ui.cursor().top(), t.dialog_rule);
     crate::scenario::publish_target(&format!("{key}:status_header"), response.rect);
     response
 }

@@ -30,6 +30,43 @@ impl Sketch {
             .or_else(|| self.freeform_offsets.iter().find(|o| o.output == output).map(|o| o.distance))
     }
 
+    /// A Parallel between an offset line and the source it follows (#4464). The association
+    /// keeps them parallel already, and the output's points are held during a solve, so solving
+    /// it would only pin the source to the output's current direction. It drives again once
+    /// Break releases the output.
+    pub(crate) fn follows_its_source(&self, kind: &ConstraintKind) -> bool {
+        let ConstraintKind::Parallel { a, b } = *kind else {
+            return false;
+        };
+        let (Some(a), Some(b)) = (self.curves.get(a).map(|c| c.id.as_str()), self.curves.get(b).map(|c| c.id.as_str())) else {
+            return false;
+        };
+        self.offsets.iter().any(|o| {
+            o.sources.iter().enumerate().any(|(i, (source, _))| {
+                let output = match &o.topology {
+                    Some(t) => t.roles.get(i).map(|r| r.output.as_str()),
+                    None => o.outputs.get(i).map(String::as_str),
+                };
+                output.is_some_and(|output| (source == a && output == b) || (source == b && output == a))
+            })
+        })
+    }
+
+    /// An arc an offset made round its source's own centre (#6569). Its ends are held while the
+    /// sketch solves, so its own condition, both ends as far from the centre, only tied that
+    /// centre (and the source with it) to the middle of the held ends: a slot offset by 1 mm
+    /// could no longer be moved by the dimension that places it. The source's own arc keeps the
+    /// centre, and the offset is rebuilt from the source after the solve.
+    pub(crate) fn offset_arc_follows_source(&self, curve: usize) -> bool {
+        if self.offsets.is_empty() {
+            return false;
+        }
+        let Some(arc) = self.curves.get(curve) else { return false };
+        let CurveKind::Arc { c: centre, .. } = arc.kind else { return false };
+        let output = |id: &str| self.offsets.iter().any(|o| o.owns_output(id));
+        output(&arc.id) && self.curves.iter().enumerate().any(|(k, other)| k != curve && other.kind.uses(centre) && !output(&other.id))
+    }
+
     /// Endpoints of a normal-distance annotation, evaluated from its source curve.
     pub fn offset_dimension_points(&self, output: &str) -> Option<(Vec2, Vec2)> {
         let (source, forward, distance) = self

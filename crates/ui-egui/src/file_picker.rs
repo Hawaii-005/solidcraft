@@ -31,7 +31,7 @@ impl SolveApp {
     /// Keep the target design and editors unchanged until the picker answers.
     /// (A save being written keeps it unchanged too, see [`crate::save_job`].)
     pub fn file_picker_busy(&self) -> bool {
-        self.file_picker.is_some() || self.saving.is_some()
+        self.file_picker.is_some() || self.saving.is_some() || self.disk_prompt
     }
 
     pub(crate) fn pick_open(&mut self, complete: impl FnOnce(&mut SolveApp, Option<String>) + 'static) {
@@ -242,6 +242,68 @@ mod tests {
         assert_eq!(h.app.session.path.as_deref(), path.to_str());
     }
 
+    /// The sheet-metal Output buttons must ask where to save, not discard the headless
+    /// command's returned text (#6847). Cancelling must not export or change the design.
+    #[test]
+    fn sheet_exports_wait_for_a_path_and_write_only_on_completion() {
+        for (command, extension, field) in [("sheet.export_dxf", "dxf", "dxf"), ("sheet.export_bend_table", "csv", "text")] {
+            let mut h = crate::scenario::Harness::new();
+            for (id, params) in [
+                ("sketch.create", json!({"plane": "XY", "name": "Base"})),
+                ("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [100, 60]})),
+                ("sketch.finish", json!({})),
+                ("sheet.flange", json!({"sketch": "Base"})),
+                ("sheet.flange", json!({"edges": [[50, 0, 2.5]], "height": "20 mm", "position": "outside"})),
+            ] {
+                h.app.run(id, params).unwrap();
+            }
+            let answer = picker(&mut h.app, true);
+            let before = h.app.session.doc.to_json();
+            let expected = h.app.session.execute(command, &json!({})).unwrap();
+            assert!(!h.app.file_picker_busy(), "programmatic calls return text without a picker");
+            let text = expected[field].as_str().unwrap();
+            assert!(text.contains(if extension == "dxf" { "BEND_UP" } else { "Body1" }));
+            let path = h.dir.join(format!("flat.{extension}"));
+            for outcome in ["cancel", "fail", "save"] {
+                h.app.start(command);
+                h.frames(2);
+                assert!(h.app.file_picker_busy(), "{command} must open the save picker");
+                assert!(!path.exists());
+                assert_eq!(h.app.session.doc.to_json(), before);
+                let chosen = match outcome {
+                    "save" => Some(path.clone()),
+                    "fail" => Some(h.dir.join("missing").join(format!("flat.{extension}"))),
+                    _ => None,
+                };
+                finish(&mut h.app, &answer, chosen.map(|p| p.to_string_lossy().into_owned()));
+                assert_eq!(path.exists(), outcome == "save");
+                if outcome == "fail" {
+                    assert!(h.app.status.as_ref().is_some_and(|(_, _, error)| *error));
+                }
+                assert_eq!(h.app.session.doc.to_json(), before);
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert!(h.app.status.as_ref().is_some_and(|(text, _, error)| text.starts_with("Exported ") && !error));
+        }
+    }
+
+    #[test]
+    fn sheet_exports_without_a_sheet_report_an_error_without_a_picker() {
+        let mut h = crate::scenario::Harness::new();
+        let asked = Rc::new(Cell::new(0));
+        let count = asked.clone();
+        h.app.services.pick_save = Some(Box::new(move |_, _| {
+            count.set(count.get() + 1);
+            Box::pin(std::future::ready(None))
+        }));
+        for command in ["sheet.export_dxf", "sheet.export_bend_table"] {
+            h.app.start(command);
+            assert_eq!(asked.get(), 0);
+            assert!(!h.app.file_picker_busy());
+            assert!(h.app.status.as_ref().is_some_and(|(_, _, error)| *error));
+        }
+    }
+
     #[test]
     fn close_and_quit_wait_for_save_as_and_cancel_or_failure_keeps_changes() {
         for quit in [false, true] {
@@ -364,5 +426,51 @@ mod tests {
         h.app.start("canvas.insert");
         finish(&mut h.app, &answer, None);
         assert!(h.app.tool.is_none(), "cancelling does not resume the old placement");
+    }
+
+    /// #3216: pickers for files that aren't designs list the files' own types. On macOS a type
+    /// no filter names can't be picked: CSV parameters were greyed out.
+    #[test]
+    fn parameter_import_and_canvas_images_ask_for_their_file_types() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        let asked: Rc<RefCell<Vec<Vec<String>>>> = Rc::default();
+        let log = asked.clone();
+        h.app.services.pick_open = Some(Box::new(move |types: &[&str]| {
+            log.borrow_mut().push(types.iter().map(|t| t.to_string()).collect());
+            Box::pin(std::future::ready(None))
+        }));
+        crate::params_dialog::open(&mut h.app);
+        h.frames(2);
+        h.step(&json!({"widget": "Import…"})).unwrap();
+        h.frames(2);
+        h.app.params = None;
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.app.start("canvas.insert");
+        h.frames(2);
+        assert_eq!(*asked.borrow(), [vec!["csv", "json"], vec!["png", "jpg", "jpeg"]]);
+    }
+
+    /// #4717: a canvas placed with a click on the origin of a sketch on XY, seen from the top,
+    /// lies on XY. The origin's XZ square is under the cursor there too, edge-on, and the image
+    /// went onto it, out of sight.
+    #[test]
+    fn a_canvas_clicked_at_the_sketch_origin_lies_where_it_can_be_seen() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        for step in [
+            json!({"make_image": "pic.png"}),
+            json!({"choose_file": "pic.png"}),
+            json!({"call": "ui.view", "params": {"view": "top"}}),
+            json!({"start": "canvas.insert"}),
+            json!({"click": {"world": [0, 0, 0]}}),
+        ] {
+            h.step(&step).unwrap();
+        }
+        let doc = &h.app.session.doc;
+        let canvas = doc.canvases.first().expect("the canvas is placed");
+        let (vals, _) = doc.param_values();
+        let n = doc.canvas_plane(&vals, canvas).unwrap().normal();
+        assert!(n.z.abs() > 0.99, "the canvas lies on {n:?}, not on XY");
     }
 }

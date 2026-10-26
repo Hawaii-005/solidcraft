@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::persistent_name::{Base, FaceName, FeatureId};
 use crate::{FeatureKind, PlaneRef};
 
 /// Remap persistent topology tokens without rewriting arbitrary user expressions or labels.
@@ -21,6 +22,14 @@ pub fn remap_topology(name: &str, ids: &BTreeMap<u64, u64>, bodies: &BTreeMap<St
         && let Some(new) = bodies.get(body)
     {
         return format!("{new}:face:{suffix}");
+    }
+    // A name that reads is remapped by its structure: every feature it names, and a body
+    // face's body. Text of no known form is remapped token by token below.
+    if let Ok(face) = FaceName::parse(name)
+        && !matches!(face.base, Base::Other(_))
+        && let Some(mapped) = face.map(&mut |id, _| Some(ids.get(&id.0).map_or(id, |n| FeatureId(*n))), &mut |b| bodies.get(b).cloned())
+    {
+        return mapped.to_string();
     }
     let mut out = String::new();
     let mut at = 0;
@@ -77,13 +86,7 @@ pub fn clone_expression(source: &str, parameters: &BTreeMap<String, String>) -> 
     result
 }
 
-fn remap_geo(
-    g: &mut crate::construct::GeoRef,
-    ids: &BTreeMap<u64, u64>,
-    names: &BTreeMap<String, String>,
-    bodies: &BTreeMap<String, String>,
-    depth: usize,
-) -> crate::Result<()> {
+fn remap_geo(g: &mut crate::construct::GeoRef, ids: &BTreeMap<u64, u64>, bodies: &BTreeMap<String, String>, depth: usize) -> crate::Result<()> {
     use crate::construct::GeoRef;
     if depth > 64 {
         return Err(crate::DocError::Invalid("clone plane reference depth exceeded".into()));
@@ -100,28 +103,28 @@ fn remap_geo(
                 *n = remap_topology(n, ids, bodies);
             }
         }
-        GeoRef::ConstructPoint { name } | GeoRef::Axis { name } => mapped_name(name, names),
-        GeoRef::Plane { plane } => remap_plane(plane, ids, names, bodies, depth + 1)?,
+        GeoRef::Plane { plane } => remap_plane(plane, ids, bodies, depth + 1)?,
         _ => {}
     }
     Ok(())
 }
 
-fn remap_plane(
-    p: &mut PlaneRef,
-    ids: &BTreeMap<u64, u64>,
-    names: &BTreeMap<String, String>,
-    bodies: &BTreeMap<String, String>,
-    depth: usize,
-) -> crate::Result<()> {
+fn remap_plane(p: &mut PlaneRef, ids: &BTreeMap<u64, u64>, bodies: &BTreeMap<String, String>, depth: usize) -> crate::Result<()> {
     if depth > 64 {
         return Err(crate::DocError::Invalid("clone plane reference depth exceeded".into()));
     }
     match p {
-        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => {
-            remap_plane(base, ids, names, bodies, depth + 1)?
+        PlaneRef::Offset { base, .. } | PlaneRef::Flipped { base, .. } => remap_plane(base, ids, bodies, depth + 1)?,
+        PlaneRef::ThroughPoint { base, point } => {
+            remap_plane(base, ids, bodies, depth + 1)?;
+            remap_geo(point, ids, bodies, depth + 1)?;
         }
-        PlaneRef::Construction { name } => mapped_name(&mut name.0, names),
+        PlaneRef::AtAngle { base, line, .. } => {
+            remap_plane(base, ids, bodies, depth + 1)?;
+            if let Some(g) = line {
+                remap_geo(g, ids, bodies, depth + 1)?;
+            }
+        }
         PlaneRef::Face { name, anchor, .. } => {
             if let Some(name) = name {
                 *name = remap_topology(name, ids, bodies);
@@ -132,14 +135,14 @@ fn remap_plane(
         }
         _ => {
             for r in p.refs_mut() {
-                remap_geo(r, ids, names, bodies, depth + 1)?;
+                remap_geo(r, ids, bodies, depth + 1)?;
             }
         }
     }
     Ok(())
 }
 
-fn remap_link(
+pub(crate) fn remap_link(
     source: &mut solidcraft_sketch::LinkSource,
     ids: &BTreeMap<u64, u64>,
     names: &BTreeMap<String, String>,
@@ -212,8 +215,13 @@ impl crate::Feature {
                     checked_geo(r, 0)?;
                 }
             }
+            K::Revolve { axis: crate::AxisRef::Model { geo }, .. }
+            | K::SurfaceRevolve { axis: crate::AxisRef::Model { geo }, .. }
+            | K::Pattern { pattern: crate::PatternKind::Circular { axis_ref: Some(geo), .. }, .. } => checked_geo(geo, 0)?,
             _ => {}
         }
+        // Feature names are remapped once here; the geometry pass below handles only
+        // sketch ids and topology, so a copy whose new name is also an old key is not remapped twice.
         self.kind.remap_refs(ids, names);
         for n in &mut self.body_names {
             mapped_name(n, bodies);
@@ -236,7 +244,7 @@ impl crate::Feature {
         self.kind.remap_bodies(bodies);
         match &mut self.kind {
             K::Sketch { plane, sketch } => {
-                remap_plane(plane, ids, names, bodies, 0)?;
+                remap_plane(plane, ids, bodies, 0)?;
                 for c in &mut sketch.constraints {
                     if let Some(n) = &mut c.param {
                         mapped_name(n, parameters);
@@ -256,20 +264,23 @@ impl crate::Feature {
             | K::Split { plane, .. }
             | K::SplitFace { plane, .. }
             | K::Mirror { plane, .. }
-            | K::SurfaceTrim { plane, .. } => remap_plane(plane, ids, names, bodies, 0)?,
-            K::Draft { neutral, .. } => remap_plane(neutral, ids, names, bodies, 0)?,
-            K::ReplaceFace { target, .. } => remap_plane(target, ids, names, bodies, 0)?,
-            K::SurfaceExtend { up_to: Some(crate::ExtendTo::Plane(plane)), .. } => remap_plane(plane, ids, names, bodies, 0)?,
+            | K::SurfaceTrim { plane, .. } => remap_plane(plane, ids, bodies, 0)?,
+            K::Draft { neutral, .. } => remap_plane(neutral, ids, bodies, 0)?,
+            K::ReplaceFace { target, .. } => remap_plane(target, ids, bodies, 0)?,
+            K::SurfaceExtend { up_to: Some(crate::ExtendTo::Plane(plane)), .. } => remap_plane(plane, ids, bodies, 0)?,
             K::ConstructionAxis { def } => {
                 for r in def.refs_mut() {
-                    remap_geo(r, ids, names, bodies, 0)?;
+                    remap_geo(r, ids, bodies, 0)?;
                 }
             }
             K::ConstructionPoint { def } => {
                 for r in def.refs_mut() {
-                    remap_geo(r, ids, names, bodies, 0)?;
+                    remap_geo(r, ids, bodies, 0)?;
                 }
             }
+            K::Revolve { axis: crate::AxisRef::Model { geo }, .. }
+            | K::SurfaceRevolve { axis: crate::AxisRef::Model { geo }, .. }
+            | K::Pattern { pattern: crate::PatternKind::Circular { axis_ref: Some(geo), .. }, .. } => remap_geo(geo, ids, bodies, 0)?,
             _ => {}
         }
         Ok(())
@@ -290,7 +301,13 @@ fn checked_plane(p: &PlaneRef, depth: usize) -> crate::Result<()> {
         return Err(crate::DocError::Invalid("copy reference nesting exceeds 64".into()));
     }
     match p {
-        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => checked_plane(base, depth + 1)?,
+        PlaneRef::Offset { base, .. } | PlaneRef::Flipped { base, .. } => checked_plane(base, depth + 1)?,
+        PlaneRef::AtAngle { base, line, .. } => {
+            checked_plane(base, depth + 1)?;
+            if let Some(g) = line {
+                checked_geo(g, depth + 1)?;
+            }
+        }
         PlaneRef::Midplane { a, b } | PlaneRef::TwoEdges { a, b } => {
             checked_geo(a, depth + 1)?;
             checked_geo(b, depth + 1)?;
@@ -298,6 +315,10 @@ fn checked_plane(p: &PlaneRef, depth: usize) -> crate::Result<()> {
         PlaneRef::Perpendicular { plane, line } => {
             checked_geo(plane, depth + 1)?;
             checked_geo(line, depth + 1)?;
+        }
+        PlaneRef::ThroughPoint { base, point } => {
+            checked_plane(base, depth + 1)?;
+            checked_geo(point, depth + 1)?;
         }
         PlaneRef::ThreePoints { a, b, c } => {
             checked_geo(a, depth + 1)?;
@@ -324,6 +345,28 @@ fn checked_link(source: &solidcraft_sketch::LinkSource, depth: usize) -> crate::
 #[cfg(test)]
 mod clone_tests {
     use super::*;
+
+    #[test]
+    fn construction_feature_names_are_remapped_only_once_when_copied() {
+        use serde_json::json;
+
+        let names = BTreeMap::from([("Old".into(), "New".into()), ("New".into(), "Wrong".into())]);
+        let origin = json!({"type": "plane", "plane": {"type": "construction", "name": "Old"}});
+        for kind in [
+            json!({"type": "construction_axis", "def": {"type": "two_points", "a": {"type": "construct_point", "name": "Old"}, "b": {"type": "point", "p": [1, 2, 3]}}}),
+            json!({"type": "construction_point", "def": {"type": "edge_and_plane", "edge": {"type": "axis", "name": "Old"}, "plane": origin}}),
+            json!({"type": "construction_plane", "plane": {"type": "perpendicular", "plane": origin, "line": {"type": "axis", "name": "Old"}}}),
+        ] {
+            let mut value = kind;
+            value["id"] = json!(1);
+            value["name"] = json!("Copy");
+            let mut feature: crate::Feature = serde_json::from_value(value).unwrap();
+            let before = serde_json::to_string(&feature).unwrap();
+            feature.remap_clone(&BTreeMap::new(), &names, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+            assert_eq!(serde_json::to_string(&feature).unwrap(), before.replace("\"Old\"", "\"New\""));
+        }
+    }
+
     #[test]
     fn imported_names_and_topology_tokens_have_separate_identity() {
         let ids = BTreeMap::from([(1, 2), (10, 20)]);

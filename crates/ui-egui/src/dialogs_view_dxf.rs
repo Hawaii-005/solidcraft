@@ -21,7 +21,7 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, dashed: &mut bool, tolerance: &mu
         }
     }
     form_row(ui, "dxf.tolerance", |ui| {
-        let r = crate::ui_kit::number_field(ui, tolerance, 0.0001..=1.0, 0.001, " mm");
+        let r = crate::ui_kit::bounded_length_field(ui, tolerance, &app.session.doc.units, 8, 0.0001..=1.0, 0.001);
         crate::scenario::publish_handle("dialog:dxf:tolerance", r.rect.center());
     });
     crate::ui_kit::text(
@@ -36,8 +36,8 @@ pub fn run(app: &mut SolveApp, dashed: bool, tolerance: f64) -> Result<(), Strin
     if crate::viewport::section_plane(app).is_some() {
         return Err(app.tr_label("Turn off section analysis before exporting the view.").into());
     }
-    if app.session.model.state().bodies.is_empty() {
-        return Err(app.tr_label("No visible bodies to export.").into());
+    if !solidcraft_engine::cmd::view_dxf_exportable(&app.session) {
+        return Err(app.tr_label("No visible bodies or sketches to export.").into());
     }
     if !tolerance.is_finite() || !(0.0001..=1.0).contains(&tolerance) {
         return Err(app.tr_label("dxf.invalid_tolerance").into());
@@ -114,6 +114,20 @@ mod tests {
         let text = std::fs::read_to_string(h.dir.join("view.dxf")).unwrap();
         assert!(!text.contains("LWPOLYLINE") && !text.contains("HIDDEN"));
         assert!(!h.app.preferences.view_dxf_dashed);
+    }
+
+    #[test]
+    fn inch_dxf_tolerance_is_edited_in_inches_and_kept_in_millimetres() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("document.units", json!({"units":"in"})).unwrap();
+        h.app.start("file.export_view_dxf");
+        h.frames(3);
+        h.step(&json!({"click":{"handle":"dialog:dxf:tolerance"},"double":true})).unwrap();
+        h.step(&json!({"key":"A","cmd":true})).unwrap();
+        h.step(&json!({"text":"0.001"})).unwrap();
+        h.step(&json!({"key":"Tab"})).unwrap();
+        let Some(Kind::ViewDxf { tolerance, .. }) = h.app.dialog.as_ref().map(|d| &d.kind) else { panic!("no DXF dialog") };
+        assert!((*tolerance - 0.0254).abs() < 1e-10, "{tolerance}");
     }
 
     fn wait_for_export(h: &mut crate::scenario::Harness) {

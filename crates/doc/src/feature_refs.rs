@@ -28,6 +28,18 @@ impl FeatureKind {
         v
     }
 
+    /// Whether the feature names the feature `name` (the construction plane a plane is built on,
+    /// a patterned or mirrored feature).
+    pub fn names_feature(&self, name: &str) -> bool {
+        let mut found = false;
+        self.walk_refs(&mut |r| {
+            if let Ref::Feature(n) = r {
+                found |= n.as_ref() == name;
+            }
+        });
+        found
+    }
+
     /// Point references to sketches (by id) and features (by name) at their copies, or at a
     /// feature's new name (`timeline.rename`).
     pub fn remap_refs(&mut self, sketches: &BTreeMap<u64, u64>, names: &BTreeMap<String, String>) {
@@ -55,5 +67,31 @@ impl FeatureKind {
                 *name = BodyName(n.clone());
             }
         });
+    }
+}
+
+impl crate::Document {
+    /// Rename feature `old` to `new` where the design names it outside the features' own
+    /// references (`remap_refs`): sketch projections of a construction plane and the canvases
+    /// placed on it (#4353). (The features are the rename command's to change.)
+    pub fn rename_feature_keys(&mut self, old: &str, new: &str) {
+        let names = BTreeMap::from([(old.to_string(), new.to_string())]);
+        let (ids, bodies) = (BTreeMap::new(), BTreeMap::new());
+        for f in &mut self.features {
+            if let FeatureKind::Sketch { sketch, .. } = &mut f.kind {
+                for link in &mut sketch.links {
+                    crate::clipboard::remap_link(&mut link.source, &ids, &names, &bodies, 0);
+                }
+            }
+        }
+        for c in &mut self.canvases {
+            c.plane.walk_refs_mut(&mut |r| {
+                if let Ref::Feature(name) = r
+                    && name.as_ref() == old
+                {
+                    *name = FeatureName(new.to_string());
+                }
+            });
+        }
     }
 }

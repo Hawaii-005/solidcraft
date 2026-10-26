@@ -1,7 +1,7 @@
 # UI localization
 
 SolidCraft embeds its translations and works offline. English, Czech, Danish, German, English (UK), Spanish, French, Galician, Italian,
-Japanese, Korean, Malay, Polish, Brazilian Portuguese, Russian, Turkish, Ukrainian and Chinese are currently registered in `crates/ui-egui/src/i18n.rs`. Adding a language requires an
+Japanese, Korean, Malay, Norwegian Bokmål, Dutch, Polish, Brazilian Portuguese, Russian, Turkish, Ukrainian and Chinese are currently registered in `crates/ui-egui/src/i18n.rs`. Adding a language requires an
 embedded catalog and one registration there; the preferences selector and validation use the same
 registry.
 
@@ -44,7 +44,7 @@ that looks untranslated. Two guards catch that in the build:
 
 - `every_complete_catalog_carries_every_english_message` — adding a key to `en.json`
   without giving it to a complete catalog fails the tests. English is the source catalog,
-  Japanese and Chinese are delivered complete; Danish, German, Spanish, Galician, Italian, Korean, Malay, Polish, Brazilian Portuguese, Russian, French, Ukrainian and
+  Japanese and Chinese are delivered complete; Danish, German, Spanish, Galician, Italian, Korean, Malay, Norwegian Bokmål, Polish, Brazilian Portuguese, Russian, French, Ukrainian and
   Turkish are partial — their gaps fall back to English and are reported by `cargo xtask i18n` without
   failing the build. A new label needs en, ja, zh, de and ko; Russian, French, Ukrainian and Malay may
   follow later.
@@ -80,13 +80,23 @@ is Bozza; Counterbore is Lamatura and Countersink is Svasatura. Established tech
 terms such as Loft, Sweep, Spline and Offset remain unchanged. Command IDs, shortcuts,
 file formats, units and user-provided names are not translated.
 
+The Norwegian Bokmål catalog (`nb`, shown as Norsk bokmål) uses Skisse (Sketch),
+Kropp (Body), Funksjon (timeline Feature), Binding (Constraint), Avrunding (Fillet)
+and Fas (Chamfer). Ground/Unground are Fest posisjon/Frigjør posisjon, Draft is
+Slippvinkel, Flat Pattern is Utbretting, and Counterbore/Countersink are Sylindrisk
+forsenkning/Konisk forsenkning. Capture Position is Registrer posisjon, while
+sketch snapping is Punktfangst. Loft, Sweep, Spline and Offset remain technical
+terms. Command IDs, shortcuts, file formats, units and user-provided names stay
+unchanged.
+
 One immutable `Locale` type handles all translations. Table widgets without an app reference
 use a render scope that restores the previous locale when it exits, including nested renders.
 Standalone translated panels enter the same scope. Measure rendered text to size custom
 widgets; UTF-8 byte lengths do not describe their displayed width.
 
-The desktop host tries system CJK fonts across Windows, macOS and Linux, as well as an optional
-`CRAFT_FONTS_DIR` font pack, and skips files that cannot be parsed. Chinese uses its own fallback
+The desktop host tries system CJK fonts across Windows, macOS and Linux, the Flatpak host font
+folders (`/run/host/fonts`, `/run/host/user-fonts`), the folders listed in `SOLIDCRAFT_FONT_DIRS`
+and an optional `CRAFT_FONTS_DIR` font pack, and skips files that cannot be parsed. Chinese uses its own fallback
 chain after the general CJK font: many Japanese CJK fonts (Hiragino Gothic, Meiryo, Yu Gothic)
 match the CJK font search but lack simplified characters, so a second fallback found by the
 Chinese font-name list (`PingFang`, `Microsoft YaHei`, `Noto Sans CJK SC`, …) covers them per

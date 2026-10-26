@@ -18,10 +18,10 @@ fn picked(h: &Harness, command: &str) -> Dialog {
         d.inputs[0].items = vec![if matches!(k, Mod::Corner { .. }) {
             Sel::SketchPoint { id: sk.points.iter().find(|p| p.id != "origin").unwrap().id.clone() }
         } else {
-            Sel::SketchCurve { id: sk.curves[0].id.clone() }
+            Sel::SketchCurve { id: sk.curves[0].id.clone(), sketch: None }
         }];
         if matches!(k, Mod::Mirror) {
-            d.inputs[1].items = vec![Sel::SketchCurve { id: sk.curves[3].id.clone() }];
+            d.inputs[1].items = vec![Sel::SketchCurve { id: sk.curves[3].id.clone(), sketch: None }];
         }
         if matches!(k, Mod::PatternCirc { .. }) {
             d.inputs[1].items = vec![Sel::SketchPoint { id: "origin".into() }];
@@ -133,11 +133,11 @@ fn picked_list_removes_one_item_and_field_still_activates_input() {
     let mut h = fixture();
     let mut d = picked(&h, "sketch.scale");
     let second = h.app.session.doc.sketch(1).unwrap().curves[1].id.clone();
-    d.inputs[0].items.push(Sel::SketchCurve { id: second.clone() });
+    d.inputs[0].items.push(Sel::SketchCurve { id: second.clone(), sketch: None });
     h.app.dialog = Some(d);
     h.frames(4);
     h.step(&json!({"click":{"handle":"dialog:list:Entities:0:remove"}})).unwrap();
-    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, vec![Sel::SketchCurve { id: second }]);
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items, vec![Sel::SketchCurve { id: second, sketch: None }]);
     h.step(&json!({"click":{"handle":"dialog:Base point"}})).unwrap();
     assert_eq!(h.app.dialog.as_ref().unwrap().active, 1);
 }
@@ -164,7 +164,7 @@ fn panel_dimension_preserves_expression_and_command_and_ok_closes() {
 fn text_and_text_move_cards_preserve_parameters_and_cancel_live_edits() {
     let mut h = fixture();
     let out = h.app.run("sketch.text", json!({"text":"II","at":[50,20],"height":8})).unwrap();
-    h.app.session.selection = vec![Sel::SketchCurve { id: out["curves"][0].as_str().unwrap().into() }];
+    h.app.session.selection = vec![Sel::SketchCurve { id: out["curves"][0].as_str().unwrap().into(), sketch: None }];
     h.app.start("sketch.edit_text");
     h.frames(4);
     card(&h);
@@ -175,7 +175,7 @@ fn text_and_text_move_cards_preserve_parameters_and_cancel_live_edits() {
     h.step(&json!({"text":"Changed"})).unwrap();
     h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
     assert_eq!(h.app.session.doc.to_json(), before);
-    h.app.session.selection = vec![Sel::SketchCurve { id: out["curves"][0].as_str().unwrap().into() }];
+    h.app.session.selection = vec![Sel::SketchCurve { id: out["curves"][0].as_str().unwrap().into(), sketch: None }];
     h.app.start("sketch.move");
     h.frames(4);
     card(&h);
@@ -192,18 +192,134 @@ fn apply_keeps_the_panel_open_after_asynchronous_evaluation() {
     let mut h = fixture();
     let mut d = picked(&h, "sketch.pattern.rectangular");
     let cmds = apply_commands(&h.app, &d).unwrap();
+    let prepared = h.app.session.scratch().compute_commands(&cmds, None).unwrap();
     d.repeat_after_apply = true;
     h.app.dialog = Some(d);
     let (finish, done) = std::sync::mpsc::channel();
-    h.app.applying = Some(Applying { done, started: crate::now_ms(), cmds, seen: true });
+    h.app.applying =
+        Some(Applying { done, ready: None, started: crate::now_ms(), cmds, seen: true, progress: Default::default(), quality: Default::default() });
     let undo = h.app.session.undo.len();
     h.frames(2);
     assert_eq!(h.app.session.undo.len(), undo);
-    finish.send(()).unwrap();
+    finish.send(Ok(prepared)).ok().unwrap();
     h.frames(3);
     assert!(h.app.applying.is_none());
     let d = h.app.dialog.as_ref().unwrap();
     assert_eq!(h.app.session.undo.len(), undo + 1);
     assert!(d.inputs.iter().all(|i| i.items.is_empty()));
     assert!(!d.repeat_after_apply);
+}
+
+#[test]
+fn circular_pattern_quantity_arrows_step_the_count_within_its_limits_and_keep_parameters() {
+    let mut h = fixture();
+    h.app.dialog = Some(picked(&h, "sketch.pattern.circular"));
+    h.settle();
+    let count = |h: &Harness| match &h.app.dialog.as_ref().unwrap().kind {
+        Kind::SketchModify(Mod::PatternCirc { count, .. }) => count.clone(),
+        other => panic!("not a sketch pattern window: {other:?}"),
+    };
+    let set = |h: &mut Harness, text: &str| {
+        if let Some(Kind::SketchModify(Mod::PatternCirc { count, .. })) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
+            *count = text.into();
+        }
+        h.frames(2);
+    };
+    let sent = |h: &Harness| apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1["count"].clone();
+    let previewed = |h: &Harness| crate::dialogs::preview_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1["count"].clone();
+    assert_eq!(count(&h), "6");
+    h.step(&json!({"click":{"handle":"dialog:Quantity up"}})).unwrap();
+    assert_eq!(count(&h), "7");
+    assert_eq!((sent(&h), previewed(&h)), (json!("7"), json!("7")), "the preview follows the arrow as it follows typing");
+    h.step(&json!({"click":{"handle":"dialog:Quantity down"}})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:Quantity down"}})).unwrap();
+    assert_eq!(count(&h), "5");
+    // A circular pattern needs the original and one copy, and makes at most 500.
+    set(&mut h, "2");
+    h.step(&json!({"click":{"handle":"dialog:Quantity down"}})).unwrap();
+    assert_eq!(count(&h), "2");
+    set(&mut h, "500");
+    h.step(&json!({"click":{"handle":"dialog:Quantity up"}})).unwrap();
+    assert_eq!(count(&h), "500");
+    // A count typed past the limit steps back inside it.
+    set(&mut h, "900");
+    h.step(&json!({"click":{"handle":"dialog:Quantity down"}})).unwrap();
+    assert_eq!(count(&h), "500");
+    // An expression keeps its parameter: the arrows adjust a trailing offset.
+    h.app.run("parameters.add", json!({"name":"holes","expression":"4","unit":""})).unwrap();
+    set(&mut h, "holes");
+    h.step(&json!({"click":{"handle":"dialog:Quantity up"}})).unwrap();
+    assert_eq!((count(&h), sent(&h)), ("holes + 1".into(), json!("holes + 1")), "the command keeps the parameter");
+    for _ in 0..2 {
+        h.step(&json!({"click":{"handle":"dialog:Quantity down"}})).unwrap();
+    }
+    assert_eq!((count(&h), sent(&h)), ("holes - 1".into(), json!("holes - 1")));
+    // Text that is not a count leaves the arrows without effect.
+    set(&mut h, "nothing");
+    h.step(&json!({"click":{"handle":"dialog:Quantity up"}})).unwrap();
+    assert_eq!(count(&h), "nothing");
+}
+
+#[test]
+fn rectangular_pattern_quantity_arrows_keep_both_directions_within_the_copy_limit() {
+    let mut h = fixture();
+    h.app.dialog = Some(picked(&h, "sketch.pattern.rectangular"));
+    h.settle();
+    let counts = |h: &Harness| match &h.app.dialog.as_ref().unwrap().kind {
+        Kind::SketchModify(Mod::PatternRect { count, count2, .. }) => (count.clone(), count2.clone()),
+        other => panic!("not a sketch pattern window: {other:?}"),
+    };
+    let (one, _) = counts(&h);
+    h.step(&json!({"click":{"handle":"dialog:Quantity 2 up"}})).unwrap();
+    assert_eq!(counts(&h), (one.clone(), "2".into()));
+    if let Some(Kind::SketchModify(Mod::PatternRect { count, count2, .. })) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
+        (*count, *count2) = ("250".into(), "2".into());
+    }
+    h.frames(2);
+    // 250 × 2 is the 500 copies a sketch pattern makes at most.
+    h.step(&json!({"click":{"handle":"dialog:Quantity up"}})).unwrap();
+    h.step(&json!({"click":{"handle":"dialog:Quantity 2 up"}})).unwrap();
+    assert_eq!(counts(&h), ("250".into(), "2".into()));
+    h.step(&json!({"click":{"handle":"dialog:Quantity down"}})).unwrap();
+    assert_eq!(counts(&h), ("249".into(), "2".into()));
+}
+
+#[test]
+fn sketch_pattern_dialog_preserves_expression_text_when_applying_and_editing() {
+    let mut h = fixture();
+    h.app.run("parameters.add", json!({"name":"pitch","expression":"30","unit":"mm"})).unwrap();
+    for command in ["sketch.pattern.rectangular", "sketch.pattern.circular"] {
+        let mut d = picked(&h, command);
+        match &mut d.kind {
+            Kind::SketchModify(Mod::PatternRect { count, spacing, .. }) => {
+                *count = "1 + 2".into();
+                *spacing = "pitch".into();
+            }
+            Kind::SketchModify(Mod::PatternCirc { count, angle, .. }) => {
+                *count = "1 + 2".into();
+                *angle = "45 deg + 45 deg".into();
+            }
+            _ => panic!("expected a sketch pattern dialog"),
+        }
+        let cmds = apply_commands(&h.app, &d).unwrap();
+        assert_eq!(cmds[0].1["count"], "1 + 2");
+        let (key, expression) = if command.ends_with("rectangular") { ("spacing", "pitch") } else { ("angle", "45 deg + 45 deg") };
+        assert_eq!(cmds[0].1[key], expression);
+        let result = h.app.run(command, cmds[0].1.clone()).unwrap();
+        if command.ends_with("rectangular") {
+            h.app.run("parameters.change", json!({"name":"pitch","expression":"40"})).unwrap();
+        }
+        assert!(crate::sketch_modify_ui::edit_pattern(&mut h.app, result["pattern"].as_str().unwrap()));
+        match &h.app.dialog.as_ref().unwrap().kind {
+            Kind::SketchModify(Mod::PatternRect { count, spacing, .. }) => {
+                assert_eq!(count, "1 + 2");
+                assert_eq!(spacing, expression);
+            }
+            Kind::SketchModify(Mod::PatternCirc { count, angle, .. }) => {
+                assert_eq!(count, "1 + 2");
+                assert_eq!(angle, expression);
+            }
+            _ => panic!("expected a sketch pattern dialog"),
+        }
+    }
 }

@@ -25,6 +25,196 @@ thread_local! {
     /// The palette of a theme file (`theme_files`) in place of the built-in one of its base
     /// (dark or light), per thread like the rest. `None`: the built-in palettes.
     static CUSTOM: Cell<Option<Custom>> = const { Cell::new(None) };
+    /// The 3D view's own dark or light when Preferences give it one ([`ViewportTheme`], #4146),
+    /// per thread like the rest. `None`: the view is as dark as the window.
+    static VIEWPORT_DARK: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Three structural border levels plus independent content and control outlines.
+/// Focus, selection, status, artwork and CAD geometry do not use these roles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorderRole {
+    Primary,
+    Secondary,
+    Tertiary,
+    Container,
+    Control,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Borders {
+    pub primary: Option<Stroke>,
+    pub secondary: Option<Stroke>,
+    /// Pattern for secondary section rules; solid preserves existing themes.
+    pub secondary_dotted: bool,
+    pub tertiary: Option<Stroke>,
+    /// Solid outlines for nested previews, information wells and shortcut keycaps.
+    pub container: Option<Stroke>,
+    pub control: Option<Stroke>,
+    pub primary_inset: Option<InsetBorder>,
+    /// Optional directional chrome. Absent themes keep their flat strokes.
+    pub bevel: Option<Bevel>,
+}
+
+/// Two directional edge bands, shared by raised chrome and recessed editors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bevel {
+    pub width: f32,
+    pub highlight: Color32,
+    pub light: Color32,
+    pub shadow: Color32,
+    pub dark_shadow: Color32,
+}
+
+impl Bevel {
+    /// Draw inside existing geometry; no extra input targets or layout allocation.
+    pub fn paint(self, painter: &egui::Painter, rect: egui::Rect, radius: impl Into<egui::CornerRadius>, recessed: bool, enabled: bool) {
+        if !rect.is_finite() || self.width <= 0.0 || !self.width.is_finite() || rect.width().min(rect.height()) <= self.width * 4.0 {
+            return;
+        }
+        let radius = radius.into();
+        let bands = if recessed {
+            [(self.shadow, self.highlight), (self.dark_shadow, self.light)]
+        } else {
+            [(self.highlight, self.dark_shadow), (self.light, self.shadow)]
+        };
+        for (index, (upper, lower)) in bands.into_iter().enumerate() {
+            let inset = (index as f32 + 0.5) * self.width;
+            let edge = rect.shrink(inset);
+            let mut rounding: egui::epaint::CornerRadiusF32 = radius.into();
+            rounding -= inset;
+            let mut path = Vec::new();
+            egui::epaint::tessellator::path::rounded_rectangle(&mut path, edge, rounding);
+            if let Some(first) = path.first().copied() {
+                path.push(first);
+            }
+            for pair in path.windows(2) {
+                if let Some((a, b)) = pair.first().zip(pair.get(1)) {
+                    let middle = *a + (*b - *a) * 0.5;
+                    let relative = (middle - edge.center()) / edge.size();
+                    let color = if relative.x + relative.y < 0.0 { upper } else { lower };
+                    let color = if enabled { color } else { color.gamma_multiply(0.45) };
+                    painter.line_segment([*a, *b], Stroke::new(self.width, color));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InsetBorder {
+    pub stroke: Stroke,
+    /// Clear distance from the inner edge of the primary stroke, in logical points.
+    pub gap: f32,
+}
+
+impl Borders {
+    pub const LEGACY: Self = Self {
+        primary: None,
+        secondary: None,
+        secondary_dotted: false,
+        tertiary: None,
+        container: None,
+        control: None,
+        primary_inset: None,
+        bevel: None,
+    };
+
+    pub fn stroke(self, role: BorderRole, fallback: Stroke) -> Stroke {
+        match role {
+            BorderRole::Primary => self.primary,
+            BorderRole::Secondary => self.secondary,
+            BorderRole::Tertiary => self.tertiary,
+            BorderRole::Container => self.container,
+            BorderRole::Control => self.control,
+        }
+        .unwrap_or(fallback)
+    }
+}
+
+impl Tokens {
+    /// Bevel themes use the editable surface colour independently of button faces.
+    pub fn input_fill(&self) -> Color32 {
+        if self.borders.bevel.is_some() { self.field } else { self.control_fill }
+    }
+
+    pub fn input_bevel(&self, ui: &egui::Ui, response: &egui::Response) {
+        if let Some(bevel) = self.borders.bevel {
+            bevel.paint(ui.painter(), response.rect.shrink(1.0), self.control_radius, true, response.enabled());
+        }
+    }
+
+    pub fn button_bevel(&self, ui: &egui::Ui, response: &egui::Response, selected: bool) {
+        self.button_bevel_with_radius(ui, response, selected, self.control_radius);
+    }
+
+    /// Compound controls supply the same corner geometry as their selected fill.
+    pub fn button_bevel_with_radius(&self, ui: &egui::Ui, response: &egui::Response, selected: bool, radius: impl Into<egui::CornerRadius>) {
+        if let Some(bevel) = self.borders.bevel {
+            let pressed = response.enabled()
+                && (response.is_pointer_button_down_on()
+                    || (response.has_focus() && ui.input(|i| i.key_down(egui::Key::Space) || i.key_down(egui::Key::Enter))));
+            bevel.paint(ui.painter(), response.rect, radius, selected || pressed, response.enabled());
+        }
+    }
+
+    pub fn primary_border(&self, color: Color32) -> Stroke {
+        self.borders.stroke(BorderRole::Primary, Stroke::new(1.0, color))
+    }
+    pub fn secondary_border(&self, color: Color32) -> Stroke {
+        self.borders.stroke(BorderRole::Secondary, Stroke::new(1.0, color))
+    }
+    /// Secondary rules share a pattern as well as a stroke. Dot count is bounded for tiny widths.
+    fn secondary_dots(&self, painter: &egui::Painter, path: &[egui::Pos2], stroke: Stroke) {
+        if stroke.width <= 0.0 || path.iter().any(|p| !p.is_finite()) {
+            return;
+        }
+        let length: f32 = path.windows(2).map(|pair| pair.first().zip(pair.get(1)).map_or(0.0, |(a, b)| a.distance(*b))).sum();
+        if !length.is_finite() {
+            return;
+        }
+        let spacing = (stroke.width * 3.0).max(3.0).max(length / 4096.0);
+        painter.extend(egui::Shape::dotted_line(path, stroke.color, spacing, stroke.width * 0.5));
+    }
+
+    pub fn secondary_line(&self, painter: &egui::Painter, points: [egui::Pos2; 2], color: Color32) {
+        let stroke = self.secondary_border(color);
+        if self.borders.secondary_dotted {
+            self.secondary_dots(painter, &points, stroke);
+        } else {
+            painter.line_segment(points, stroke);
+        }
+    }
+
+    pub fn secondary_hline(&self, painter: &egui::Painter, range: impl Into<egui::emath::Rangef>, y: f32, color: Color32) {
+        let range = range.into();
+        self.secondary_line(painter, [egui::pos2(range.min, y), egui::pos2(range.max, y)], color);
+    }
+
+    pub fn secondary_vline(&self, painter: &egui::Painter, x: f32, range: impl Into<egui::emath::Rangef>, color: Color32) {
+        let range = range.into();
+        self.secondary_line(painter, [egui::pos2(x, range.min), egui::pos2(x, range.max)], color);
+    }
+
+    /// Enclosures stay solid independently of the section-divider pattern.
+    pub fn container_rect(&self, painter: &egui::Painter, rect: egui::Rect, radius: impl Into<egui::CornerRadius>, fill: Color32, color: Color32) {
+        let radius = radius.into();
+        painter.rect(rect, radius, fill, self.container_border(color), egui::StrokeKind::Inside);
+        if let Some(bevel) = self.borders.bevel {
+            bevel.paint(painter, rect, radius, false, true);
+        }
+    }
+
+    pub fn container_border(&self, color: Color32) -> Stroke {
+        self.borders.stroke(BorderRole::Container, Stroke::new(1.0, color))
+    }
+
+    pub fn tertiary_border(&self, color: Color32) -> Stroke {
+        self.borders.stroke(BorderRole::Tertiary, Stroke::new(1.0, color))
+    }
+    pub fn control_border_stroke(&self, color: Color32) -> Stroke {
+        self.borders.stroke(BorderRole::Control, Stroke::new(1.0, color))
+    }
 }
 
 /// A theme file's palette and whether it is dark.
@@ -38,6 +228,20 @@ pub struct Custom {
 /// that changed anything (the visuals follow on the next [`apply`]).
 pub fn set_custom(custom: Option<Custom>) -> bool {
     CUSTOM.with(|c| c.replace(custom) != custom)
+}
+
+/// Isolated widget tests restore the thread's theme even when an assertion fails.
+#[cfg(test)]
+pub(crate) fn scoped_tokens(tokens: Tokens) -> impl Drop {
+    struct Restore(Option<Custom>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_custom(self.0);
+        }
+    }
+    let restore = Restore(CUSTOM.get());
+    set_custom(Some(Custom { dark: is_dark(), tokens }));
+    restore
 }
 
 /// A tab's selection colours. This is deliberately separate from the global widget style:
@@ -85,12 +289,31 @@ impl TabAccent {
             // Model and shared utility tabs retain their existing selection exactly.
             _ => (t.accent, t.selected_ink, t.accent_soft),
         };
+        let ink = if contrast_ratio(ink, soft) >= 4.5 {
+            ink
+        } else if contrast_ratio(color, soft) >= 4.5 {
+            color
+        } else if contrast_ratio(t.text, soft) >= 4.5 {
+            t.text
+        } else if contrast_ratio(Color32::BLACK, soft) >= contrast_ratio(Color32::WHITE, soft) {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        };
         Self { color, ink, soft }
     }
 
     /// Small text on a tab's solid pill. Brighter fills need dark ink in either theme.
     pub fn on_fill(self, t: &Tokens) -> Color32 {
-        if contrast_ratio(t.on_accent, self.color) >= 4.5 { t.on_accent } else { t.tab_on_fill_dark }
+        if contrast_ratio(t.on_accent, self.color) >= 4.5 {
+            t.on_accent
+        } else if contrast_ratio(t.tab_on_fill_dark, self.color) >= 4.5 {
+            t.tab_on_fill_dark
+        } else if contrast_ratio(Color32::BLACK, self.color) >= contrast_ratio(Color32::WHITE, self.color) {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        }
     }
 
     pub fn current(ctx: &egui::Context) -> Self {
@@ -126,6 +349,11 @@ impl TabAccent {
 /// Is the dark theme on?
 pub fn is_dark() -> bool {
     DARK.get()
+}
+
+/// Is the 3D view dark? As the window, unless Preferences give the view its own (#4146).
+pub fn viewport_dark() -> bool {
+    VIEWPORT_DARK.get().unwrap_or_else(is_dark)
 }
 
 /// The common conversion boundary for compiled icon palette data.
@@ -195,6 +423,60 @@ impl<'de> Deserialize<'de> for ColorVision {
     }
 }
 
+/// The 3D view's colours (#4146): the theme's own, or the built-in Light or Dark theme's whatever
+/// the window uses, so a dark window can show the model on a light view and the other way round.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewportTheme {
+    #[default]
+    Theme,
+    Light,
+    Dark,
+}
+
+impl ViewportTheme {
+    pub const ALL: [ViewportTheme; 3] = [ViewportTheme::Theme, ViewportTheme::Light, ViewportTheme::Dark];
+
+    /// The saved value (`ui.prefs` `viewport_theme`).
+    pub fn id(self) -> &'static str {
+        match self {
+            ViewportTheme::Theme => "theme",
+            ViewportTheme::Light => "light",
+            ViewportTheme::Dark => "dark",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<ViewportTheme> {
+        ViewportTheme::ALL.into_iter().find(|m| m.id() == id)
+    }
+
+    /// Its name in the Preferences (a message id).
+    pub fn label_id(self) -> &'static str {
+        match self {
+            ViewportTheme::Theme => "ui.viewport_theme_follow",
+            ViewportTheme::Light => "ui.light",
+            ViewportTheme::Dark => "ui.dark",
+        }
+    }
+
+    /// The view's own dark or light, or `None` to draw it as the window ([`set_viewport_dark`]).
+    pub fn dark(self) -> Option<bool> {
+        match self {
+            ViewportTheme::Theme => None,
+            ViewportTheme::Light => Some(false),
+            ViewportTheme::Dark => Some(true),
+        }
+    }
+}
+
+/// From saved preferences: an unknown value is Theme, as [`ColorVision`]'s is Off.
+impl<'de> Deserialize<'de> for ViewportTheme {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(v.as_str().and_then(ViewportTheme::from_id).unwrap_or_default())
+    }
+}
+
 /// The colour vision mode on now (on this thread).
 pub fn vision() -> ColorVision {
     VISION.with(Cell::get)
@@ -215,44 +497,52 @@ pub fn srgb(c: [f32; 3]) -> Color32 {
 /// the same as when they were literals in the WGSL). The light theme's are the headless default.
 pub use solidcraft_engine::render::AnalysisColors;
 
-/// The colours icons draw of their own (`icons::paint` takes ink, fill and accent from its
-/// caller). Every icon colour is a token so a colour vision mode can reach it.
+/// Colours for native viewport markers and the agent pointer. Command artwork uses the SVG palette.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IconColors {
-    /// Surface sheets: a sheet, a second sheet beside it, a lighter sheet, iso lines and teeth.
-    pub sheet: Color32,
-    pub sheet_2: Color32,
-    pub sheet_light: Color32,
-    pub sheet_line: Color32,
-    /// Highlights (and the white ink of markers and the agent pointer), and the sphere's glint.
     pub highlight: Color32,
-    pub glint: Color32,
-    pub folder: Color32,
-    pub plane: Color32,
-    pub fold: Color32,
-    /// Zebra stripes, and the environment map's sky and floor.
-    pub stripe: Color32,
-    pub sky: Color32,
-    pub floor: Color32,
-    /// Appearance: red, blue and yellow paint dabs.
-    pub paint: [Color32; 3],
-    /// Origin: X, Y and Z arrows.
-    pub axes: [Color32; 3],
-    /// Accessibility: reachable, blocked. Draft: positive, between. Curvature: flat, middle,
-    /// tight.
-    pub access: [Color32; 2],
-    pub draft: [Color32; 2],
-    pub curvature: [Color32; 3],
-    pub interference: Color32,
-    pub warning: Color32,
-    /// The pointer an AI agent moves.
     pub agent: Color32,
-    /// The dark halo under viewport markers (snap points).
     pub marker_halo: Color32,
 }
 
+/// Every colour and size the UI draws with. The colours drawn in the 3D view are listed again in
+/// [`Tokens::with_viewport`], which takes them from the other side when the 3D view is set to the
+/// other one's colours (#4146): a new colour drawn in the view goes in both.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
+    /// Optional structural/control strokes. None retains each surface’s legacy styling.
+    pub borders: Borders,
+    /// File/start presentation, with explicit foreground/background pairs.
+    pub file_dim: Color32,
+    pub file_recovery_well: Color32,
+    pub file_action_height: f32,
+    pub file_back_height: f32,
+    pub file_recovery_icon: f32,
+    pub file_grid_gap: f32,
+    pub file_background: Color32,
+    pub file_surface: Color32,
+    pub file_border: Color32,
+    /// Neutral multiplication tint for File-view model thumbnails.
+    pub file_image_tint: Color32,
+    pub file_rail: Color32,
+    pub file_rail_ink: Color32,
+    pub file_rail_hover: Color32,
+    pub file_primary: Color32,
+    pub file_primary_ink: Color32,
+    pub file_primary_border: Color32,
+    pub file_recovery: Color32,
+    pub file_recovery_ink: Color32,
+    pub file_recovery_border: Color32,
+    pub file_nav_width: f32,
+    pub file_nav_height: f32,
+    pub file_tile_height: f32,
+    pub file_tile_icon: f32,
+    pub file_recent_height: f32,
+    pub file_sample_image_height: f32,
+    pub file_content_inset_x: f32,
+    pub file_content_inset_y: f32,
+    pub file_section_gap: f32,
+    pub font_start_title: f32,
     // Shared dimensions in logical pixels; identical in both themes.
     pub space_2: f32,
     pub space_3: f32,
@@ -386,7 +676,6 @@ pub struct Tokens {
     pub error: Color32,
     pub warning: Color32,
     pub icon: Color32,
-    pub icon_fill: Color32,
     pub timeline: Color32,
     pub hover: Color32,
     // ---- viewport selection feedback ----
@@ -413,6 +702,9 @@ pub struct Tokens {
     pub origin_plane_edge: Color32,
     pub origin_plane_hover: Color32,
     pub origin_point: Color32,
+    /// The X, Y and Z colours, one set for every axis drawn (#976): the origin axes, the view
+    /// triad, the navigation cube's triad, the Move gizmo, a 3D sketch point's triad, joint
+    /// origins, measured distances along the axes and the headless picture's origin axes.
     pub axis_x: Color32,
     pub axis_y: Color32,
     pub axis_z: Color32,
@@ -450,6 +742,8 @@ pub struct Tokens {
     /// Sketch curves: under-constrained, fully constrained (and finished sketches).
     pub sketch: Color32,
     pub sketch_fixed: Color32,
+    /// Wider rim beneath sketch curves to separate them from shaded faces.
+    pub sketch_halo: Color32,
     /// Fixed (locked) sketch geometry.
     pub sketch_locked: Color32,
     /// Sketch dimensions: driving, driven (reference).
@@ -462,10 +756,6 @@ pub struct Tokens {
     pub dialog_bg: Color32,
     pub dialog_border: Color32,
     pub chip: Color32,
-    /// Band behind a panel's heading and, lighter, behind its section headings (both set off
-    /// from `dialog_bg`).
-    pub heading_bg: Color32,
-    pub subheading_bg: Color32,
     /// Inside of bodies cut by a section.
     pub section_cap: Color32,
     /// Closed sketch profiles (translucent fill).
@@ -513,10 +803,6 @@ pub struct Tokens {
     pub sketch_lost: Color32,
     pub sketch_construction: Color32,
     pub sketch_centerline: Color32,
-    /// The view triad's X, Y and Z (and the CPU scene's origin axes).
-    pub triad: [Color32; 3],
-    /// The move gizmo's X, Y and Z.
-    pub gizmo: [Color32; 3],
     /// Sheet metal flat pattern: bend up, bend down.
     pub bend_up: Color32,
     pub bend_down: Color32,
@@ -528,21 +814,112 @@ pub struct Tokens {
     pub continuity: [Color32; 4],
     pub analysis: AnalysisColors,
     pub icons: IconColors,
-    /// The application bar's buttons: ink, fill and accent of their icons.
-    pub app_bar_icon: [Color32; 3],
-    /// The SolidCraft mark on the application bar: light, mid and dark faces, and its edge.
-    pub logo: [Color32; 4],
+    /// Optional SVG display roles and semantic ramps from the active theme file.
+    pub icon_palette: Option<crate::icon_svg::Palette>,
+    /// The SolidCraft mark on the application bar: light, mid and dark faces (the gaps between
+    /// them show the bar).
+    pub logo: [Color32; 3],
 }
 
 impl Tokens {
+    /// An expanded outline follows its fill, including a theme's deliberately square corners.
+    pub(crate) fn outset_radius(radius: f32, outset: f32) -> f32 {
+        if radius > 0.0 { radius + outset } else { 0.0 }
+    }
+
     /// Subtle shell elevation, derived from the semantic application-bar colour.
     pub(crate) fn shell_shadow(self) -> egui::Shadow {
         egui::Shadow { offset: [0, self.space_2 as i8], blur: self.space_8 as u8, spread: 0, color: self.app_bar.gamma_multiply(0.18) }
     }
 
-    /// The tokens of the current theme and colour vision mode.
+    /// The X, Y and Z axis colours, in that order.
+    pub const fn axes(&self) -> [Color32; 3] {
+        [self.axis_x, self.axis_y, self.axis_z]
+    }
+
+    /// The tokens of the current theme and colour vision mode, the colours drawn in the 3D view
+    /// from the view's own dark or light ([`viewport_dark`]).
     pub fn get() -> Tokens {
-        Tokens::themed(is_dark(), vision())
+        let window = Tokens::themed(is_dark(), vision());
+        if viewport_dark() == is_dark() { window } else { window.with_viewport(Tokens::themed(viewport_dark(), vision())) }
+    }
+
+    /// The tokens of the 3D view's side (#4146), for a window colour drawn straight onto the view
+    /// with nothing behind it (a status line, a label or a warning beside the geometry), so it
+    /// reads on the view's background. As [`Tokens::get`] unless the view has its own side.
+    pub fn view() -> Tokens {
+        Tokens::themed(viewport_dark(), vision())
+    }
+
+    /// These tokens with the colours drawn in the 3D view taken from `view`: the background and
+    /// grid, bodies, selection and hover, the origin and construction geometry, previews, sketches
+    /// and their dimensions and glyphs, the navigation cube and triads, box selection and the
+    /// analysis colours. The window keeps its own: panels, dialogs, menus, and the chips and cards
+    /// over the view (`overlay` with its text, icons and borders).
+    pub fn with_viewport(self, view: Tokens) -> Tokens {
+        Tokens {
+            sel_face: view.sel_face,
+            sel_edge: view.sel_edge,
+            sel_edge_rim: view.sel_edge_rim,
+            hover_edge: view.hover_edge,
+            hover_edge_halo: view.hover_edge_halo,
+            hover_face_lift: view.hover_face_lift,
+            sel_profile: view.sel_profile,
+            sel_profile_edge: view.sel_profile_edge,
+            hover_profile: view.hover_profile,
+            hover_profile_edge: view.hover_profile_edge,
+            sel_vertex: view.sel_vertex,
+            origin_plane: view.origin_plane,
+            origin_plane_edge: view.origin_plane_edge,
+            origin_plane_hover: view.origin_plane_hover,
+            origin_point: view.origin_point,
+            axis_x: view.axis_x,
+            axis_y: view.axis_y,
+            axis_z: view.axis_z,
+            construction_plane: view.construction_plane,
+            construction_geom: view.construction_geom,
+            body: view.body,
+            body_edge: view.body_edge,
+            manipulator: view.manipulator,
+            preview_add: view.preview_add,
+            preview_new: view.preview_new,
+            preview_sketch: view.preview_sketch,
+            preview_cut: view.preview_cut,
+            cube_face: view.cube_face,
+            cube_border: view.cube_border,
+            cube_text: view.cube_text,
+            cube_hover: view.cube_hover,
+            viewport_top: view.viewport_top,
+            viewport_bottom: view.viewport_bottom,
+            grid: view.grid,
+            grid_major: view.grid_major,
+            body_selected: view.body_selected,
+            sketch: view.sketch,
+            sketch_fixed: view.sketch_fixed,
+            sketch_locked: view.sketch_locked,
+            dimension: view.dimension,
+            dimension_driven: view.dimension_driven,
+            sketch_point: view.sketch_point,
+            sketch_point_free: view.sketch_point_free,
+            section_cap: view.section_cap,
+            profile_fill: view.profile_fill,
+            glyph_bg: view.glyph_bg,
+            glyph_edge: view.glyph_edge,
+            glyph_text: view.glyph_text,
+            rubber_band: view.rubber_band,
+            box_window: view.box_window,
+            box_crossing: view.box_crossing,
+            sketch_projected: view.sketch_projected,
+            sketch_lost: view.sketch_lost,
+            sketch_construction: view.sketch_construction,
+            sketch_centerline: view.sketch_centerline,
+            bend_up: view.bend_up,
+            bend_down: view.bend_down,
+            interference: view.interference,
+            continuity: view.continuity,
+            analysis: view.analysis,
+            ..self
+        }
     }
 
     /// The tokens of a theme and colour vision mode: a theme file's palette when one is on for
@@ -588,12 +965,17 @@ pub fn set_dark(dark: bool) {
     DARK.set(dark);
 }
 
+/// Give the 3D view its own dark or light (#4146), or `None` to draw it as dark as the window.
+pub fn set_viewport_dark(dark: Option<bool>) {
+    VIEWPORT_DARK.set(dark);
+}
+
 fn visuals(dark: bool) -> egui::Visuals {
     let t = Tokens::themed(dark, vision());
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = t.panel;
     v.window_fill = t.panel;
-    v.window_stroke = Stroke::new(1.0, t.border);
+    v.window_stroke = t.primary_border(t.border);
     v.extreme_bg_color = t.field;
     v.faint_bg_color = t.panel_header;
     v.override_text_color = Some(t.text);
@@ -602,14 +984,24 @@ fn visuals(dark: bool) -> egui::Visuals {
     v.widgets.active.weak_bg_fill = t.accent_soft;
     v.selection.bg_fill = t.accent_soft;
     v.selection.stroke = Stroke::new(1.0, t.accent);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, t.border);
+    v.widgets.noninteractive.bg_stroke = t.tertiary_border(t.border);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, t.text);
     v.widgets.hovered.weak_bg_fill = t.hover;
     v.widgets.hovered.bg_fill = t.hover;
     // egui uses the open-state fill for a movable window's active title bar.
     v.widgets.open.weak_bg_fill = t.panel_header;
+    for state in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        state.bg_stroke = t.borders.stroke(BorderRole::Control, state.bg_stroke);
+    }
     v.window_corner_radius = egui::CornerRadius::same(t.radius_md);
+    v.menu_corner_radius = egui::CornerRadius::same(t.radius_md);
+    // Keep the existing 2/3 point egui shapes under the default 4 point small token.
+    // Set every interaction state so hovering or focusing cannot restore rounded corners.
+    for widget in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.active, &mut v.widgets.open] {
+        widget.corner_radius = egui::CornerRadius::same(t.radius_sm / 2);
+    }
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(t.radius_sm.saturating_sub(1));
     v
 }
 
@@ -622,10 +1014,107 @@ pub fn apply(ctx: &egui::Context) {
         s.spacing.item_spacing = egui::vec2(t.space_6, t.space_4);
         s.spacing.button_padding = egui::vec2(t.space_6, t.space_3);
     });
+    // The new visuals are painted on the next pass: without a repaint request the widgets
+    // keep the previous theme's colours until some other event schedules a pass (#5802).
+    ctx.request_repaint();
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn widget_states_and_popup_frames_follow_theme_radii_without_changing_defaults() {
+        use super::*;
+        let old_custom = CUSTOM.get();
+        for dark in [false, true] {
+            set_custom(None);
+            let actual = visuals(dark);
+            let original = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+            assert_eq!(actual.menu_corner_radius, original.menu_corner_radius);
+            for (a, b) in [
+                (actual.widgets.noninteractive, original.widgets.noninteractive),
+                (actual.widgets.inactive, original.widgets.inactive),
+                (actual.widgets.hovered, original.widgets.hovered),
+                (actual.widgets.active, original.widgets.active),
+                (actual.widgets.open, original.widgets.open),
+            ] {
+                assert_eq!(a.corner_radius, b.corner_radius);
+            }
+            let tokens = Tokens { radius_sm: 0, radius_md: 0, ..Tokens::dark() };
+            set_custom(Some(Custom { dark, tokens }));
+            let square = visuals(dark);
+            set_custom(old_custom);
+            assert_eq!(square.window_corner_radius, egui::CornerRadius::ZERO);
+            assert_eq!(square.menu_corner_radius, egui::CornerRadius::ZERO);
+            for widget in [square.widgets.noninteractive, square.widgets.inactive, square.widgets.hovered, square.widgets.active, square.widgets.open]
+            {
+                assert_eq!(widget.corner_radius, egui::CornerRadius::ZERO);
+            }
+        }
+        assert_eq!(Tokens::outset_radius(0.0, 3.0), 0.0);
+        assert_eq!(Tokens::outset_radius(6.0, 3.0), 9.0);
+    }
+
+    /// A theme change repaints: egui paints the new visuals on the next pass, so without a
+    /// repaint request the widgets keep the previous theme's colours until another event
+    /// schedules a pass (#5802).
+    #[test]
+    fn applying_a_theme_asks_for_a_repaint_with_the_new_visuals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ctx = egui::Context::default();
+        // The integration hook fires on every repaint request, whoever asked for it.
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&requests);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        // Let egui's own startup repaints settle: the context must be idle before the
+        // theme changes, so the only repaint left is the one the theme asks for.
+        let mut settled = false;
+        for _ in 0..8 {
+            ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+            if !ctx.has_requested_repaint() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the context must be idle before the theme changes");
+        let before = requests.load(Ordering::Relaxed);
+        let previous = super::is_dark();
+        super::set_dark(!previous);
+        let dark = super::is_dark();
+        let expected = super::visuals(dark);
+        // The theme is applied outside a pass: inside one egui schedules repaints of its
+        // own, and the request of the theme would hide among them.
+        super::apply(&ctx);
+        super::set_dark(previous);
+        assert!(requests.load(Ordering::Relaxed) > before, "a theme change must ask for a repaint");
+        assert!(ctx.has_requested_repaint(), "a theme change must leave a repaint pending");
+        let theme = if dark { egui::Theme::Dark } else { egui::Theme::Light };
+        assert_eq!(ctx.style_of(theme).visuals, expected, "the new theme's visuals must be in place");
+    }
+
+    #[test]
+    fn file_view_foreground_pairs_hold_small_text_contrast_without_changing_accent() {
+        for dark in [false, true] {
+            for vision in super::ColorVision::ALL {
+                let t = super::Tokens::themed(dark, vision);
+                for (ink, surface) in [
+                    (t.file_rail_ink, t.file_rail),
+                    (t.file_rail_ink, t.file_rail_hover),
+                    (t.file_primary_ink, t.file_primary),
+                    (t.file_primary_ink, t.file_background),
+                    (t.file_recovery_ink, t.file_recovery),
+                    (t.form_ink, t.file_surface),
+                    (t.file_dim, t.file_surface),
+                    (t.file_dim, t.file_background),
+                    (t.file_dim, t.file_primary),
+                ] {
+                    assert!(super::contrast_ratio(ink, surface) >= 4.5, "dark={dark}: {ink:?} on {surface:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn tab_accents_map_explicit_tokens_without_changing_model() {
         for dark in [false, true] {
@@ -676,6 +1165,23 @@ mod tests {
             let [color, ink, soft] = values.map(rgb);
             assert_eq!(super::TabAccent::for_tab(&t, "MODEL"), super::TabAccent { color, ink, soft });
         }
+    }
+
+    #[test]
+    fn built_in_selected_tab_labels_hold_wcag_small_text_contrast() {
+        let mut themes = vec![("Dark", super::Tokens::dark()), ("Light", super::Tokens::light())];
+        themes.extend(crate::theme_files::builtin().iter().map(|theme| (theme.name.as_str(), crate::theme_files::resolve(theme))));
+        let mut failures = Vec::new();
+        for (name, tokens) in themes {
+            for tab in crate::workspace::TABS.iter().copied().chain(["SKETCH", "MESH", "FORM", "SHEET METAL", "RENDER"]) {
+                let accent = super::TabAccent::for_tab(&tokens, tab);
+                let ratio = super::contrast_ratio(accent.ink, accent.soft);
+                if ratio < 4.5 {
+                    failures.push(format!("{name} {tab}: {ratio:.4}:1 ({:?} on {:?})", accent.ink, accent.soft));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "selected tab contrast below 4.5:1:\n{}", failures.join("\n"));
     }
 
     #[test]
@@ -737,13 +1243,61 @@ mod tests {
         });
     }
 
-    /// Title and section bands stand out from a dialog, the title more than its sections.
+    /// A 3D view set to the other side's colours (#4146): the view's colours come from the other
+    /// side and everything else stays the window's, in every colour vision mode. A view as dark as
+    /// the window gives the window's tokens unchanged.
     #[test]
-    fn heading_bands_are_darker_than_the_dialog_in_order() {
-        let luma = |c: egui::Color32| u32::from(c.r()) * 3 + u32::from(c.g()) * 6 + u32::from(c.b());
-        for t in [super::Tokens::light(), super::Tokens::dark()] {
-            assert!(luma(t.heading_bg) < luma(t.subheading_bg), "{t:?}");
-            assert!(luma(t.subheading_bg) < luma(t.dialog_bg), "{t:?}");
+    fn a_view_on_the_other_side_takes_its_colours() {
+        use super::{ColorVision, Tokens};
+        for mode in ColorVision::ALL {
+            super::set_vision(mode);
+            for window in [false, true] {
+                super::set_dark(window);
+                for same in [None, Some(window)] {
+                    super::set_viewport_dark(same);
+                    assert_eq!(super::viewport_dark(), window);
+                    assert_eq!(Tokens::get(), Tokens::themed(window, mode), "{mode:?} {window} {same:?}");
+                    assert_eq!(Tokens::view(), Tokens::get(), "{mode:?} {window} {same:?}");
+                }
+                super::set_viewport_dark(Some(!window));
+                assert_eq!(super::viewport_dark(), !window);
+                let (t, w, v) = (Tokens::get(), Tokens::themed(window, mode), Tokens::themed(!window, mode));
+                // What is drawn straight onto the view takes all of its side's colours.
+                assert_eq!(Tokens::view(), v);
+                // The two sides differ, so the checks below tell them apart.
+                assert_ne!((w.viewport_top, w.panel), (v.viewport_top, v.panel));
+                // The view's: background and grid, bodies, selection and hover, sketches with their
+                // dimensions and glyphs, the origin, the cube and triads, box selection, analysis.
+                assert_eq!((t.viewport_top, t.viewport_bottom, t.grid, t.grid_major), (v.viewport_top, v.viewport_bottom, v.grid, v.grid_major));
+                assert_eq!(
+                    (t.body, t.body_edge, t.body_selected, t.sel_face, t.sel_edge, t.hover_edge),
+                    (v.body, v.body_edge, v.body_selected, v.sel_face, v.sel_edge, v.hover_edge)
+                );
+                assert_eq!(
+                    (t.sketch, t.sketch_fixed, t.dimension, t.glyph_bg, t.glyph_text, t.profile_fill),
+                    (v.sketch, v.sketch_fixed, v.dimension, v.glyph_bg, v.glyph_text, v.profile_fill)
+                );
+                assert_eq!(
+                    (t.origin_plane, t.axis_x, t.cube_face, t.cube_text, t.axis_y, t.axis_z),
+                    (v.origin_plane, v.axis_x, v.cube_face, v.cube_text, v.axis_y, v.axis_z)
+                );
+                assert_eq!(
+                    (t.box_window, t.section_cap, t.preview_add, t.sketch_construction, t.continuity),
+                    (v.box_window, v.section_cap, v.preview_add, v.sketch_construction, v.continuity)
+                );
+                assert_eq!(t.analysis, v.analysis);
+                // The window's: panels, text, accents, dialogs, and the chips over the view with
+                // their borders and icons.
+                assert_eq!(
+                    (t.panel, t.text, t.border, t.accent, t.accent_soft, t.icon),
+                    (w.panel, w.text, w.border, w.accent, w.accent_soft, w.icon)
+                );
+                assert_eq!(
+                    (t.overlay, t.hover, t.dialog_bg, t.field, t.timeline, t.app_bar),
+                    (w.overlay, w.hover, w.dialog_bg, w.field, w.timeline, w.app_bar)
+                );
+            }
         }
+        super::set_viewport_dark(None);
     }
 }

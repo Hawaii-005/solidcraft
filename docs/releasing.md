@@ -109,6 +109,31 @@ new commits were added. An existing tag or published release is never overwritte
 version after publication. Do not push the version tag yourself: publishing the draft creates
 it at the draft's target commit.
 
+## macOS disk image
+
+`packaging/macos/package.sh` builds the `.dmg` with [dmgbuild](https://github.com/dmgbuild/dmgbuild)
+(MIT; hash-pinned in `packaging/macos/dmg-requirements.txt`, installed into a throwaway venv under
+`target/`). It writes the Finder layout, the background and the icon positions straight into the
+image, so the build needs no Finder session or AppleScript, which are unreliable on CI runners.
+
+The look lives in `assets/platforms/macos/dmg/`: `layout.json` (window size, icon size and
+positions, shared by both files below), `settings.py` (the dmgbuild settings) and `background.tiff`
+(a blueprint sheet, 540×360 pt, with a 1x and a 2x representation so Retina screens get the sharp one). Change the art with
+`make_background.py` (needs Pillow; its docstring has the commands), view the result by mounting the
+image, and commit the TIFF with the script. Rules the design follows:
+
+- The title bar adds to the window rectangle (`title_bar` in `layout.json`, 32 pt on macOS 27); the
+  content area must equal the background's size. Older macOS versions have a thinner title bar and
+  were not checked.
+- Finder draws the icon names itself, black in Light and white in Dark appearance, and art cannot
+  change that. Each name therefore sits on a mid-tone plate that both colours read on. Keep the
+  plates under the icons if you move them.
+- `README.txt` stays on the disk but is hidden (`SetFile -a V`), so the window stays calm.
+
+`package.sh` mounts the finished image and checks the layout files, the volume icon, the bundle and
+its signature. `hdiutil` prints deprecation warnings on macOS 27 (dmgbuild still uses it); if a
+later macOS removes it, dmgbuild needs a release that uses `diskutil image`.
+
 ## Notes for the next release
 
 Items to carry into the next release's notes (step 3 below), then remove from here:
@@ -128,8 +153,9 @@ change release infrastructure does not itself request publication of the applica
    and an example model on an available platform. Inspect the package-check job output for
    other platforms; report any platform you could not exercise yourself.
 3. Review the generated notes. Add a concise description of features, fixes, breaking changes,
-   and known limitations. Keep the installation instructions. Packages are currently unsigned;
-   do not claim otherwise. Resolve failed checks or missing artifacts before publication.
+   and known limitations. Keep the installation instructions. The macOS app is Developer ID
+   signed and notarized only when the build summary says so; other packages are unsigned. Do not
+   claim otherwise. Resolve failed checks or missing artifacts before publication.
 4. Publish the verified draft using `gh` or the equivalent GitHub release API. For example:
 
    ```sh
@@ -213,8 +239,14 @@ connect with `sudo snap connect solidcraft:removable-media` (getting-started.md)
 
 ## WinGet (Windows Package Manager)
 
-SolidCraft is in [winget-pkgs](https://github.com/microsoft/winget-pkgs) as
-`bherbruck.SolidCraft` (`winget install bherbruck.SolidCraft`). Publishing a non-prerelease
+SolidCraft is not in [winget-pkgs](https://github.com/microsoft/winget-pkgs) yet: its first
+version, as `bherbruck.SolidCraft`, has to be submitted and merged there once (by hand, with
+Komac or `wingetcreate`) before `winget install bherbruck.SolidCraft` finds it. A first
+submission, for 0.21.0, is already open as
+[microsoft/winget-pkgs#452486](https://github.com/microsoft/winget-pkgs/pull/452486) (flagged
+`Validation-Executable-Error`): take that one up rather than opening another. Until then the
+README and [downloads](downloads.md) don't offer the command (#5734); add it back when the
+package is listed. After that first version, publishing a non-prerelease
 GitHub release runs `winget.yml`, which uses [Komac](https://github.com/russellbanks/Komac)
 (a pinned, checksum-verified binary) to open a pull request at microsoft/winget-pkgs from the
 owner's fork `bherbruck/winget-pkgs`. It submits the three versioned MSIs
@@ -245,6 +277,57 @@ To enable it once (owner):
 When the token expires, create a new one the same way and run step 2 again. If a release was
 published while the secret was missing or expired, submit it afterwards with
 `gh workflow run winget.yml -R bherbruck/solidcraft -f tag=v<version>`.
+
+## macOS signing and notarization
+
+`packaging/macos/package.sh` signs with the hardened runtime and notarizes when the release
+workflow has these repository secrets; without them (forks, dry runs) it keeps the ad-hoc
+signature and the job summary says so:
+
+| Secret | Content |
+| --- | --- |
+| `APPLE_CERTIFICATE_P12` | base64 of the **Developer ID Application** certificate and key, exported as `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | password of that `.p12` |
+| `APPLE_API_KEY_P8` | text of the App Store Connect API key (`AuthKey_<id>.p8`) |
+| `APPLE_API_KEY_ID` | the key's ID |
+| `APPLE_API_ISSUER` | the issuer ID (App Store Connect > Users and Access > Integrations) |
+
+`packaging/macos/signing.sh --setup` imports the certificate into a temporary keychain after the
+build, and `--cleanup` removes it at the end of the job.
+
+The app is signed with `packaging/macos/entitlements.plist`. Its
+`com.apple.security.cs.disable-library-validation` entitlement lets the hardened runtime load
+3Dconnexion's `3DconnexionClient.framework` (`crates/threedx-client/src/macos.rs`); without it
+the 3D mouse silently stops working. Test a notarized build with a real 3D mouse before
+publishing. The script notarizes the app (a zip of it) and staples it before the `.dmg` is made,
+so a copy dragged to /Applications opens offline. It then notarizes and staples the `.dmg`, and
+notarizes the CLI `.zip` (a zip can't be stapled). `stapler staple` is retried, because it can
+fail with error 65 for a while after Apple accepts a submission. The checks are `stapler validate`
+and `spctl` on the `.dmg`, and `spctl --assess` on the mounted app. To try it
+locally, pass `--sign` and set `MACOS_SIGN_IDENTITY` and the `APPLE_API_KEY_PATH`, `APPLE_API_KEY_ID`,
+`APPLE_API_ISSUER` variables and run the script.
+
+The certificate expires in **November 2027**. To renew it, create a new Developer ID Application
+certificate in the Apple Developer account, export it with its key as a `.p12`, and replace
+`APPLE_CERTIFICATE_P12` and `APPLE_CERTIFICATE_PASSWORD`. Releases built before the expiry stay
+valid, because the signature carries a secure timestamp.
+
+Signing currently uses a maintainer's **personal** Developer ID, so downloads show that person's
+name, not an organisation's. Moving to an organisation account means replacing the certificate
+and the API key secrets (`APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`).
+
+## Homebrew tap
+
+macOS users install with `brew install --cask tangency-labs/tap/solidcraft` from the tap repository
+[tangency-labs/homebrew-tap](https://github.com/tangency-labs/homebrew-tap) (`Casks/solidcraft.rb`).
+Homebrew's own cask repository only takes signed and notarized apps, so the tap stays until the
+macOS signing work lands.
+
+After publishing a stable release, bump the cask: set `version` and the `sha256` of
+`solidcraft-<version>-macos-universal.dmg` (the line for that file in the release's
+`SHA256SUMS.txt`), run `brew style Casks/solidcraft.rb`, and push to the tap's `main`. The cask's
+`livecheck` follows the latest GitHub release, so `brew livecheck --cask tangency-labs/tap/solidcraft`
+shows when the tap is behind. Skip prereleases and nightlies.
 
 ## Update signing
 

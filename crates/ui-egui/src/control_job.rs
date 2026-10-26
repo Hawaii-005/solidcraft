@@ -26,6 +26,7 @@
 //! `agent_off_thread`, off by default).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use serde_json::{Value, json};
@@ -68,7 +69,13 @@ const NAMES_A_FILE: [&str; 8] = ["path", "paths", "file", "files", "dir", "folde
 /// Commands that change nothing in the design and write a file: they run on a copy.
 const ANSWERED_ON_A_COPY: [&str; 2] = ["file.export", "file.save_mesh"];
 
-/// Exports computing at once; more run here.
+/// Commands that only read the design, which can take long on a large one (a measure of every
+/// body, an inspection that measures them, #4604; a clearance or interference check of every pair
+/// of bodies, minutes on an assembly of 150): they run on a copy too, whatever the preference,
+/// since an answer from the design as it was when asked has no order to keep.
+const READ_ON_A_COPY: [&str; 4] = ["inspect.measure", "document.inspect", "inspect.clearance", "inspect.interference"];
+
+/// Exports and readings computing at once; more run here.
 const MAX_ANSWERING: usize = 4;
 
 /// How often a design change is computed again because the design changed under it before it
@@ -100,6 +107,20 @@ fn executed(params: &Value) -> Option<(&str, Value)> {
     Some((command, params.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}))))
 }
 
+/// A request that only reads the design and can take long ([`READ_ON_A_COPY`]): an
+/// `engine.execute` of such a command, or the `document.inspect` method. The command and its
+/// parameters.
+fn reading(req: &ControlRequest) -> Option<(&'static str, Value)> {
+    match req.method.as_str() {
+        "document.inspect" => Some(("document.inspect", req.params.clone())),
+        "engine.execute" | "command" => {
+            let (command, params) = executed(&req.params)?;
+            spec_id(command).filter(|id| READ_ON_A_COPY.contains(id)).map(|id| (id, params))
+        }
+        _ => None,
+    }
+}
+
 /// Requests that change the design: they wait while one computes.
 pub(crate) fn changes_the_design(method: &str) -> bool {
     matches!(method, "engine.execute" | "command" | "engine.script" | "engine.batch")
@@ -124,6 +145,8 @@ pub struct ControlJob {
     pub(crate) started: f64,
     /// The command, as the toolbar names it.
     pub(crate) label: String,
+    /// How far it has got (evaluated ahead).
+    steps: Option<Arc<Steps>>,
 }
 
 impl ControlJob {
@@ -158,23 +181,58 @@ fn spawn(
     Some(rx)
 }
 
+/// How far a request evaluating ahead has got: the step running (from 1) of how many, and
+/// each step's command as the toolbar names it.
+pub(crate) struct Steps {
+    now: AtomicUsize,
+    labels: Vec<String>,
+    total: usize,
+}
+
+impl Steps {
+    fn new(app: &SolveApp, request: &Value, commands: &[(String, Value)]) -> Arc<Steps> {
+        // A batch counts all its steps, also those after the ones computed ahead.
+        let total = request.get("commands").and_then(Value::as_array).map_or(commands.len(), Vec::len).max(commands.len());
+        Arc::new(Steps { now: AtomicUsize::new(0), labels: commands.iter().map(|(c, _)| label(app, c)).collect(), total })
+    }
+
+    /// What the chip says: the command running, and in a batch which step it is
+    /// (`3/21 · Extrude`).
+    pub(crate) fn shown(&self) -> String {
+        let now = self.now.load(Ordering::Relaxed).max(1);
+        let label = self.labels.get(now - 1).or(self.labels.last()).cloned().unwrap_or_default();
+        if self.total > 1 { format!("{now}/{} · {label}", self.total) } else { label }
+    }
+}
+
 /// Evaluate `commands` ahead on a copy of the session, on a worker (with the folder scope
 /// `request` names). What it computes is kept for the run here.
-fn evaluate_ahead(app: &SolveApp, request: &Value, commands: Vec<(String, Value)>) -> Option<(Receiver<Option<Value>>, Arc<KeptResults>)> {
+fn evaluate_ahead(
+    app: &SolveApp,
+    request: &Value,
+    commands: Vec<(String, Value)>,
+) -> Option<(Receiver<Option<Value>>, Arc<KeptResults>, Arc<Steps>)> {
     let scope = crate::control::request_scope(app, request).ok()?;
     let ahead = app.session.ahead();
     let kept = ahead.kept();
+    let steps = Steps::new(app, request, &commands);
+    let counting = steps.clone();
     let rx = spawn(scope, move || {
-        let _ = ahead.evaluate(&commands);
+        let _ = ahead.evaluate_counting(&commands, &counting.now);
         None
     })?;
-    Some((rx, kept))
+    Some((rx, kept, steps))
 }
 
 /// Start computing a design change ahead, for the design as it is now.
-fn begin_ahead(app: &SolveApp, req: &ControlRequest, commands: Vec<(String, Value)>, tries: u8) -> Option<(Work, Receiver<Option<Value>>)> {
-    let (rx, kept) = evaluate_ahead(app, &req.params, commands.clone())?;
-    Some((Work::Ahead { commands, doc: app.session.doc.clone(), revision: app.session.revision, tries, kept }, rx))
+fn begin_ahead(
+    app: &SolveApp,
+    req: &ControlRequest,
+    commands: Vec<(String, Value)>,
+    tries: u8,
+) -> Option<(Work, Receiver<Option<Value>>, Arc<Steps>)> {
+    let (rx, kept, steps) = evaluate_ahead(app, &req.params, commands.clone())?;
+    Some((Work::Ahead { commands, doc: app.session.doc.clone(), revision: app.session.revision, tries, kept }, rx, steps))
 }
 
 impl SolveApp {
@@ -202,6 +260,8 @@ pub struct Ahead {
     pub(crate) started: f64,
     /// The command, as the toolbar names it.
     pub(crate) label: String,
+    /// How far it has got.
+    pub(crate) steps: Arc<Steps>,
 }
 
 impl Ahead {
@@ -215,8 +275,8 @@ impl Ahead {
         }
         let commands = ahead_commands(method, request);
         let label = label(app, &commands.first()?.0);
-        let (done, kept) = evaluate_ahead(app, request, commands)?;
-        Some(Ahead { done, kept, started: crate::now_ms(), label })
+        let (done, kept, steps) = evaluate_ahead(app, request, commands)?;
+        Some(Ahead { done, kept, started: crate::now_ms(), label, steps })
     }
 
     /// The evaluation is in (or its worker ended).
@@ -240,13 +300,22 @@ fn ahead_commands(method: &str, p: &Value) -> Vec<(String, Value)> {
                 return Vec::new();
             }
             let Some(steps) = p.get("commands").and_then(Value::as_array) else { return Vec::new() };
-            steps
-                .iter()
-                .map_while(|step| {
-                    let command = step.get("command").or_else(|| step.get("id")).and_then(Value::as_str)?;
-                    let params = step.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}));
-                    computes_ahead(command, &params).then(|| (command.to_string(), params))
+            // As the batch will run them: with `coalesce_parameters`, a run of parameter edits
+            // as one edit (#5822).
+            let coalesce = p.get("coalesce_parameters").and_then(Value::as_bool).unwrap_or(false);
+            solidcraft_engine::batch_params::plan(steps, coalesce)
+                .into_iter()
+                .map(|run| match run {
+                    solidcraft_engine::batch_params::BatchRun::Step(i) => {
+                        let step = steps.get(i)?;
+                        let command = step.get("command").or_else(|| step.get("id")).and_then(Value::as_str)?;
+                        Some((command.to_string(), step.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}))))
+                    }
+                    solidcraft_engine::batch_params::BatchRun::Params { changes, .. } => {
+                        Some(("parameters.change".to_string(), solidcraft_engine::batch_params::combined_params(&changes)))
+                    }
                 })
+                .map_while(|c| c.filter(|(command, params)| computes_ahead(command, params)))
                 .collect()
         }
         _ => Vec::new(),
@@ -269,8 +338,11 @@ fn within_wait(app: &SolveApp, rx: &Receiver<Option<Value>>) -> Option<Option<Va
 impl SolveApp {
     /// Since when an agent's design change has been computing off the window thread (ms), and
     /// its command.
-    pub fn agent_computing(&self) -> Option<(f64, &str)> {
-        self.control_job.as_ref().map(|j| (j.started, j.label.as_str())).or_else(|| self.agent.computing())
+    pub fn agent_computing(&self) -> Option<(f64, String)> {
+        self.control_job
+            .as_ref()
+            .map(|j| (j.started, j.steps.as_ref().map_or_else(|| j.label.clone(), |s| s.shown())))
+            .or_else(|| self.agent.computing())
     }
 
     /// Stop waiting for the agent's design change that is computing: it is answered as stopped
@@ -293,7 +365,18 @@ impl SolveApp {
     /// Take a control request off the window thread when it computes long (see the module
     /// notes). Returns it when it should simply run here now.
     pub(crate) fn offload_control(&mut self, ctx: &egui::Context, req: ControlRequest) -> Option<ControlRequest> {
-        if self.apply_off_thread.is_none() || !self.preferences.agent_off_thread || self.file_load.busy() || self.file_picker.is_some() {
+        if self.apply_off_thread.is_none() || self.file_load.busy() || self.file_picker.is_some() {
+            return Some(req);
+        }
+        // Reading the design (a measure, an inspection that measures): on a copy, answered from
+        // there, preference or not. On a large assembly it took a minute on the window thread,
+        // and the window, answering nothing meanwhile, was closed as not responding (#4604).
+        if self.control_answering.len() < MAX_ANSWERING
+            && let Some((id, params)) = reading(&req)
+        {
+            return self.answer_on_a_copy(req, id, params);
+        }
+        if !self.preferences.agent_off_thread {
             return Some(req);
         }
         // An export: on a copy, answered from there.
@@ -302,26 +385,12 @@ impl SolveApp {
             && let Some((command, params)) = executed(&req.params)
             && let Some(id) = spec_id(command).filter(|id| ANSWERED_ON_A_COPY.contains(id))
         {
-            let Ok(scope) = crate::control::request_scope(self, &req.params) else { return Some(req) };
-            let mut copy = self.session.scratch();
-            let rx = spawn(scope, move || {
-                Some(match copy.execute(id, &params) {
-                    Ok(v) => json!({"ok": true, "result": v}),
-                    Err(e) => json!({"ok": false, "error": e.to_string()}),
-                })
-            });
-            let Some(rx) = rx else { return Some(req) };
-            let job = ControlJob { label: label(self, id), req, work: Work::Answer, done: rx, started: crate::now_ms() };
-            match within_wait(self, &job.done) {
-                Some(reply) => self.answered(job, reply),
-                None => self.control_answering.push(job),
-            }
-            return None;
+            return self.answer_on_a_copy(req, id, params);
         }
         let commands = ahead_commands(&req.method, &req.params);
         let Some(first) = commands.first().map(|(c, _)| c.clone()) else { return Some(req) };
-        let Some((work, rx)) = begin_ahead(self, &req, commands, 0) else { return Some(req) };
-        let job = ControlJob { label: label(self, &first), req, work, done: rx, started: crate::now_ms() };
+        let Some((work, rx, steps)) = begin_ahead(self, &req, commands, 0) else { return Some(req) };
+        let job = ControlJob { label: label(self, &first), req, work, done: rx, started: crate::now_ms(), steps: Some(steps) };
         if within_wait(self, &job.done).is_some() {
             // Computed within the wait: it runs now, as before, finding what was computed.
             let Work::Ahead { kept, .. } = job.work else { return Some(job.req) };
@@ -332,10 +401,36 @@ impl SolveApp {
         None
     }
 
-    /// An export's reply, from its copy, with the echo the command leaves when it runs here.
+    /// Run command `id` on a copy of the session, off the window thread, and answer `req` from
+    /// there: at once when it is done within the app's wait, otherwise once it is in. `None`: it
+    /// is taken care of; `Some`: it runs here (no threads).
+    fn answer_on_a_copy(&mut self, req: ControlRequest, id: &'static str, params: Value) -> Option<ControlRequest> {
+        let Ok(scope) = crate::control::request_scope(self, &req.params) else { return Some(req) };
+        let mut copy = self.session.scratch();
+        let rx = spawn(scope, move || {
+            Some(match copy.execute(id, &params) {
+                Ok(v) => json!({"ok": true, "result": v}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            })
+        });
+        let Some(rx) = rx else { return Some(req) };
+        let job = ControlJob { label: label(self, id), req, work: Work::Answer, done: rx, started: crate::now_ms(), steps: None };
+        match within_wait(self, &job.done) {
+            Some(reply) => self.answered(job, reply),
+            None => self.control_answering.push(job),
+        }
+        None
+    }
+
+    /// An export's or a reading's reply, from its copy, with the echo an export leaves when it
+    /// runs here.
     fn answered(&mut self, job: ControlJob, reply: Option<Value>) {
+        if job.req.refuse_cancelled_chat() {
+            return;
+        }
         let reply = reply.unwrap_or_else(|| json!({"ok": false, "error": format!("`{}` ended without a reply", job.label)}));
-        if reply["ok"] == true {
+        let export = executed(&job.req.params).and_then(|(command, _)| spec_id(command)).is_some_and(|id| ANSWERED_ON_A_COPY.contains(&id));
+        if reply["ok"] == true && export {
             let language = crate::i18n::Locale::for_language(&self.preferences.language);
             self.session.echo(language.format("ui.command_done", &[("command", job.label.as_str())]));
         }
@@ -347,6 +442,10 @@ impl SolveApp {
         if !self.control_answering.is_empty() {
             let mut i = 0;
             while i < self.control_answering.len() {
+                if self.control_answering.get(i).is_some_and(|job| job.req.refuse_cancelled_chat()) {
+                    self.control_answering.remove(i);
+                    continue;
+                }
                 match self.control_answering.get(i).and_then(ControlJob::poll) {
                     Some(reply) => {
                         let job = self.control_answering.remove(i);
@@ -358,6 +457,10 @@ impl SolveApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let Some(job) = &self.control_job else { return };
+        if job.req.refuse_cancelled_chat() {
+            self.control_job = None;
+            return;
+        }
         if job.poll().is_none() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
@@ -382,8 +485,8 @@ impl SolveApp {
         }
         if (!same || s.revision != revision) && tries < MAX_TRIES {
             // A person's edit went first: computed again for the design as it is now.
-            if let Some((work, rx)) = begin_ahead(self, &job.req, commands, tries + 1) {
-                self.control_job = Some(ControlJob { work, done: rx, ..job });
+            if let Some((work, rx, steps)) = begin_ahead(self, &job.req, commands, tries + 1) {
+                self.control_job = Some(ControlJob { work, done: rx, steps: Some(steps), ..job });
                 return;
             }
         }

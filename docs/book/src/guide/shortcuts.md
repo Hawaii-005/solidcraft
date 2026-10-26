@@ -2,6 +2,32 @@
 
 Command shortcuts can be changed in File › Keyboard Shortcuts; these are the defaults.
 
+Click a binding to record a new shortcut. A shortcut can contain Shift, Ctrl/Cmd and
+Alt/Option modifiers plus exactly one other key. Hold the modifiers, then press the final
+key; you can take your time assembling the modifiers before that key. The recorder also
+allows modifiers to arrive after the ordinary key: it previews the chord and waits one
+second after the last added modifier, and until all keys are released, before confirming.
+For example, record Shift+Cmd+M for Sketch Mirror on macOS. Escape cancels recording without
+changing the old binding. Pressing two different ordinary keys cancels the attempt.
+
+The binding button shows modifiers immediately as you press them, even before adding the
+ordinary key. Releasing a modifier before that key removes it from the preview. A status
+line tells you to add a key, release all keys, or wait for confirmation; the proposed chord
+stays visible during confirmation. Nothing is saved while the preview is still pending.
+
+On macOS, the editor, Help list, toolbar hints, context menus and S search display Cmd and
+Option. Existing settings retain SolidCraft's Ctrl/Cmd alias for the primary modifier;
+Control and Command pressed together are recorded explicitly as Ctrl+Cmd. Conflicting
+bindings still require confirmation, and built-in reserved shortcuts remain reserved.
+Recording changes app settings, not the design file.
+
+This follows the usual [modifier-before-key convention documented by Apple](https://support.apple.com/en-ie/102650)
+and the [key-event and modifier-state model documented by W3C](https://www.w3.org/TR/uievents/#keys-modifiers).
+The one-second grace period is SolidCraft's recording aid, not a standard-mandated delay;
+using an already assigned shortcut has no added delay. Operating systems and browsers can
+intercept reserved combinations before SolidCraft receives them. Choose a different chord
+if that happens; recording is cancelled if the app loses focus.
+
 | Key | Command | Key | Command |
 |---|---|---|---|
 | L | Line | E | Extrude |
@@ -15,6 +41,18 @@ Command shortcuts can be changed in File › Keyboard Shortcuts; these are the d
 | Ctrl+Z | Undo | Ctrl+Y | Redo |
 | Ctrl+N | New Design | Ctrl+O | Open |
 | Ctrl+S | Save | Delete | Delete the selection |
+| Ctrl+Shift+S | Save As | | |
+| Ctrl+1 | Front View | Ctrl+2 | Back View |
+| Ctrl+3 | Left View | Ctrl+4 | Right View |
+| Ctrl+5 | Top View | Ctrl+6 | Bottom View |
+| Ctrl+7 | Isometric View | | |
+
+L, R and C start their tool family (lines, rectangles, circles) in the variant you used last, as
+the family's toolbar button does: after a Midpoint Line, L starts a Midpoint Line again. Pick
+another variant from the button's drop-down (or the Sketch Palette) and the key starts that one
+from then on. The choice is kept across designs and restarts. With **Pressing a tool's shortcut
+again switches its mode** on (Preferences › Sketch), pressing the key again before the first
+click steps to the family's next variant.
 
 Keys handled by the window itself:
 
@@ -32,7 +70,9 @@ Keys handled by the window itself:
 While a value box has the keyboard (a dimension being added, a dialog field), keys type into
 it and single-letter shortcuts don't fire. With Sketch Dimension (D), the box opens as soon as
 you click a line, circle or arc (or the second point or line), so D, click, type the value,
-Enter.
+Enter. With Preferences › Design › Step values with the arrow keys and the wheel on, ↑ ↓ in a
+value box, or the wheel over it, step a plain number by 1 (with Shift by 10, with Alt by 0.1);
+see [Parameters and expressions](parameters.md).
 
 Mouse and touch:
 
@@ -58,7 +98,7 @@ While drawing or dragging a sketch point:
 | Keys | Action |
 |---|---|
 | Ctrl/Cmd or Alt/Option (default) | suppress auto-snap for that gesture |
-| Shift | prefer a line midpoint when targeting |
+| Shift | prefer a line midpoint when targeting (skips a curve-curve crossing) |
 
 Change the snap-suppress chord in Preferences › Sketch. Selection still uses Shift and
 Ctrl/Cmd to add or toggle (Preferences › Selection can make Shift add-only).

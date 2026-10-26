@@ -2,9 +2,11 @@
 //!
 //! The linked design is opened and evaluated on its own, and its solid bodies, as placed in it,
 //! join a new component through an Import feature (exact B-rep, kept in this design so it opens
-//! without the part file). The link remembers the file, relative to this design's folder once it
-//! is saved; Update Links reads the file again and replaces the Import feature's bodies, and
-//! Break Link keeps the bodies and forgets the file.
+//! without the part file). The link remembers the absolute file in a session and a path relative
+//! to the design's folder on disk; Update Links reads it again and replaces the Import feature's
+//! bodies, and Break Link keeps the bodies and forgets the file. The bodies' faces are named after the names
+//! the design gives them (`Feature::link_faces`), so a joint on a linked face stays on that face
+//! when the design changes, as it would inside the design, and reports it when the face is gone.
 
 use std::path::{Component as PathPart, Path, PathBuf};
 
@@ -15,6 +17,9 @@ use super::CommandSpec;
 use crate::params::{bad, str_, vec3};
 use crate::{EngineError, Result, Session};
 
+#[path = "component_extract.rs"]
+mod extract;
+
 #[cfg(test)]
 #[path = "component_relink_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -22,12 +27,13 @@ mod relink_tests;
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("component.insert_design", "Insert Design", insert_design).at("SOLID", "ASSEMBLE").icon("component").params(
-        "path: a .solidcraft design → a new component linked to it, holding its solid bodies as placed in that design; \
+        "path: a .solidcraft design → a new component linked to it, holding its solid bodies as placed in that design and a copy of its design properties; \
          name? (default: the design's name); parent?: component id or name (default: the active one); translate?: [x,y,z]; \
-         reuse?: bool (default false): insert another occurrence of an existing link to the same file",
+         reuse?: bool (default false): insert a free occurrence, reusing an existing link to the same file when available",
     ),
     CommandSpec::new("component.update_links", "Update Links", update_links).icon("update").params(
-        "component?: id or name (default: every linked component) — reads the linked designs again and replaces their bodies where they changed",
+        "component?: id or name (default: every linked component) — reads the linked designs again and replaces their bodies where they changed; \
+         → updated, unchanged, warnings (also joints whose faces are gone or that no longer solve)",
     ),
     CommandSpec::new("component.relink", "Relink Source", relink).icon("update").params(
         "component: id or name of a linked component; path: a saved .solidcraft design — replaces the source and linked bodies for all its occurrences, preserving identities and placements; returns path, previous_path, warnings, joint_errors and joint_conflicts",
@@ -35,6 +41,19 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("component.break_link", "Break Link", break_link)
         .icon("break")
         .params("component: id or name of a linked component — keeps its bodies as they are and forgets the design file"),
+    CommandSpec::new("component.extract", "Extract to File", extract::extract).icon("export").params(
+        "component: id or name of a component that is not linked; path: the .solidcraft design to write → its history, subcomponents and their joints \
+         move to that design, and the component becomes linked to it (as component.insert_design makes it); returns path, file, feature, bodies, \
+         notices (what stays behind), warnings and copies (components that build the same bodies: see component.replace_with_link)",
+    ),
+    CommandSpec::new("component.copies", "Find Identical Copies", extract::copies).icon("inspect").noundo().params(
+        "component: id or name of a linked component → copies: [{component, name}], the components not linked whose own history builds the same bodies",
+    ),
+    CommandSpec::new("component.replace_with_link", "Replace with Link", extract::replace_with_link).icon("chain").params(
+        "component or components: [ids or names] of components that are not linked; with: a linked component, or path: a .solidcraft design \
+         (its link here, else a new linked component) → each component's history goes and its placements become placements of the linked \
+         component; refused when its bodies are not the same as the link's; returns component, name, replaced and warnings",
+    ),
     CommandSpec::new("component.links", "List Links", list_links)
         .icon("chain")
         .noundo()
@@ -94,7 +113,8 @@ fn stored(design: Option<&str>, file: &Path) -> String {
 fn resolve(design: Option<&str>, link: &str) -> PathBuf {
     let p = Path::new(link);
     match base_dir(design) {
-        Some(d) if p.is_relative() => d.join(p),
+        // Browser storage keys do not let the OS resolve `..` for us.
+        Some(d) if p.is_relative() => absolute(&d.join(p)),
         _ => p.to_path_buf(),
     }
 }
@@ -104,16 +124,32 @@ pub(super) fn rebased(doc: &Document, from: Option<&str>, to: &str) -> std::coll
     doc.links.iter().map(|(c, l)| (*c, DesignLink { path: stored(Some(to), &resolve(from, &l.path)), feature: l.feature })).collect()
 }
 
+/// Resolve a design's component links against its original file, before opening it from a
+/// different location (for example a recovery file) or keeping it in session history.
+pub fn resolve_design_links(doc: &mut Document, from: Option<&str>) {
+    for link in doc.links.values_mut() {
+        link.path = absolute(&resolve(from, &link.path)).to_string_lossy().into_owned();
+    }
+}
+
+/// The bodies of a linked design: its name, the Import feature that holds them and the names
+/// the design gives their faces (`Feature::link_faces`), with the source's design properties.
+type Linked = (String, solidcraft_io::StepFeature, Vec<Vec<String>>, solidcraft_doc::Metadata);
+
 /// The solid bodies of the design at `file`, evaluated, as an Import feature.
-fn linked_bodies(file: &Path, own: Option<&str>) -> Result<(String, solidcraft_io::StepFeature)> {
+fn linked_bodies(file: &Path, own: Option<&str>) -> Result<Linked> {
     let shown = file.display().to_string();
     if own.is_some_and(|o| absolute(Path::new(o)) == absolute(file)) {
         return Err(EngineError::Other(format!("{shown}: a design can't be linked into itself")));
     }
     let bytes = solidcraft_io::vfs::read(&shown, solidcraft_io::MAX_DESIGN_BYTES).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
     let doc = solidcraft_io::read_design(&bytes).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    let name = doc.name.clone();
-    let part = Session::new(doc);
+    session_bodies(&Session::opened_at(doc, None, Some(&shown)), &shown)
+}
+
+/// The solid bodies of `part`, the design saved as `shown`, as an Import feature.
+fn session_bodies(part: &Session, shown: &str) -> Result<Linked> {
+    let name = part.doc.name.clone();
     if let Some(e) = part.model.results.iter().find_map(|r| r.error.clone()) {
         return Err(EngineError::Other(format!("{shown}: the design has a feature that fails ({e}); fix it before linking it")));
     }
@@ -124,11 +160,14 @@ fn linked_bodies(file: &Path, own: Option<&str>) -> Result<(String, solidcraft_i
     }
     let step = solidcraft_io::export(&part.doc.painted(&world), &solids, solidcraft_io::Format::Step, &name)
         .map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
-    let mut feature = solidcraft_io::step_import_feature(&step, &shown).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
+    let mut feature = solidcraft_io::step_import_feature(&step, shown).map_err(|e| EngineError::Other(format!("{shown}: {e}")))?;
     if world.bodies.len() > solids.len() {
         feature.warnings.push(format!("{} mesh bodies of {shown} are not linked", world.bodies.len() - solids.len()));
     }
-    Ok((name, feature))
+    // The STEP text keeps no face names: carry the design's own, so references into the linked
+    // bodies follow them as they do inside the design (#3330).
+    let faces = solidcraft_doc::naming::carried_face_names(&world, &feature.import.bodies);
+    Ok((name, feature, faces, part.doc.metadata.clone()))
 }
 
 fn component_key(s: &Session, p: &Value, key: &str, cmd: &str) -> Result<u64> {
@@ -158,25 +197,34 @@ fn insert_design(s: &mut Session, p: &Value) -> Result<Value> {
             return super::component::copy_occurrence(s, &json!({"component": component, "parent": parent, "translate": translate}));
         }
     }
-    let (design_name, sf) = linked_bodies(&file, s.path.as_deref())?;
+    let (design_name, sf, faces, metadata) = linked_bodies(&file, s.path.as_deref())?;
     let name = str_(p, "name").filter(|n| !n.trim().is_empty()).map(str::to_string).unwrap_or(design_name);
     let mut create = json!({"name": name, "activate": false});
+    // Clipboard insertion uses reuse even for the first paste, which must stay movable.
+    if p.get("reuse").and_then(Value::as_bool).unwrap_or(false) {
+        create["grounded"] = json!(false);
+    }
     if let Some(parent) = p.get("parent") {
         create["parent"] = parent.clone();
     }
     let made = super::component::new_component(s, &create)?;
     let comp = made["component"].as_u64().ok_or_else(|| bad(cmd, "the component was not created"))?;
     let occ = made["occurrence"].as_u64();
+    // Seed only a new definition: reused links keep any locally edited part properties.
+    if let Some(c) = s.doc_mut().components.iter_mut().find(|c| c.id == comp) {
+        c.metadata = metadata;
+    }
     let id = s.doc_mut().add_feature(sf.kind, Some(&name))?;
     if let Some(f) = s.doc_mut().feature_mut(id) {
         f.component = comp;
         f.body_names = sf.body_names;
+        f.link_faces = faces;
     }
     if let Some(o) = s.doc_mut().occurrences.iter_mut().find(|o| Some(o.id) == occ) {
         o.transform[3] = [translate.x, translate.y, translate.z, 1.0];
     }
     let path = stored(s.path.as_deref(), &file);
-    s.doc_mut().links.insert(comp, DesignLink { path: path.clone(), feature: id });
+    s.doc_mut().links.insert(comp, DesignLink { path: file.to_string_lossy().into_owned(), feature: id });
     s.refresh();
     if let Some(e) = s.model.result(id).and_then(|r| r.error.clone()) {
         return Err(EngineError::Other(e));
@@ -198,13 +246,16 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let links: Vec<(u64, DesignLink)> = s.doc.links.iter().filter(|(c, _)| only.is_none_or(|o| o == **c)).map(|(c, l)| (*c, l.clone())).collect();
     let (mut updated, mut unchanged, mut warnings) = (Vec::new(), Vec::new(), Vec::new());
-    for (comp, link) in links {
+    let count = links.len();
+    for (index, (comp, link)) in links.into_iter().enumerate() {
         let cname = s.doc.components.iter().find(|c| c.id == comp).map(|c| c.name.clone());
         let Some(cname) = cname else {
             // The component was deleted: the link goes with it.
             s.doc_mut().links.remove(&comp);
             continue;
         };
+        // A window running this off its thread names the design being read again (#5329).
+        solidcraft_doc::progress::item(Some((&cname, index, count)));
         let Some(FeatureKind::Import { step: old, .. }) = s.doc.feature(link.feature).filter(|f| f.component == comp).map(|f| &f.kind) else {
             return Err(bad(
                 cmd,
@@ -213,26 +264,62 @@ fn update_links(s: &mut Session, p: &Value) -> Result<Value> {
         };
         let old = old.clone();
         let file = resolve(s.path.as_deref(), &link.path);
-        let (_, sf) = linked_bodies(&file, s.path.as_deref()).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;
+        let (_, sf, faces, _) = linked_bodies(&file, s.path.as_deref()).map_err(|e| bad(cmd, format!("{cname}: {e}")))?;
         warnings.extend(sf.warnings.iter().cloned());
-        if matches!(&sf.kind, FeatureKind::Import { step, .. } if *step == old) {
+        let same = matches!(&sf.kind, FeatureKind::Import { step, .. } if *step == old);
+        let kept = s.doc.feature(link.feature).map(|f| &f.link_faces);
+        if same && kept == Some(&faces) {
             unchanged.push(cname);
             continue;
         }
-        if let Some(f) = s.doc_mut().feature_mut(link.feature) {
-            // Bodies keep their names where the design still has as many.
-            if f.body_names.len() != sf.body_names.len() {
-                f.body_names = sf.body_names;
+        // The same bodies, their faces named for the first time (a link made before names were
+        // kept): nothing a reference finds changes. Names the design gave other faces since do.
+        let changed = !same || kept.is_some_and(|k| !k.is_empty());
+        if !same {
+            for name in numbered_references(s, comp, link.feature) {
+                warnings.push(format!(
+                    "{name} refers to faces of {cname} by their place in the linked file, which this update can change: check it, and pick its faces again so it follows them by name"
+                ));
             }
-            f.kind = sf.kind;
         }
-        updated.push(cname);
+        if let Some(f) = s.doc_mut().feature_mut(link.feature) {
+            if !same {
+                // Bodies keep their names where the design still has as many.
+                if f.body_names.len() != sf.body_names.len() {
+                    f.body_names = sf.body_names;
+                }
+                f.kind = sf.kind;
+            }
+            // A link made before the design's face names were kept gets them here.
+            f.link_faces = faces;
+        }
+        if changed { updated.push(cname) } else { unchanged.push(cname) }
     }
+    solidcraft_doc::progress::item(None);
     s.refresh();
     if let Some(e) = s.doc.links.values().find_map(|l| s.model.result(l.feature).and_then(|r| r.error.clone())) {
         return Err(EngineError::Other(e));
     }
+    // A reference whose face the design no longer has says so here, not only in the joint list.
+    if !updated.is_empty() {
+        let sol = solidcraft_doc::joints::solve(&s.doc, &s.model.state());
+        warnings.extend(sol.errors.iter().chain(&sol.conflicts).map(|(_, name, why)| format!("joint {name}: {why}")));
+    }
     Ok(json!({"updated": updated, "unchanged": unchanged, "warnings": warnings}))
+}
+
+/// The joints and joint origins on occurrences of `comp` that name its linked faces by their
+/// place in the file (`F<feature>:face:<k>`, made before the design's own names were kept), which
+/// an update can give to another face.
+fn numbered_references(s: &Session, comp: u64, feature: u64) -> Vec<String> {
+    let numbered = format!("F{feature}:face:");
+    let on = |o: &solidcraft_doc::joints::JointOrigin| {
+        s.doc.occurrences.iter().any(|x| x.id == o.occurrence && x.component == comp)
+            && o.snap.face_names().iter().any(|n| n.trim_start_matches(solidcraft_doc::naming::LEGACY_MARK).starts_with(&numbered))
+    };
+    let joints = s.doc.assembly.joints.iter().filter(|j| on(&j.a) || on(&j.b)).map(|j| format!("joint {}", j.name));
+    let origins = s.doc.assembly.origins.iter().filter(|o| on(&o.origin)).map(|o| format!("joint origin {}", o.name));
+    joints.chain(origins).collect()
 }
 
 fn relink(s: &mut Session, p: &Value) -> Result<Value> {
@@ -256,7 +343,7 @@ fn relink(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // Read/evaluate the candidate before changing anything. Session::execute owns the single
     // undo step and restores both the document and evaluated state on any later failure.
-    let (_, sf) = linked_bodies(&file, s.path.as_deref()).map_err(|e| bad(cmd, e.to_string()))?;
+    let (_, sf, faces, _) = linked_bodies(&file, s.path.as_deref()).map_err(|e| bad(cmd, e.to_string()))?;
     let geometry_changed = match (s.doc.feature(link.feature).map(|f| &f.kind), &sf.kind) {
         (Some(FeatureKind::Import { step: old, .. }), FeatureKind::Import { step, .. }) => old != step,
         _ => true,
@@ -277,8 +364,9 @@ fn relink(s: &mut Session, p: &Value) -> Result<Value> {
             f.body_names = sf.body_names;
         }
         f.kind = sf.kind;
+        f.link_faces = faces;
     }
-    s.doc_mut().links.insert(comp, DesignLink { path: path.clone(), feature: link.feature });
+    s.doc_mut().links.insert(comp, DesignLink { path: file.to_string_lossy().into_owned(), feature: link.feature });
     s.refresh();
     if let Some(error) = s.model.result(link.feature).and_then(|r| r.error.clone()) {
         return Err(bad(cmd, error));
@@ -291,7 +379,8 @@ fn relink(s: &mut Session, p: &Value) -> Result<Value> {
     for (_, name, why) in sol.errors.iter().chain(&sol.conflicts) {
         warnings.push(format!("joint {name}: {why}"));
     }
-    Ok(json!({"component": comp, "feature": link.feature, "path": path, "previous_path": link.path, "geometry_changed": geometry_changed,
+    let previous_path = stored(s.path.as_deref(), &resolve(s.path.as_deref(), &link.path));
+    Ok(json!({"component": comp, "feature": link.feature, "path": path, "previous_path": previous_path, "geometry_changed": geometry_changed,
         "warnings": warnings, "joint_errors": diagnostics(&sol.errors), "joint_conflicts": diagnostics(&sol.conflicts)}))
 }
 
@@ -299,7 +388,7 @@ fn break_link(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "component.break_link";
     let comp = component_key(s, p, "component", cmd)?;
     let link = s.doc_mut().links.remove(&comp).ok_or_else(|| bad(cmd, "that component is not linked to a design"))?;
-    Ok(json!({"component": comp, "path": link.path}))
+    Ok(json!({"component": comp, "path": stored(s.path.as_deref(), &resolve(s.path.as_deref(), &link.path))}))
 }
 
 fn list_links(s: &mut Session, _p: &Value) -> Result<Value> {
@@ -310,7 +399,9 @@ fn list_links(s: &mut Session, _p: &Value) -> Result<Value> {
         .map(|(c, l)| {
             let file = resolve(s.path.as_deref(), &l.path);
             let name = s.doc.components.iter().find(|x| x.id == *c).map(|x| x.name.clone());
-            json!({"component": c, "name": name, "path": l.path, "file": file.display().to_string(), "found": file.is_file()})
+            let path = stored(s.path.as_deref(), &file);
+            let file = file.to_string_lossy();
+            json!({"component": c, "name": name, "path": path, "file": file, "found": solidcraft_io::vfs::is_file(&file)})
         })
         .collect();
     Ok(json!({"links": links}))
@@ -328,7 +419,7 @@ mod tests {
         let design = root.join("assembly").join("case.solidcraft");
         let design = design.to_string_lossy().into_owned();
         assert_eq!(stored(Some(&design), &part), "../parts/plate.solidcraft");
-        assert_eq!(absolute(&resolve(Some(&design), "../parts/plate.solidcraft")), part);
+        assert_eq!(resolve(Some(&design), "../parts/plate.solidcraft"), part);
         // A design path given relative to the working folder works the same.
         assert_eq!(stored(Some("case.solidcraft"), &absolute(Path::new("parts/plate.solidcraft"))), "parts/plate.solidcraft");
         // Before the design has a file the path is kept whole; saving it makes it relative.
@@ -357,6 +448,95 @@ mod tests {
 
     fn volume(s: &mut Session) -> f64 {
         run(s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap_or(f64::NAN)
+    }
+
+    /// #6860: Save As changes the file's folder, not the targets kept in the edit history.
+    #[test]
+    fn save_as_keeps_link_targets_through_undo_redo_and_checkpoints() {
+        for on_copy in [false, true] {
+            let dir = std::env::temp_dir().join(format!("solidcraft-link-save-as-{}-{on_copy}", std::process::id()));
+            std::fs::create_dir_all(dir.join("parts")).unwrap();
+            std::fs::create_dir_all(dir.join("asm/sub/deeper")).unwrap();
+            let part = dir.join("parts/plate.solidcraft");
+            let case = dir.join("asm/case.solidcraft");
+            save_box(&part, 30.0);
+            let mut s = Session::default();
+            run(&mut s, "component.insert_design", json!({"path": part}));
+            run(&mut s, "file.save", json!({"path": case}));
+            // Opening starts from the relative paths actually written to disk.
+            run(&mut s, "doc.open", json!({"path": case}));
+            run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [60, 0, 0]}));
+            let checkpoint = s.checkpoint();
+            run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [80, 0, 0]}));
+            run(&mut s, "edit.undo", json!({}));
+            let before = s.doc.clone();
+            let undo_before = s.undo.last().unwrap().doc.clone();
+            let missing = dir.join("missing/case.solidcraft");
+            assert!(s.execute("file.save_as", &json!({"path": missing})).is_err());
+            assert_eq!(s.path.as_deref(), case.to_str());
+            for folder in ["asm/sub", "asm/sub/deeper"] {
+                let path = dir.join(folder).join("case.solidcraft");
+                if on_copy {
+                    let mut copy = s.scratch();
+                    run(&mut copy, "file.save_as", json!({"path": path}));
+                    s.adopt_save(&copy);
+                } else {
+                    run(&mut s, "file.save_as", json!({"path": path}));
+                }
+                assert!(!s.is_dirty());
+                for command in ["edit.redo", "edit.undo", "edit.undo", "edit.redo"] {
+                    run(&mut s, command, json!({}));
+                    let links = run(&mut s, "component.links", json!({}));
+                    assert_eq!(links["links"][0]["found"], true, "{on_copy}, {folder}, {command}: {links}");
+                    assert_eq!(absolute(Path::new(links["links"][0]["file"].as_str().unwrap())), absolute(&part));
+                }
+            }
+            assert!(std::sync::Arc::ptr_eq(&s.doc, &before), "saving does not rewrite the live document");
+            assert!(std::sync::Arc::ptr_eq(&s.undo.last().unwrap().doc, &undo_before), "saving does not copy the edit history");
+            s.restore_checkpoint(checkpoint).unwrap();
+            assert_eq!(run(&mut s, "component.links", json!({}))["links"][0]["found"], true);
+            let path = s.path.clone().unwrap();
+            for format in ["json", "container"] {
+                run(&mut s, "file.save", json!({"format": format}));
+                let disk = solidcraft_io::read_design(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(disk.links.values().next().unwrap().path, "../../../parts/plate.solidcraft");
+                run(&mut s, "doc.open", json!({"path": path}));
+                assert!(!s.is_dirty());
+                assert_eq!(run(&mut s, "component.links", json!({}))["links"][0]["found"], true);
+            }
+            save_box(&part, 45.0);
+            assert_eq!(run(&mut s, "component.update_links", json!({}))["updated"], json!(["plate"]));
+            assert!((volume(&mut s) - 9125.0).abs() < 1e-6);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn recovered_relative_links_keep_their_targets_after_save_as() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-link-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("parts")).unwrap();
+        std::fs::create_dir_all(dir.join("asm/sub")).unwrap();
+        let part = dir.join("parts/plate.solidcraft");
+        save_box(&part, 30.0);
+        let mut s = Session::default();
+        run(&mut s, "component.insert_design", json!({"path": part}));
+        run(&mut s, "file.save", json!({"path": dir.join("asm/case.solidcraft")}));
+        run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [60, 0, 0]}));
+        let recovery = dir.join("recovery");
+        let mut autosaver = crate::recovery::Autosaver::new(&recovery, std::time::Duration::ZERO).unwrap();
+        assert!(autosaver.save(&s).unwrap());
+        drop(autosaver);
+        let entry = crate::recovery::orphans(&recovery).pop().unwrap();
+        // Older autosaves hold paths relative to the design, not the recovery folder.
+        std::fs::write(recovery.join(format!("{}.solidcraft", entry.id)), solidcraft_io::write_design(&s.design())).unwrap();
+        let mut recovered = Session::default();
+        run(&mut recovered, "doc.recover", json!({"dir": recovery, "id": entry.id}));
+        assert_eq!(run(&mut recovered, "component.links", json!({}))["links"][0]["found"], true);
+        run(&mut recovered, "solid.box", json!({"length": 5, "width": 5, "height": 5, "corner": [80, 0, 0]}));
+        run(&mut recovered, "file.save_as", json!({"path": dir.join("asm/sub/case.solidcraft")}));
+        run(&mut recovered, "edit.undo", json!({}));
+        assert_eq!(run(&mut recovered, "component.links", json!({}))["links"][0]["found"], true);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -406,5 +586,170 @@ mod tests {
         assert!(s.execute("component.insert_design", &json!({})).is_err());
         assert!(s.execute("component.insert_design", &json!({"path": "x.solidcraft", "translate": [1, "a", 2]})).is_err());
         assert!(s.doc.components.is_empty() && s.doc.links.is_empty() && s.doc.features.is_empty());
+    }
+
+    /// #3330's part: a plate 60 × 40 × 5 with a Ø 6 hole at x = `hx` (10 mm), saved at `path`. The
+    /// session stays open to edit the part as a user would.
+    fn plate(path: &Path) -> Session {
+        let mut part = Session::default();
+        run(&mut part, "parameters.add", json!({"name": "hx", "expression": "10 mm"}));
+        run(&mut part, "solid.box", json!({"length": 60, "width": 40, "height": 5, "corner": [-30, -20, 0], "body_name": "Plate"}));
+        run(&mut part, "solid.cylinder", json!({"diameter": 6, "height": 7, "base": ["hx", 0, -1], "operation": "cut", "name": "Hole"}));
+        run(&mut part, "file.save", json!({"path": path}));
+        part
+    }
+
+    /// Another Ø 6 hole through the plate at `x`.
+    fn hole(part: &mut Session, x: f64, name: &str) {
+        run(part, "solid.cylinder", json!({"diameter": 6, "height": 7, "base": [x, 0, -1], "operation": "cut", "name": name}));
+    }
+
+    /// #3330's assembly: the plate linked in and grounded, and a pin rigidly jointed to the top edge
+    /// of its hole. `older`: the link keeps no face names, as one made before them.
+    fn pinned(path: &Path, older: bool) -> Session {
+        let mut s = Session::default();
+        let feature = run(&mut s, "component.insert_design", json!({"path": path, "name": "Plate"}))["feature"].as_u64().unwrap();
+        if older {
+            s.doc_mut().feature_mut(feature).unwrap().link_faces.clear();
+            s.refresh();
+        }
+        run(&mut s, "occurrence.ground", json!({"occurrence": "Plate:1", "grounded": true}));
+        run(&mut s, "solid.cylinder", json!({"diameter": 6, "height": 20, "base": [0, 50, 0], "operation": "new", "body_name": "PinBody"}));
+        run(&mut s, "component.create", json!({"name": "Pin", "parent": "root", "activate": false}));
+        run(&mut s, "component.move_bodies", json!({"bodies": ["PinBody"], "component": "Pin"}));
+        let joint = json!({"type": "rigid", "name": "PinInHole", "flip": true,
+            "a": {"occurrence": "Plate:1", "circle": [13, 0, 5]}, "b": {"occurrence": "Pin:1", "circle": [3, 50, 0]}});
+        run(&mut s, "joint.create", joint);
+        s
+    }
+
+    /// Asserts the pin's joint sits on the plate's top at x (world) and solves without errors.
+    fn assert_joint_at(s: &mut Session, x: f64, case: &str) {
+        let list = run(s, "joint.list", json!({}));
+        assert_eq!(list["errors"], json!([]), "{case}: {list}");
+        let o = &list["joints"][0]["frame_a"]["origin"];
+        let at = [0, 1, 2].map(|i| o[i].as_f64().unwrap_or(f64::NAN));
+        assert!((at[0] - x).abs() < 1e-6 && at[1].abs() < 1e-6 && (at[2] - 5.0).abs() < 1e-6, "{case}: the joint is at {at:?}, not x = {x}");
+    }
+
+    /// #3330: a joint on a linked part's hole stays on that hole when Update Links brings in an
+    /// edit of the part, as it does inside one design, also when the edit adds a hole of the same
+    /// size that takes the first one's place in the file.
+    #[test]
+    fn joints_on_a_linked_part_follow_its_faces_through_update_links() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-link-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plate.solidcraft");
+        let hx = |part: &mut Session, x: &str| {
+            run(part, "parameters.change", json!({"name": "hx", "expression": x}));
+        };
+        let edits: [(&str, &dyn Fn(&mut Session), f64); 3] = [
+            ("the hole moved to x = 20", &|p: &mut Session| hx(p, "20 mm"), 20.0),
+            (
+                "a hole at x = -10 added before it in the timeline, and the hole moved to x = 20",
+                &|p: &mut Session| {
+                    run(p, "timeline.rollback", json!({"position": 1}));
+                    hole(p, -10.0, "Hole0");
+                    run(p, "timeline.rollback", json!({}));
+                    hx(p, "20 mm");
+                },
+                20.0,
+            ),
+            (
+                "the hole moved to x = 5, and a hole added at x = 15",
+                &|p: &mut Session| {
+                    hx(p, "5 mm");
+                    hole(p, 15.0, "Hole2");
+                },
+                5.0,
+            ),
+        ];
+        for (case, edit, x) in edits {
+            let mut part = plate(&path);
+            let mut s = pinned(&path, false);
+            assert_joint_at(&mut s, 10.0, case);
+            edit(&mut part);
+            run(&mut part, "file.save", json!({}));
+            let update = run(&mut s, "component.update_links", json!({}));
+            assert_eq!(update["updated"], json!(["Plate"]), "{case}: {update}");
+            assert_eq!(update["warnings"], json!([]), "{case}: {update}");
+            assert_joint_at(&mut s, x, case);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3330: when the part no longer has the face a joint is on, Update Links and the joint list
+    /// say so instead of moving the joint to another hole of the same size.
+    #[test]
+    fn a_joint_whose_linked_face_is_gone_is_reported_not_moved() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-link-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plate.solidcraft");
+        let mut part = plate(&path);
+        let mut s = pinned(&path, false);
+        hole(&mut part, -10.0, "Hole0");
+        run(&mut part, "timeline.delete", json!({"feature": "Hole"}));
+        run(&mut part, "file.save", json!({}));
+        let update = run(&mut s, "component.update_links", json!({}));
+        let warnings = update["warnings"].to_string();
+        assert!(warnings.contains("joint PinInHole") && warnings.contains("no longer exists"), "{update}");
+        let list = run(&mut s, "joint.list", json!({}));
+        assert_eq!(list["errors"][0]["name"], "PinInHole", "{list}");
+        assert!(list["joints"][0]["frame_a"].is_null(), "{list}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two arms jointed top face to bottom face, both occurrences of one linked arm design: when
+    /// the arm is made thicker, its holes moved or it is made longer, Update Links brings the
+    /// change in and every joint type re-solves onto the moved faces, edges and corners, as it
+    /// does inside one design (`jointed_arms_stay_together_as_the_arm_changes`).
+    #[test]
+    fn jointed_linked_arms_stay_together_through_update_links() {
+        use crate::cmd::joints::face_tests::{ARM_EDITS, ARM_FORMS, arm_pairs, arm_part, arm_size, arms_apart, joint_arms};
+        let dir = std::env::temp_dir().join(format!("solidcraft-link-arms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("arm.solidcraft");
+        let mut apart = Vec::new();
+        for form in ARM_FORMS {
+            let mut part = Session::default();
+            arm_part(&mut part);
+            run(&mut part, "file.save", json!({"path": path}));
+            let mut s = Session::default();
+            let first = run(&mut s, "component.insert_design", json!({"path": path, "name": "Arm"}))["occurrence"].as_u64().unwrap();
+            let pairs = arm_pairs(&mut s, first);
+            joint_arms(&mut s, form, &pairs);
+            apart.extend(arms_apart(&mut s, "as made", form, &pairs, arm_size(&[])));
+            for (i, (name, value)) in ARM_EDITS.into_iter().enumerate() {
+                run(&mut part, "parameters.change", json!({"name": name, "expression": format!("{value} mm")}));
+                run(&mut part, "file.save", json!({}));
+                let update = run(&mut s, "component.update_links", json!({}));
+                assert_eq!(update["updated"], json!(["Arm"]), "{form} {name}: {update}");
+                assert_eq!(update["warnings"], json!([]), "{form} {name}: {update}");
+                apart.extend(arms_apart(&mut s, &format!("{name} = {value}"), form, &pairs, arm_size(&ARM_EDITS[..=i])));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(apart.is_empty(), "{} joints apart:\n{}", apart.len(), apart.join("\n"));
+    }
+
+    /// A joint made on a link that kept no face names (an older design) names the faces by their
+    /// place in the file: Update Links says it can't vouch for it, and keeps the names from then on.
+    #[test]
+    fn update_links_warns_about_joints_on_faces_named_by_their_place() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-link-numbered-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plate.solidcraft");
+        let mut part = plate(&path);
+        let mut s = pinned(&path, true);
+        let feature = s.doc.links.values().next().unwrap().feature;
+        assert!(s.doc.feature(feature).unwrap().link_faces.is_empty());
+        // An unchanged part keeps the bodies; the names come in quietly.
+        assert_eq!(run(&mut s, "component.update_links", json!({}))["unchanged"], json!(["Plate"]));
+        assert!(!s.doc.feature(feature).unwrap().link_faces.is_empty());
+        run(&mut part, "parameters.change", json!({"name": "hx", "expression": "20 mm"}));
+        run(&mut part, "file.save", json!({}));
+        let update = run(&mut s, "component.update_links", json!({}));
+        assert!(update["warnings"].to_string().contains("joint PinInHole refers to faces of Plate by their place"), "{update}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

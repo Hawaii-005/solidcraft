@@ -10,7 +10,7 @@ use solidcraft_geom::{Aabb3, Vec3};
 use solidcraft_kernel::Body;
 
 use super::CommandSpec;
-use super::joints::{cannot_move, effective_values, joint_id, occurrence_id, resolve_holding, value};
+use super::joints::{cannot_move, effective_values, joint_id, occurrence_id, place_holding, value};
 use crate::params::{bad, bool_, str_, vec3};
 use crate::{EngineError, Result, Session};
 
@@ -18,8 +18,10 @@ use crate::{EngineError, Result, Session};
 mod analysis;
 #[path = "motion_animation.rs"]
 mod animation;
+#[path = "motion_trace.rs"]
+pub(crate) mod associative;
 #[path = "contact_sweep.rs"]
-mod contact_sweep;
+pub(crate) mod contact_sweep;
 #[path = "motion_sweep.rs"]
 mod sweep;
 
@@ -67,7 +69,16 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .params("study; samples? (default steps + 1); path? (.json or .csv) → occurrence positions per step (the design is not changed)"),
     CommandSpec::new("motion.export_animation", "Export Motion Animation", animation::export).icon("export").noundo().params(
-        "study: id|name, or joint: id|name with from and to (degrees for angles, mm for distances, or expressions) and index?;          path: a .gif file, or a folder for PNG frames (frame-0001.png, frame-0002.png, …); samples? (frames, 2…1000; default the          study's steps + 1, or 100); width?, height? (16…4096 pixels, default 800 × 500); camera?: {target, yaw, pitch, roll?,          distance, fov?, up?} (ui.camera's reply; fields left out keep the default view: view.apply's camera, or the home view          framing the model); fps? (1…50, default 20); grid?, axes? (default true: the ground grid and the origin's axes) - draws the study as it plays, or the joint as it is driven, with the headless          renderer → path, format, frames, width, height, fps (GIF), bytes, renderer, stopped_at, stopped_by_loop,          stopped_by_contact (the design is not changed)",
+        "study: id|name, or joint: id|name with from and to (degrees for angles, mm for distances, or expressions) and index?, or \
+         view: id|name (an exploded view, coming apart from the assembled placement) with back? (default false; true: back together \
+         too, exploded at the middle frame of an odd count); path: a .gif file, or a folder for PNG frames (frame-0001.png, \
+         frame-0002.png, …); samples? (frames, 2…1000; default the study's steps + 1, 100 for a joint, 41 for a view or 81 with \
+         back); width?, height? (16…4096 pixels, default 800 × 500); camera?: {target, yaw, pitch, roll?, distance, fov?, up?} \
+         (ui.camera's reply; fields left out keep the default view: view.apply's camera, or the home view framing the model, for a \
+         view both assembled and exploded); fps? (1…50, default 20); grid?, axes? (default true: the ground grid and the origin's \
+         axes) - draws the study as it plays, the joint as it is driven or the view as it explodes, with the headless renderer → \
+         path, format, frames, width, height, fps (GIF), bytes, renderer, stopped_at, stopped_by_loop, stopped_by_contact (the \
+         design is not changed, nor its placements)",
     ),
     CommandSpec::new("motion.trace", "Motion Trace", trace).at("SOLID", "ASSEMBLE").icon("trace").noundo().params(concat!(
         trace_doc!(),
@@ -76,11 +87,19 @@ pub static COMMANDS: &[CommandSpec] = &[
     )),
     CommandSpec::new("motion.trace.keep", "Keep Motion Trace", keep_trace).icon("trace").params(concat!(
         trace_doc!(),
-        "; name? (default Motion TraceN) - keeps the trace as a 3D sketch spline through its points (a new sketch with 3D Sketch \
-         on, in the root component, where no joint moves it; a fixed curve, it does not follow later changes) → sketch, name, curves, points"
+        "; name? (default Motion TraceN); auto_update?: bool (default true); point_ref?: joint origin snap - keeps the trace as a \
+         root 3D sketch spline. Associative curves follow mechanism and driving-input edits; false keeps a fixed curve. \
+         point_ref retains a geometry snap; otherwise point is retained in component coordinates → sketch, name, curves, points"
     )),
+    CommandSpec::new("motion.trace.edit", "Edit Motion Trace", associative::edit).icon("trace").params(
+        "sketch: id|name; joint? with from and to, or study?; index?; samples? (2…500); auto_update?: false to detach. \
+         Edits a saved associative trace's driving conditions in one undo step",
+    ),
     CommandSpec::new("motion.plot", "Plot Motion Study", analysis::plot).icon("graph").noundo().params(analysis::PLOT_DOC),
-    CommandSpec::new("motion.interference", "Motion Interference", analysis::interference).icon("interference").noundo().params(analysis::INTERFERENCE_DOC),
+    CommandSpec::new("motion.interference", "Motion Interference", analysis::interference)
+        .icon("interference")
+        .noundo()
+        .params(analysis::INTERFERENCE_DOC),
     CommandSpec::new("joint.sweep", "Sweep Joint", sweep::sweep).icon("interference").params(sweep::SWEEP_DOC),
     CommandSpec::new("motion.list", "List Motion Studies", list_studies).icon("list").noundo(),
     CommandSpec::new("motion.delete", "Delete Motion Study", delete_study).icon("delete").params("study"),
@@ -97,12 +116,6 @@ pub static COMMANDS: &[CommandSpec] = &[
 ];
 
 const MAX_ITEMS: usize = 10_000;
-
-fn next_id(s: &Session, cmd: &str) -> Result<u64> {
-    let a = &s.doc.assembly;
-    let ids = a.contact_sets.iter().map(|c| c.id).chain(a.studies.iter().map(|m| m.id)).chain(a.exploded.iter().map(|e| e.id));
-    super::next_free_id(cmd, ids)
-}
 
 fn occurrences(s: &Session, p: &Value, cmd: &str) -> Result<Vec<u64>> {
     let list = p.get("occurrences").and_then(Value::as_array).ok_or_else(|| bad(cmd, "`occurrences` must list occurrences"))?;
@@ -376,7 +389,7 @@ fn drive_with_contact(s: &mut Session, want: &[(u64, Vec<f64>)], given: &BTreeSe
                 j.values = q;
             }
         }
-        resolve_holding(s, &held)
+        place_holding(s, &held)
     };
     // Loops already open at the start stay as they are; a loop the motion opens stops it.
     let open_at_start: BTreeSet<u64> = set(s, 0.0).conflicts.iter().map(|c| c.0).collect();
@@ -477,7 +490,7 @@ fn new_set(s: &mut Session, p: &Value) -> Result<Value> {
     if s.doc.assembly.contact_sets.len() >= MAX_ITEMS {
         return Err(bad(cmd, "too many contact sets"));
     }
-    let id = next_id(s, cmd)?;
+    let id = s.doc_mut().allocate_id()?;
     let name = str_(p, "name").map(str::to_string).unwrap_or_else(|| format!("Contact Set{}", s.doc.assembly.contact_sets.len() + 1));
     let a = &mut s.doc_mut().assembly;
     a.contact_sets.push(ContactSet { id, name: name.clone(), occurrences: occ, suppressed: false });
@@ -585,9 +598,13 @@ fn study(s: &mut Session, p: &Value) -> Result<Value> {
             keys.push(StudyKey { joint, index, points });
         }
     }
-    let id = next_id(s, cmd)?;
-    let count = s.doc.assembly.studies.len();
-    let a = &mut s.doc_mut().assembly;
+    let doc = s.doc_mut();
+    let id = match existing {
+        Some(i) => doc.assembly.studies.get(i).ok_or_else(|| bad(cmd, "no such motion study"))?.id,
+        None => doc.allocate_id()?,
+    };
+    let count = doc.assembly.studies.len();
+    let a = &mut doc.assembly;
     let out = match existing.and_then(|i| a.studies.get_mut(i)) {
         Some(m) => {
             if let Some(n) = steps {
@@ -883,7 +900,16 @@ fn trace(s: &mut Session, p: &Value) -> Result<Value> {
 /// world, which no joint moves) with 3D Sketch on and the spline through the trace's points.
 fn keep_trace(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "motion.trace.keep";
-    let (mut points, mut out) = sample_trace(s, p, cmd)?;
+    let source = if bool_(p, "auto_update") != Some(false) { Some(associative::source(s, p, cmd)?) } else { None };
+    let (mut points, out) = sample_trace(s, p, cmd)?;
+    finish_trace(&mut points);
+    if points.len() < 2 {
+        return Err(bad(cmd, "the point does not move: there is no trace to keep"));
+    }
+    keep_sampled_trace(s, p, cmd, points, out, source)
+}
+
+fn finish_trace(points: &mut Vec<Vec3>) {
     // Where the motion stood still (at a limit or a stop), one fit point.
     points.dedup_by(|a, b| a.dist(*b) < 1e-6);
     // A full cycle comes back to where it started (to the loop solver's tolerance): the spline
@@ -898,9 +924,16 @@ fn keep_trace(s: &mut Session, p: &Value) -> Result<Value> {
         }
         points.push(first);
     }
-    if points.len() < 2 {
-        return Err(bad(cmd, "the point does not move: there is no trace to keep"));
-    }
+}
+
+fn keep_sampled_trace(
+    s: &mut Session,
+    p: &Value,
+    cmd: &str,
+    points: Vec<Vec3>,
+    mut out: Value,
+    source: Option<solidcraft_doc::motion::MotionTrace>,
+) -> Result<Value> {
     let name = match str_(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) => n.to_string(),
         None => (1..=s.doc.features.len() + 1).map(|k| format!("Motion Trace{k}")).find(|n| s.doc.find_feature(n).is_none()).unwrap_or_default(),
@@ -921,15 +954,27 @@ fn keep_trace(s: &mut Session, p: &Value) -> Result<Value> {
     s.revision += 1;
     let (made, spline) = made?;
     let sketch = made.get("sketch").cloned().unwrap_or(Value::Null);
-    out["sketch"] = sketch;
+    out["sketch"] = sketch.clone();
     out["name"] = made.get("name").cloned().unwrap_or(Value::Null);
     out["curves"] = spline.get("curves").cloned().unwrap_or(Value::Null);
     out["points"] = json!(points.len());
+    if let Some(mut source) = source {
+        source.sketch = sketch.as_u64().ok_or_else(|| bad(cmd, "trace sketch is missing"))?;
+        source.wire = spline
+            .get("curves")
+            .and_then(Value::as_array)
+            .and_then(|v| v.first())
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad(cmd, "trace curve is missing"))?
+            .to_string();
+        associative::remember(s, &source);
+        s.doc_mut().assembly.traces.push(source);
+    }
     Ok(out)
 }
 
 fn list_studies(s: &mut Session, _p: &Value) -> Result<Value> {
-    Ok(json!({"studies": s.doc.assembly.studies}))
+    Ok(json!({"studies": s.doc.assembly.studies, "traces": associative::list(s)}))
 }
 
 fn delete_study(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1003,7 +1048,7 @@ fn explode_create(s: &mut Session, p: &Value) -> Result<Value> {
     if s.doc.assembly.exploded.len() >= MAX_ITEMS {
         return Err(bad(cmd, "too many exploded views"));
     }
-    let id = next_id(s, cmd)?;
+    let id = s.doc_mut().allocate_id()?;
     let name = str_(p, "name").map(str::to_string).unwrap_or_else(|| format!("Exploded View{}", s.doc.assembly.exploded.len() + 1));
     s.doc_mut().assembly.exploded.push(ExplodedView { id, name: name.clone(), moves: moves.clone() });
     Ok(json!({"view": id, "name": name, "moves": moves.iter().map(|(o, t)| json!({"occurrence": o, "translate": t})).collect::<Vec<_>>()}))
@@ -1018,19 +1063,32 @@ fn explode_show(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let i = view_index(s, p, cmd)?;
     let v = s.doc.assembly.exploded.get(i).cloned().ok_or_else(|| bad(cmd, "view"))?;
-    s.pending_moves.clear();
-    for (o, t) in &v.moves {
-        let Some(occ) = s.doc.occurrences.iter().find(|x| x.id == *o) else { continue };
-        let mut m = occ.transform;
-        if let Some(r) = m.get_mut(3) {
-            r[0] += t.x;
-            r[1] += t.y;
-            r[2] += t.z;
-        }
-        s.pending_moves.insert(*o, m);
-    }
+    s.pending_moves = exploded_at(&explode_moves(s, &v), 1.0);
     s.revision += 1;
     Ok(json!({"view": v.id, "name": v.name}))
+}
+
+/// What exploded view `v` moves: (occurrence, its placement, the translation the view adds). Moves
+/// of occurrences no longer in the design, or not finite (a hostile design file), are left out;
+/// a later move of one occurrence replaces an earlier one.
+fn explode_moves(s: &Session, v: &ExplodedView) -> Vec<(u64, Mat, Vec3)> {
+    let placed: std::collections::BTreeMap<u64, Mat> = s.doc.occurrences.iter().map(|o| (o.id, o.transform)).collect();
+    v.moves.iter().filter(|(_, t)| t.len() < 1e7).filter_map(|(o, t)| Some((*o, *placed.get(o)?, *t))).collect()
+}
+
+/// The pending moves that show `moves` `amount` of the way out: 0 assembled, 1 exploded.
+fn exploded_at(moves: &[(u64, Mat, Vec3)], amount: f64) -> std::collections::BTreeMap<u64, Mat> {
+    let mut out = std::collections::BTreeMap::new();
+    for (o, m, t) in moves {
+        let mut m = *m;
+        if let Some(r) = m.get_mut(3) {
+            r[0] += t.x * amount;
+            r[1] += t.y * amount;
+            r[2] += t.z * amount;
+        }
+        out.insert(*o, m);
+    }
+    out
 }
 
 fn explode_list(s: &mut Session, _p: &Value) -> Result<Value> {

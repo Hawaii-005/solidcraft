@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod appearance;
+pub mod appearance_pack;
 mod assembly;
 mod body_transfer;
 mod body_transfer_sheet;
@@ -14,6 +15,9 @@ pub use body_transfer::{valid_transfer_matrix, validate_body_transfer};
 pub mod canvas;
 mod clipboard;
 pub use clipboard::{clone_expression, remap_topology};
+pub mod component_color;
+mod component_removal;
+pub use component_removal::RemovedTree;
 pub mod config;
 pub mod construct;
 pub mod display_quality;
@@ -27,7 +31,9 @@ mod feature_refs;
 pub use face_anchor::{FaceAnchor, FaceAttachmentStatus};
 pub mod format;
 mod format_offsets;
+pub mod frame;
 mod history_names;
+pub mod hole_reference;
 pub use format_offsets::whole_profile_selection_from_value;
 pub mod joints;
 mod lineage;
@@ -38,19 +44,29 @@ mod name_lookup;
 mod names;
 pub mod naming;
 mod params;
+pub mod persistent_name;
 pub mod physical_material;
 mod piece_names;
+pub mod pipe_thread_catalog;
 mod points;
 mod profile_refs;
 pub mod progress;
+mod thread_catalog;
+pub use thread_catalog::{TappedThread, TappedThreadFamily, parse_tapped_thread, tapped_thread_sizes};
 mod walk;
 pub use profile_refs::{capture_profile_selection, profile_fallback_notes, profile_selection_indices, profile_selection_indices_lenient};
 pub mod plastic;
 pub mod project;
 mod project3d;
+pub mod render_aging;
+pub mod render_job;
+pub mod render_optics;
+pub mod render_resources;
 pub mod render_settings;
+pub mod render_surface;
 pub use project3d::iso_grid;
 pub mod sheet;
+pub mod text_params;
 
 pub use assembly::{
     IDENTITY, MAX_PLACEMENT_DEPTH, MAX_PLACEMENTS, Mat, Occurrence, apply_point, apply_vector, is_identity, map_point_expr, mat_inverse, mat_mul,
@@ -87,6 +103,8 @@ pub enum DocError {
 
 pub type Result<T> = std::result::Result<T, DocError>;
 
+#[cfg(test)]
+mod coil_tests;
 #[cfg(test)]
 mod feature_walk_tests;
 #[cfg(test)]

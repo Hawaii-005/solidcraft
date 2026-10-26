@@ -436,10 +436,16 @@ impl Grid {
     fn cell(&self, p: Vec2) -> (i64, i64) {
         (((p.x - self.lo.x) / self.size).floor() as i64, ((p.y - self.lo.y) / self.size).floor() as i64)
     }
-    /// Cells a box covers; None for boxes spanning too many (they are checked against all).
+    /// Cells a box covers; None for boxes spanning too many (they are checked against all),
+    /// including infinite or huge boxes whose cell span does not fit in an `i64`.
     fn cells(&self, b: &solidcraft_geom::Aabb2) -> Option<Vec<(i64, i64)>> {
+        if !(b.min.is_finite() && b.max.is_finite()) {
+            return None;
+        }
         let (c0, c1) = (self.cell(b.min), self.cell(b.max));
-        if (c1.0 - c0.0 + 1).saturating_mul(c1.1 - c0.1 + 1) > 2048 {
+        let span = |lo: i64, hi: i64| hi.checked_sub(lo)?.checked_add(1);
+        let count = span(c0.0, c1.0)?.checked_mul(span(c0.1, c1.1)?)?;
+        if count > 2048 {
             return None;
         }
         let mut out = Vec::new();
@@ -1166,9 +1172,53 @@ fn rejoined(segs: Vec<Seg2>, joins: &impl Fn(&Seg2, &Seg2) -> bool) -> Vec<Seg2>
     out
 }
 
+/// `regions` with each region that repeats an earlier one (the same boundary within a small
+/// tolerance) left out.
+fn without_repeats(regions: &[Region2]) -> Vec<Region2> {
+    // Comparing every pair is quadratic: beyond this many the regions are kept as they are.
+    const MAX_COMPARED: usize = 5000;
+    if regions.len() < 2 || regions.len() > MAX_COMPARED {
+        return regions.to_vec();
+    }
+    let keys: Vec<(f64, Vec2, f64)> =
+        regions.iter().map(|r| (r.outer.signed_area().abs(), r.outer.centroid(), r.outer.segs.iter().map(Seg2::length).sum::<f64>())).collect();
+    let mut kept: Vec<usize> = Vec::new();
+    for (i, r) in regions.iter().enumerate() {
+        let Some(&(area, centroid, size)) = keys.get(i) else { continue };
+        let tol = 1e-7 * (1.0 + size);
+        let repeat = kept.iter().any(|&k| {
+            keys.get(k).is_some_and(|&(a, c, _)| (a - area).abs() <= tol * (1.0 + size) && c.dist(centroid) <= tol)
+                && regions.get(k).is_some_and(|other| same_region(r, other, tol))
+        });
+        if !repeat {
+            kept.push(i);
+        }
+    }
+    kept.iter().filter_map(|&i| regions.get(i).cloned()).collect()
+}
+
+/// Whether two regions have the same boundary within `tol`: the same outer loop and the same
+/// holes, whichever segment each loop starts with.
+fn same_region(a: &Region2, b: &Region2, tol: f64) -> bool {
+    let on = |p: Vec2, l: &Loop2| l.segs.iter().any(|s| s.point_at(s.closest_param(p)).dist(p) <= tol);
+    // Each loop's corners and segment middles lie on the other loop.
+    let covers = |x: &Loop2, y: &Loop2| x.segs.iter().all(|s| on(s.start(), y) && on(s.mid(), y));
+    let same_loop = |x: &Loop2, y: &Loop2| {
+        (x.signed_area().abs() - y.signed_area().abs()).abs() <= tol * (1.0 + x.segs.iter().map(Seg2::length).sum::<f64>())
+            && covers(x, y)
+            && covers(y, x)
+    };
+    a.holes.len() == b.holes.len() && same_loop(&a.outer, &b.outer) && a.holes.iter().all(|h| b.holes.iter().any(|g| same_loop(h, g)))
+}
+
 /// Union of regions that touch along shared boundary segments (one extrude of several adjacent
 /// profiles makes one body). Disjoint regions stay separate.
 pub fn merge_regions(regions: &[Region2]) -> Vec<Region2> {
+    // A region drawn again on top of another is one region (#5543): a circle drawn twice at one
+    // place is two profiles, and extruded as two coincident tools a cut through a grid of holes
+    // with four such circles retried with the tool nudged and took fifty times as long.
+    let distinct = without_repeats(regions);
+    let regions = distinct.as_slice();
     let tol = MERGE_TOL * 10.0;
     // Every boundary segment oriented with the region on its left.
     let mut segs: Vec<Seg2> = Vec::new();
@@ -1337,5 +1387,31 @@ mod whole_boundary_tests {
         // Serialized profiles cannot forge this runtime certificate.
         let copy: Profile = serde_json::from_str(&serde_json::to_string(annulus).unwrap()).unwrap();
         assert!(copy.whole_curve_boundaries().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solidcraft_geom::Aabb2;
+
+    /// An infinite or huge box spans more cells than an `i64` holds; it is checked against all
+    /// shapes instead of wrapping the count and filling memory (solidcraft#5020).
+    #[test]
+    fn grid_cells_refuse_infinite_and_huge_boxes() {
+        let small = Aabb2 { min: Vec2::new(0.0, 0.0), max: Vec2::new(10.0, 10.0) };
+        let grid = Grid::new(&[small]);
+        // A box spanning the whole grid touches the 2 x 2 cells at its corners.
+        assert_eq!(grid.cells(&small).map(|c| c.len()), Some(4));
+        let inf = Aabb2 { min: Vec2::new(-f64::INFINITY, -f64::INFINITY), max: Vec2::new(f64::INFINITY, f64::INFINITY) };
+        assert!(grid.cells(&inf).is_none());
+        let nan = Aabb2 { min: Vec2::new(f64::NAN, 0.0), max: Vec2::new(1.0, 1.0) };
+        assert!(grid.cells(&nan).is_none());
+        let huge = Aabb2 { min: Vec2::new(-1e300, -1e300), max: Vec2::new(1e300, 1e300) };
+        assert!(grid.cells(&huge).is_none());
+        // A grid built over an infinite box falls back to unit cells and still answers.
+        let grid = Grid::new(&[small, inf]);
+        assert!(grid.cells(&inf).is_none());
+        assert!(grid.cells(&huge).is_none());
     }
 }

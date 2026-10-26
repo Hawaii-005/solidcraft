@@ -10,7 +10,8 @@
 //!   into a body is a Cut and stays one however far it goes, through the far side included;
 //!   one that starts as a Join does not turn into a Cut when it reaches another body. When
 //!   the distance passes through zero onto the other side (a drag reversed past the start, or
-//!   Reverse), the operation is decided afresh for that side and latched there. A zero
+//!   Reverse), the operation is decided afresh for that side and latched there. So is a new
+//!   start (From Object, a start offset): it moves the extrude to other bodies (#467). A zero
 //!   distance changes nothing. Choosing an operation by hand ends the automatic choice for
 //!   the rest of the extrude.
 
@@ -26,6 +27,12 @@ pub struct Smart {
     pub manual_dir: bool,
     /// The automatic operation (an index into the operations) and the side it was chosen for.
     pub latch: Option<(usize, i8)>,
+    /// The To Object target the distance was last set from.
+    pub target: Option<Sel>,
+    /// Where the extrude starts (its From Object and start offset) when the latch was decided.
+    pub start: serde_json::Value,
+    /// Picks off the profile plane become the To Object target (Preferences › Design).
+    pub auto_to_object: bool,
 }
 
 /// One-side direction for a new pick: 0 (along the normal) or 1 (reversed). `ray` is the view

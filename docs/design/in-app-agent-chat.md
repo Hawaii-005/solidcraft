@@ -92,7 +92,7 @@ Code: `crates/ui-egui/src/agent_chat/`.
 |---|---|
 | `backend.rs` | The `ChatBackend` trait and its `Event`s: the only thing the panel talks to. |
 | `acp.rs`, `acp_client.rs` | The protocol messages, and `AcpBackend`, the first backend. |
-| `api_client.rs` | `ApiBackend`: an OpenAI-compatible endpoint, with SolidCraft running the tool loop. |
+| `api_client.rs` | `ApiBackend`: an OpenAI-compatible or Anthropic-compatible endpoint, with SolidCraft running the tool loop. |
 | `agents.rs` | The agents (found and added), permission modes, "always allow" answers. |
 | `settings.rs` | Preferences → AI and the Add agent dialog. |
 | `process.rs` | The agent as a child process in a process group of its own; stopping it ends the group. |
@@ -112,13 +112,17 @@ requests, for a backend that runs tools in process). Two backends exist:
 - `AcpBackend` drives a coding agent the user already has (the default, and the point of the
   feature: the user's own account, no keys).
 - `ApiBackend` talks to an OpenAI-compatible chat completions endpoint (Ollama, LM Studio,
-  OpenAI, a custom URL) and runs the tool loop itself: it starts the same `solidcraft-cli mcp
-  --connect` server an ACP agent would get and is its MCP client (`tools/list` becomes the
-  function tools, `crash_reports` left out), so its calls pass the same gate, limits, questions
-  and undo as an ACP agent's. At most 24 model requests per message. The HTTP request is the
-  desktop host's (`Services::agent_http`, ureq with no redirects); the key comes from the system
-  keychain (`Services::secrets`, the keyring crate) for the connection only and is refused over
-  plain HTTP to another computer.
+  OpenAI, a custom URL) or an Anthropic-compatible Messages endpoint (Anthropic, or a provider
+  that speaks the Messages API), and runs the tool loop itself: it starts the same
+  `solidcraft-cli mcp --connect` server an ACP agent would get and is its MCP client
+  (`tools/list` becomes the endpoint's tools, `crash_reports` left out), so its calls pass the
+  same gate, limits, questions and undo as an ACP agent's. At most 24 model requests per
+  message. The HTTP request is the desktop host's (`Services::agent_http`, ureq with no
+  redirects); the key comes from the system keychain (`Services::secrets`, the keyring crate)
+  for the connection only and is refused over plain HTTP to another computer. The two protocols
+  differ only in their wire shape: OpenAI sends the system note as a message, function tools
+  and one `tool` message per result; Anthropic sends it as `system`, `input_schema` tools and
+  all of a round's `tool_result` blocks in one user message.
 
 Another kind of backend slots in the same way without reshaping the panel.
 
@@ -165,6 +169,35 @@ design from before the turn), relabelled "Agent chat: <message>". If the history
 the meantime the start is found by the design it holds; if it's gone, nothing is merged. The
 conversation shows the merged step with an Undo button while it's still the latest thing done.
 
+### Document ownership
+
+Each open design tab owns an `AgentChat`, including its transcript, backend session, agent
+selection, sign-in retry, draft, attachments, pending messages and approval state. `DocSlot`
+parks that state alongside its `Session`; switching restores both together. Panel visibility,
+placement, agent discovery, endpoint model cache, settings dialogs and the desktop endpoint
+starter remain window state. A new tab gets a fresh conversation. Closing a tab drops its
+backend; closing the last tab or replacing its design (including programmatic New, Open and
+Recover commands or scripts) clears its conversation.
+Conversation state is in memory only and does not change the design file format.
+
+Leaving a tab cancels its running turn, declines outstanding approvals, and merges completed
+changes into that design's undo history before swapping sessions. Its backend conversation
+remains available when the tab is selected again. Pending messages stay with that tab and wait
+for Send. Hidden backends are not polled and their tool endpoints never feed the active tab's
+gate. Prompts waiting for startup or sign-in also move to the explicit Send queue on leaving.
+Late events are received only when their owning tab is selected again; requests without a
+running turn are refused, and late permission questions from a stopped turn are cancelled.
+Turning off AI or quitting stops hidden backends as well.
+
+Every admitted tool request also carries a shared turn validity flag. Ending the turn or
+leaving the tab invalidates it. The app checks it before dispatch, after deferred computation,
+before an animated command applies, and before returning or saving a window screenshot. A
+cancelled computation or export releases its UI waiting slot without waiting for its worker;
+already started file writes are not rolled back. Requests already past the gate cannot apply
+commands to or return inspection or screenshot data from the next tab, even if tab indices
+change through closing. Ordinary external control requests retain their existing active-design
+behavior.
+
 ### The agent's own tools
 
 ACP lets the client offer a file system and a terminal; the chat offers neither, and starts the
@@ -210,7 +243,7 @@ returns the whole state, for tests and screenshots.
 
 | Area | Work |
 |---|---|
-| Conversation | Diffs, history per design, resume (`session/load`) |
+| Conversation | Diffs, persisted conversation history, resume (`session/load`) |
 | Session controls | Model and mode pickers from `configOptions` / `modes`, slash commands |
 | Auth | An embedded terminal or "open a terminal here" for terminal logins on each OS; logout |
 | Discovery | Read the ACP registry; keychain-aware login check on macOS |

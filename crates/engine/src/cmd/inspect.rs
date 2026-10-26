@@ -1,5 +1,10 @@
 //! Inspection: measure bodies, describe the document, sketches and model topology.
 
+use std::collections::BTreeMap;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
 use serde_json::{Value, json};
 use solidcraft_sketch::CurveKind;
 
@@ -8,13 +13,21 @@ use crate::params::{bad, bool_, str_, string_list};
 use crate::{EngineError, Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("inspect.colored_components", "Enable Component Colors", colored_components)
+        .at("SOLID", "INSPECT").icon("colored_components").noundo()
+        .params("enabled?: bool (omitted: toggle); temporary component colours, without changing appearances"),
     CommandSpec::new("inspect.measure", "Measure", measure)
         .at("SOLID", "INSPECT")
         .icon("measure")
         .key("I")
         .noundo()
-        .params("bodies?: [names] (default all); or items: [1-2 selections] → length/area/volume; diameter, radius, circumference or arc_length/angle_deg of circles, arcs and cylinders; slot sizes; min (distance_mm, from, to), max, center_distance (centre to centre, or from an axis) and angle"),
+        .params("bodies?: [names] (default all) → closed per body; volume_mm3, center_of_mass, density_g_cm3 and mass_g only for closed, consistently oriented bodies; area, bbox and counts for all; total.open_bodies_skipped counts bodies excluded from volume/mass totals; or items: [1-2 selections] (face/edge: type, body, point; index optional) → length/area/volume; diameter, radius, circumference or arc_length/angle_deg of circles, arcs and cylinders; slot sizes; min (distance_mm, from, to), max, center_distance (centre to centre, or from an axis) and angle"),
     CommandSpec::new("document.inspect", "Inspect Design", inspect).icon("inspect").noundo().params("measure?: bool (include body measurements)"),
+    CommandSpec::new("document.revision", "Design Revision", revision).icon("inspect").noundo().params(
+        "→ document_id (this open design's id: kept while it stays open, another for each design started or opened), \
+         revision (moves whenever the design, what is hidden or a component's uncaptured position changes, \
+         never on a selection or a view; from one counter for the whole run, so it never repeats). Read-only",
+    ),
     CommandSpec::new("sketch.inspect", "Inspect Sketch", sketch_inspect).icon("inspect").noundo().params("sketch?: id|name (default active)"),
     CommandSpec::new("model.edges", "List Edges", model_edges).icon("inspect").noundo().params("body: name"),
     CommandSpec::new("model.faces", "List Faces", model_faces).icon("inspect").noundo().params(
@@ -30,21 +43,21 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("bodies: [names]; material: name (Steel, Aluminum, ABS Plastic, …, or one made with material.create; `material.list`)"),
     CommandSpec::new("appearance.assign", "Appearance", appearance).at("SOLID", "MODIFY").icon("appearance").key("A").params(
         "bodies?: [names]; faces?: [[x,y,z] on faces] (body?: which body, default the nearest); components?: [names or ids, or occurrence names]; \
-             appearance?: library name (appearance.library) | color: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1, default 1); \
-             pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (requires color/appearance and opacity 1); omitted/null uses legacy scalar shading. Neither appearance nor color (or color: null): clear, so the face follows its body, the body its component, the component its material",
+             appearance?: library name or stable starter.* ID (appearance.library) | color: \"#rrggbb\" or [r, g, b] (0–255), opacity? (0–1, default 1); \
+             name?: inert copied look label (requires color, mutually exclusive with appearance); pbr?: {metallic:0..1, roughness:0.045..1, dielectric_ior:1..3} (requires color/appearance and opacity 1); a starter ID or registered starter name resolves its recipe before color overrides; omitted pbr retains that response and pbr: null explicitly clears it. Unavailable glass recipes refuse through either selector. Other custom labels with an explicit color retain legacy scalar behavior. Neither appearance nor color (or color: null): clear, so the face follows its body, the body its component, the component its material",
     ),
     CommandSpec::new("appearance.library", "Appearance Library", appearance_library).icon("library")
         .noundo()
-        .params("→ the built-in appearances (name, colour, opacity)"),
+        .params("→ 20 legacy scalar appearances, six opaque PBR finishes and 40 starter recipes with IDs, categories, provenance, requirements and availability; six starter glass recipes are unavailable"),
     CommandSpec::new("appearance.list", "List Appearances", appearance_list).icon("list")
         .noundo()
         .params("body?: name → assigned appearances; with body, its resolved look and its faces' (face index, look)"),
     CommandSpec::new("material.list", "List Materials", material_list).icon("list")
         .noundo()
         .doc_only()
-        .params("→ the built-in materials, then the design's own (user: true, with their look)"),
+        .params("→ built-in and design-owned materials (user: true, look, optional physical_card/physical_validation/density_comparison). Read-only; candidate engineering records do not certify sources or supply a solver"),
     CommandSpec::new("engine.commands", "List Commands", commands).icon("list").noundo(),
-    CommandSpec::new("engine.describe", "Describe Command", crate::checked!("engine.describe", DESCRIBE_CONTRACT, describe))
+    CommandSpec::new("engine.describe", "Describe Command", crate::checked!("engine.describe", describe))
         .icon("list")
         .noundo()
         .doc_only()
@@ -53,20 +66,33 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("command: a command id. Returns {id, label, params, input, output} (and param_warnings in the warn parameter-check mode): the command's parameter documentation and, once the command has a typed contract, the JSON Schemas (2020-12) of its parameters and of a successful result (null otherwise). Read-only."),
 ];
 
+/// Does `body` enclose a volume? A B-rep body does when every shell is closed and consistently
+/// oriented (not a surface body), a mesh body when every triangle side is shared by exactly two
+/// triangles. Only that is asked: other findings of a full validity check (faces that don't
+/// mesh, tolerance gaps of an imported solid) don't take a closed body's volume away, and the
+/// check stays cheap for designs with many bodies.
+pub(crate) fn encloses_volume(body: &solidcraft_kernel::Body) -> bool {
+    if body.is_mesh() { body.is_closed_mesh() } else { !body.is_surface() }
+}
+
 pub fn measure_json(b: &solidcraft_doc::ModelBody) -> Value {
-    match solidcraft_kernel::measure(&b.body) {
-        Ok(m) => json!({
-            "name": b.name,
-            "volume_mm3": m.volume,
-            "area_mm2": m.area,
-            "center_of_mass": m.centroid,
-            "bbox": {"min": m.bbox.min, "max": m.bbox.max},
-            "faces": m.merged.faces,
-            "edges": m.merged.edges,
-            "vertices": m.merged.vertices,
-            "face_types": m.merged.face_types,
-            "kernel": {"faces": m.faces, "edges": m.edges, "vertices": m.vertices, "shells": m.shells},
-        }),
+    match b.measure() {
+        Ok(m) => {
+            let closed = encloses_volume(&b.body);
+            json!({
+                "name": b.name,
+                "closed": closed,
+                "volume_mm3": closed.then_some(m.volume),
+                "area_mm2": m.area,
+                "center_of_mass": closed.then_some(m.centroid),
+                "bbox": {"min": m.bbox.min, "max": m.bbox.max},
+                "faces": m.merged.faces,
+                "edges": m.merged.edges,
+                "vertices": m.merged.vertices,
+                "face_types": m.merged.face_types,
+                "kernel": {"faces": m.faces, "edges": m.edges, "vertices": m.vertices, "shells": m.shells},
+            })
+        }
         Err(e) => json!({"name": b.name, "error": e.to_string()}),
     }
 }
@@ -86,10 +112,11 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     // Mass from each body's material.
     for (b, body) in bodies.iter_mut().zip(selected) {
+        let source = body.definition_name();
+        // Every body's material, measured or not: naming it takes no measuring.
+        b["material"] = json!(s.doc.body_material(source));
         if let Some(v) = b["volume_mm3"].as_f64() {
-            let source = body.definition_name();
             let rho = s.doc.density(source);
-            b["material"] = json!(s.doc.materials.get(source).cloned().unwrap_or_else(|| "Default".into()));
             b["density_g_cm3"] = json!(rho);
             b["mass_g"] = json!(v * rho / 1000.0);
         }
@@ -111,12 +138,13 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
             // and the area (both faces minus the holes, plus the bores).
             let open = sh.perforated_area();
             if open > 0.0 {
-                let v = b["volume_mm3"].as_f64().unwrap_or(0.0);
-                let nv = v - open * sh.t;
-                if let Some(m) = b["mass_g"].as_f64().filter(|_| v > 0.0) {
-                    b["mass_g"] = json!(m * nv / v);
+                if let Some(v) = b["volume_mm3"].as_f64() {
+                    let nv = v - open * sh.t;
+                    if let Some(m) = b["mass_g"].as_f64().filter(|_| v > 0.0) {
+                        b["mass_g"] = json!(m * nv / v);
+                    }
+                    b["volume_mm3"] = json!(nv);
                 }
-                b["volume_mm3"] = json!(nv);
                 let bores: f64 = sh
                     .perforations
                     .iter()
@@ -126,6 +154,7 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
+    let skipped = bodies.iter().filter(|b| b["closed"] == false).count();
     let tv: f64 = bodies.iter().filter_map(|b| b["volume_mm3"].as_f64()).sum();
     let ta: f64 = bodies.iter().filter_map(|b| b["area_mm2"].as_f64()).sum();
     let tf: u64 = bodies.iter().filter_map(|b| b["faces"].as_u64()).sum();
@@ -133,7 +162,7 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
     let tvx: u64 = bodies.iter().filter_map(|b| b["vertices"].as_u64()).sum();
     let tm: f64 = bodies.iter().filter_map(|b| b["mass_g"].as_f64()).sum();
     Ok(
-        json!({"body_count": bodies.len(), "bodies": bodies, "total": {"volume_mm3": tv, "area_mm2": ta, "mass_g": tm, "faces": tf, "edges": te, "vertices": tvx}}),
+        json!({"body_count": bodies.len(), "bodies": bodies, "total": {"open_bodies_skipped": skipped, "volume_mm3": tv, "area_mm2": ta, "mass_g": tm, "faces": tf, "edges": te, "vertices": tvx}}),
     )
 }
 
@@ -222,6 +251,59 @@ fn sketch_inspect(s: &mut Session, p: &Value) -> Result<Value> {
     sketch_json(s, id).ok_or_else(|| EngineError::Other("that sketch is not evaluated (rolled back or not a sketch)".into()))
 }
 
+/// Revisions of every design of this run (#6646).
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// The design as `document.revision` last saw it, which its revision names.
+pub(crate) struct Followed {
+    /// Held weakly: a design something holds weakly is never changed in place (`Arc::make_mut`
+    /// moves it), and its address can't go to another design meanwhile.
+    doc: Weak<solidcraft_doc::Document>,
+    visibility: crate::Visibility,
+    pending_moves: BTreeMap<u64, solidcraft_doc::Mat>,
+    revision: u64,
+}
+
+/// A new design's id: one for this run, then a number, so no two designs of one run, or of two
+/// runs, have the same.
+pub(crate) fn new_document_id() -> String {
+    static RUN: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let run = RUN.get_or_init(|| {
+        let started = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        // Hashed with this process's random keys (where the system has them), so two runs differ
+        // even with the clock set back.
+        RandomState::new().hash_one(started)
+    });
+    format!("{run:016x}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+impl Session {
+    /// The revision of what the design holds now (`document.revision`), a new one when it changed
+    /// since last asked. Changes between two asks that end where they began (an edit undone) need
+    /// no new one: the design is the one that revision named.
+    pub fn design_revision(&mut self) -> u64 {
+        let seen = |f: &Followed| {
+            std::ptr::eq(f.doc.as_ptr(), Arc::as_ptr(&self.doc)) && f.visibility == self.visibility && f.pending_moves == self.pending_moves
+        };
+        match self.followed.as_ref().filter(|f| seen(f)) {
+            Some(f) => f.revision,
+            None => {
+                let revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+                let (doc, visibility, pending_moves) = (Arc::downgrade(&self.doc), self.visibility.clone(), self.pending_moves.clone());
+                self.followed = Some(Followed { doc, visibility, pending_moves, revision });
+                revision
+            }
+        }
+    }
+}
+
+/// `document.revision`: the design's id and [`Session::design_revision`].
+fn revision(s: &mut Session, _p: &Value) -> Result<Value> {
+    let revision = s.design_revision();
+    Ok(json!({"document_id": s.document_id, "revision": revision}))
+}
+
 fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.model.state();
     let (vals, perr) = s.doc.param_values();
@@ -247,11 +329,16 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .collect();
     let with_measure = bool_(p, "measure").unwrap_or(false);
+    // Each body is measured on its own: on all cores, in body order (as `inspect.measure`).
+    let mut measured = if with_measure { solidcraft_kernel::map_on_threads(&st.bodies, 16, measure_json) } else { Vec::new() }.into_iter();
     let bodies: Vec<Value> = st
         .bodies
         .iter()
         .map(|b| {
-            let mut v = if with_measure { measure_json(b) } else { json!({"name": b.name, "feature": b.feature}) };
+            let mut v = match measured.next() {
+                Some(m) => m.unwrap_or_else(|| json!({"name": b.name, "error": "measuring this body failed"})),
+                None => json!({"name": b.name, "feature": b.feature}),
+            };
             if let Some(o) = v.as_object_mut() {
                 o.insert("visible".into(), json!(s.body_visible(&b.name)));
                 if s.body_removed_later(&b.name) {
@@ -362,7 +449,7 @@ fn physical_material(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`bodies` must list existing bodies"));
     }
     for b in &bodies {
-        if canonical == "Default" {
+        if canonical == solidcraft_doc::DEFAULT_MATERIAL {
             s.doc_mut().materials.remove(b);
         } else {
             s.doc_mut().materials.insert(b.clone(), canonical.clone());
@@ -386,36 +473,68 @@ pub(super) fn color_param(v: &Value) -> Option<[u8; 3]> {
     Some([c(0)?, c(1)?, c(2)?])
 }
 
-fn appearance(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn appearance(s: &mut Session, p: &Value) -> Result<Value> {
     use solidcraft_doc::appearance::{FaceLook, Look, library};
     let cmd = "appearance.assign";
-    let mut look: Option<Look> = match (str_(p, "appearance"), p.get("color")) {
-        // A colour with a name: that colour, called that (a name not in the library is fine).
-        (Some(n), Some(v)) if !v.is_null() => {
-            let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0–255"))?;
-            let o = p.get("opacity").and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(1.0);
-            let mut l = Look::custom(c, o);
-            l.name = n.chars().take(128).collect();
-            Some(l)
+    // A saved label is data, not a request to resolve a recipe. Keep the explicit
+    // appearance selector separate so an owned look may have any recipe's ID as its name.
+    let copied_name = match p.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) if !name.is_empty() && name.chars().count() <= 128 && !name.chars().any(char::is_control) => Some(name),
+        _ => return Err(bad(cmd, "`name` must be a nonempty label of at most 128 characters without controls")),
+    };
+    if copied_name.is_some() && (p.get("color").is_none_or(Value::is_null) || p.get("appearance").is_some_and(|value| !value.is_null())) {
+        return Err(bad(cmd, "`name` requires an explicit color and cannot be combined with `appearance`"));
+    }
+    // Both the stable ID and a registered display name explicitly select a recipe.
+    // Copied labels use `name`, so color overrides cannot bypass unsupported optics.
+    let preset = str_(p, "appearance").and_then(solidcraft_doc::appearance_pack::find);
+    let mut look: Option<Look> = if let Some(preset) = preset {
+        // Refuse unsupported optics before any color/PBR/opacity override.
+        let mut look = preset.opaque_look().map_err(|e| bad(cmd, e.to_string()))?;
+        if let Some(color) = p.get("color").filter(|v| !v.is_null()) {
+            look.color = color_param(color).ok_or_else(|| bad(cmd, "invalid preset color override"))?;
         }
-        (Some(n), _) => {
-            let mut l = library(n).ok_or_else(|| bad(cmd, format!("no appearance `{n}` in the library (appearance.library)")))?;
-            if let Some(o) = p.get("opacity").and_then(Value::as_f64).filter(|x| x.is_finite()) {
-                l.opacity = o.clamp(0.0, 1.0);
+        if let Some(opacity) = p.get("opacity").and_then(Value::as_f64).filter(|x| x.is_finite()) {
+            look.opacity = opacity.clamp(0.0, 1.0);
+        }
+        Some(look)
+    } else {
+        match (str_(p, "appearance"), p.get("color")) {
+            // A colour with a name: that colour, called that (a name not in the library is fine).
+            (Some(n), Some(v)) if !v.is_null() => {
+                let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0–255"))?;
+                let o = p.get("opacity").and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(1.0);
+                let mut l = Look::custom(c, o);
+                l.name = n.chars().take(128).collect();
+                Some(l)
             }
-            Some(l)
-        }
-        (None, None | Some(Value::Null)) => None,
-        (None, Some(v)) => {
-            let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0–255"))?;
-            let o = match p.get("opacity") {
-                Some(o) => o.as_f64().filter(|x| x.is_finite() && (0.0..=1.0).contains(x)).ok_or_else(|| bad(cmd, "`opacity` must be 0…1"))?,
-                None => 1.0,
-            };
-            Some(Look::custom(c, o))
+            (Some(n), _) => {
+                let mut l = if let Some(preset) = solidcraft_doc::appearance_pack::find(n) {
+                    preset.opaque_look().map_err(|e| bad(cmd, e.to_string()))?
+                } else {
+                    library(n).ok_or_else(|| bad(cmd, format!("no appearance `{n}` in the library (appearance.library)")))?
+                };
+                if let Some(o) = p.get("opacity").and_then(Value::as_f64).filter(|x| x.is_finite()) {
+                    l.opacity = o.clamp(0.0, 1.0);
+                }
+                Some(l)
+            }
+            (None, None | Some(Value::Null)) => None,
+            (None, Some(v)) => {
+                let c = color_param(v).ok_or_else(|| bad(cmd, "`color` must be \"#rrggbb\" or [r, g, b] with values 0–255"))?;
+                let o = match p.get("opacity") {
+                    Some(o) => o.as_f64().filter(|x| x.is_finite() && (0.0..=1.0).contains(x)).ok_or_else(|| bad(cmd, "`opacity` must be 0…1"))?,
+                    None => 1.0,
+                };
+                Some(Look::custom(c, o))
+            }
         }
     };
     if let Some(l) = &mut look {
+        if let Some(name) = copied_name {
+            l.name = name.clone();
+        }
         attach_pbr(cmd, p, l)?;
     } else if p.get("pbr").is_some_and(|v| !v.is_null()) {
         return Err(bad(cmd, "`pbr` requires a color or appearance"));
@@ -542,38 +661,58 @@ pub(super) fn look_json(l: &solidcraft_doc::appearance::Look) -> Value {
 mod pbr_tests;
 
 pub(super) fn attach_pbr(cmd: &str, params: &Value, look: &mut solidcraft_doc::appearance::Look) -> Result<()> {
-    let Some(value) = params.get("pbr") else { return Ok(()) };
-    if value.is_null() {
-        look.pbr = None;
-        return Ok(());
+    if let Some(value) = params.get("pbr") {
+        look.pbr = if value.is_null() {
+            None
+        } else {
+            let object = value
+                .as_object()
+                .filter(|o| o.len() == 3 && o.keys().all(|k| matches!(k.as_str(), "metallic" | "roughness" | "dielectric_ior")))
+                .ok_or_else(|| bad(cmd, "`pbr` requires exactly metallic, roughness and dielectric_ior"))?;
+            let number = |key: &str| object.get(key).and_then(Value::as_f64).ok_or_else(|| bad(cmd, format!("`pbr.{key}` must be a finite number")));
+            Some(
+                solidcraft_doc::pbr_appearance::PbrParameters::new(number("metallic")?, number("roughness")?, number("dielectric_ior")?)
+                    .map_err(|e| bad(cmd, e.to_string()))?,
+            )
+        };
     }
-    if let Some(opacity) = params.get("opacity")
-        && opacity.as_f64().filter(|v| v.is_finite() && *v == 1.0).is_none()
-    {
-        return Err(bad(cmd, "opaque PBR requires numeric opacity 1"));
+    // Validate the final look, including a named preset's inherited response.
+    // Both appearance assignments and physical-material defaults use this path.
+    if look.pbr.is_some() {
+        if let Some(opacity) = params.get("opacity")
+            && opacity.as_f64().filter(|v| v.is_finite() && *v == 1.0).is_none()
+        {
+            return Err(bad(cmd, "opaque PBR requires numeric opacity 1"));
+        }
+        if look.opacity != 1.0 {
+            return Err(bad(cmd, "opaque PBR requires opacity 1; refraction/transmission is not supported"));
+        }
     }
-    let object = value
-        .as_object()
-        .filter(|o| o.len() == 3 && o.keys().all(|k| matches!(k.as_str(), "metallic" | "roughness" | "dielectric_ior")))
-        .ok_or_else(|| bad(cmd, "`pbr` requires exactly metallic, roughness and dielectric_ior"))?;
-    let number = |key: &str| object.get(key).and_then(Value::as_f64).ok_or_else(|| bad(cmd, format!("`pbr.{key}` must be a finite number")));
-    let response = solidcraft_doc::pbr_appearance::PbrParameters::new(number("metallic")?, number("roughness")?, number("dielectric_ior")?)
-        .map_err(|e| bad(cmd, e.to_string()))?;
-    if look.opacity != 1.0 {
-        return Err(bad(cmd, "opaque PBR requires opacity 1; refraction/transmission is not supported"));
-    }
-    look.pbr = Some(response);
     Ok(())
 }
 
 fn appearance_library(_s: &mut Session, _p: &Value) -> Result<Value> {
-    let list: Vec<Value> = solidcraft_doc::appearance::LIBRARY
+    let mut list: Vec<Value> = solidcraft_doc::appearance::LIBRARY
         .iter()
         .map(|(n, c, o)| {
             let category = n.split(" - ").next().unwrap_or(n);
             json!({"name": n, "category": category, "color": format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]), "opacity": o})
         })
         .collect();
+    list.extend(solidcraft_doc::appearance::OPAQUE_FINISHES.iter().filter_map(|(name, ..)| {
+        let look = solidcraft_doc::appearance::library(name)?;
+        let mut value = look_json(&look);
+        value["category"] = json!(name.split(" - ").next().unwrap_or(name));
+        Some(value)
+    }));
+    for preset in &solidcraft_doc::appearance_pack::STARTER_PACK {
+        let c = preset.preview_color();
+        let pbr = preset.opaque_look().ok().and_then(|look| look.pbr);
+        list.push(json!({"id":preset.id,"name":preset.name,"category":preset.category,"revision":preset.revision,
+            "color":format!("#{:02x}{:02x}{:02x}",c[0],c[1],c[2]),"opacity":1.0,"pbr":pbr,
+            "available":preset.is_opaque(),"requirements":preset.requirements,"provenance":preset.provenance,
+            "recipe":preset.recipe,"preview_note":preset.preview_note,"future_texture_recipe":preset.future_texture_recipe}));
+    }
     Ok(json!({"appearances": list}))
 }
 
@@ -639,8 +778,28 @@ fn appearance_list(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn material_list(s: &mut Session, _p: &Value) -> Result<Value> {
     let built_in = solidcraft_doc::MATERIALS.iter().map(|(n, d)| json!({"name": n, "density_g_cm3": d}));
-    let user = s.doc.user_materials.iter().map(
-        |m| json!({"name": m.name, "density_g_cm3": m.density, "appearance": s.doc.material_look(&m.name).as_ref().map(look_json), "user": true}),
-    );
+    let user = s
+        .doc
+        .user_materials
+        .iter()
+        .map(|m| {
+            let mut out = super::materials::material_json(m)?;
+            out["appearance"] = json!(s.doc.material_look(&m.name).as_ref().map(look_json));
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(json!({"materials": built_in.chain(user).collect::<Vec<_>>()}))
+}
+
+fn colored_components(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("enabled").is_some_and(|v| !v.is_boolean()) {
+        return Err(bad("inspect.colored_components", "enabled must be a boolean"));
+    }
+    let enabled = bool_(p, "enabled").unwrap_or(s.colored_components.is_none());
+    if enabled && s.colored_components.is_none() {
+        s.colored_components = Some(());
+    } else if !enabled {
+        s.colored_components = None;
+    }
+    Ok(json!({"enabled": enabled}))
 }

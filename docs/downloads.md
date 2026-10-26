@@ -5,8 +5,6 @@ Every platform and package. The links point at the latest release.
 - **Windows:** download and run the [installer][windows-msi].
   Also for [ARM64][windows-arm64-msi] and [32-bit][windows-x86-msi] PCs, or as a
   [portable zip][windows-portable] that runs without installing.
-  With [WinGet](https://learn.microsoft.com/windows/package-manager/winget/):
-  `winget install bherbruck.SolidCraft`.
 - **macOS:** open the [disk image][macos-dmg] and drag SolidCraft into Applications
   (Apple silicon and Intel).
 - **Linux:** download the [AppImage][linux-appimage], allow it to run as a program and open it.
@@ -16,6 +14,14 @@ Every platform and package. The links point at the latest release.
   For ARM64: [AppImage][linux-arm64-appimage], [.deb][linux-arm64-deb], [.rpm][linux-arm64-rpm].
 - **Web:** [try it in your browser][web-app], no install.
 
+
+## Code signing
+
+Windows releases will be code signed through the SignPath Foundation: free code signing provided by
+[SignPath.io](https://about.signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/). This is being set up; until it's live, the note
+below applies. macOS releases are being set up to be signed with an Apple Developer ID and
+notarized by Apple.
 
 The downloads aren't signed yet. On Windows, if SmartScreen warns you, choose **More info**, then
 **Run anyway**. On macOS, the first time, right-click SolidCraft in Applications and choose **Open**.

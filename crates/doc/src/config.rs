@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DocError, Document, Result};
+use crate::{DEFAULT_MATERIAL, DocError, Document, Result};
 
 #[path = "config_rules.rs"]
 mod rules;
@@ -96,7 +96,7 @@ impl Document {
     /// returning None for the default material.
     pub fn material_cell(&self, value: &str) -> Result<Option<String>> {
         let name = self.material_name(value).ok_or_else(|| DocError::Invalid(format!("unknown configuration material `{value}`")))?;
-        Ok((name != "Default").then_some(name))
+        Ok((name != DEFAULT_MATERIAL).then_some(name))
     }
 
     /// Freeze design-unit-sensitive configuration literals when changing display units.
@@ -130,6 +130,7 @@ impl Document {
     /// A column's current value in the design.
     pub fn config_current(&self, c: &Column) -> Option<String> {
         match c {
+            Column::Param(n) if self.text_param(n).is_some() => self.text_param(n).map(|p| p.text.clone()),
             Column::Param(n) => self.all_param_exprs().into_iter().find(|(m, _, _)| m == n).map(|(_, e, kind)| {
                 // Feature literals are stored in base units, unlike newly typed bare
                 // row cells. Capture their unit explicitly before editing in an inch design.
@@ -140,7 +141,7 @@ impl Document {
                 }
             }),
             Column::Suppress(id) => self.feature(*id).map(|f| f.suppressed.to_string()),
-            Column::Material(body) => Some(self.materials.get(body).cloned().unwrap_or_else(|| "Default".into())),
+            Column::Material(body) => Some(self.materials.get(body).cloned().unwrap_or_else(|| DEFAULT_MATERIAL.into())),
             Column::Appearance(body) => Some(self.appearances.bodies.get(body).and_then(|look| serde_json::to_string(look).ok()).unwrap_or_default()),
             Column::ComponentAppearance(id) => {
                 Some(self.appearances.components.get(id).and_then(|look| serde_json::to_string(look).ok()).unwrap_or_default())
@@ -262,6 +263,7 @@ impl Document {
         }
         self.configs.columns.iter().zip(&r.cells).all(|(c, v)| match c {
             Column::Suppress(id) => suppression_cell(v).is_ok_and(|on| self.feature(*id).is_some_and(|f| f.suppressed == on)),
+            Column::Param(name) if self.text_param(name).is_some() => self.text_param(name).is_some_and(|p| p.text == crate::text_params::unquote(v)),
             Column::Param(name) => {
                 let kind = self
                     .features

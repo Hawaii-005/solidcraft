@@ -1,8 +1,11 @@
 //! Standing up a Y-up file (#3). Many CAD programs save parts with Y up, so a STEP or IGES file
 //! from them opens lying on its back in a Z-up design. After such a file opens, SolidCraft
 //! offers to stand it up: a quarter turn about X (Y → Z) of the component the file came in as
-//! (#1386), so an assembly's parts and instances turn together, in one step that can be undone. Preferences › Design › "Offer to stand up Y-up
-//! files" turns the offer off; with Y up as the default orientation it isn't needed.
+//! (#1386), so an assembly's parts and instances turn together, in one step that can be undone.
+//! Preferences › Design › "Offer to stand up Y-up files" turns the offer off; with Y up as the
+//! default orientation it isn't needed. The file is never turned without asking: a header that
+//! names an exporter known to save Y up (SolidWorks) only adds a reason line to the offer, since
+//! such a file may have been saved Z up. The context menu's "Turn Up Axis" fixes it any time.
 
 use serde_json::json;
 
@@ -14,22 +17,38 @@ use crate::ui_kit;
 /// stand them up.
 pub fn offer(app: &mut SolveApp, path: &str, before: &[String], result: Option<&serde_json::Value>) {
     let io = &solidcraft_engine::io::is_step_path;
-    if !(io(path) || solidcraft_engine::io::is_iges_path(path)) || !app.preferences.offer_stand_up || app.preferences.up_axis != "z" {
+    if !(io(path) || solidcraft_engine::io::is_iges_path(path)) || app.preferences.up_axis != "z" {
+        return;
+    }
+    let text = |k: &str| result.and_then(|r| r.get(k)).and_then(serde_json::Value::as_str);
+    // SolidCraft's own STEP exports already use Z up.
+    if text("system") == Some("SolidCraft") || text("exporter_up") == Some("z") {
         return;
     }
     let bodies: Vec<String> = app.session.world_state().bodies.iter().map(|b| b.name.clone()).filter(|n| !before.contains(n)).collect();
-    if !bodies.is_empty() {
-        app.stand_up = Some(bodies);
-        app.stand_up_occurrence = result.and_then(|r| r.get("occurrence")).and_then(serde_json::Value::as_u64);
+    if bodies.is_empty() {
+        return;
     }
+    let occurrence = result.and_then(|r| r.get("occurrence")).and_then(serde_json::Value::as_u64);
+    if !app.preferences.offer_stand_up {
+        return;
+    }
+    // A header naming a Y-up exporter adds the reason; the file is never turned without asking.
+    app.stand_up_reason = text("exporter_up") == Some("y");
+    app.stand_up = Some(bodies);
+    app.stand_up_occurrence = occurrence;
 }
 
 /// Turn the offered bodies a quarter turn about X (Y up becomes Z up).
 pub fn stand_up(app: &mut SolveApp) -> Result<(), String> {
+    app.stand_up_reason = false;
     let Some(bodies) = app.stand_up.take() else { return Err("no file is waiting to be stood up".into()) };
     match app.stand_up_occurrence.take() {
-        // The import's component turns about its parent's origin, contents and all.
-        Some(occurrence) => app.run("occurrence.move", json!({ "occurrence": occurrence, "axis": [1, 0, 0], "angle": "90 deg" })),
+        // The import's component turns about its parent's origin, contents and all, even when it
+        // came in as the design's grounded first part (#2804): it is still being placed.
+        Some(occurrence) => {
+            app.run("occurrence.move", json!({ "occurrence": occurrence, "axis": [1, 0, 0], "angle": "90 deg", "move_grounded": true }))
+        }
         None => app.run("solid.move", json!({ "bodies": bodies, "axis": [1, 0, 0], "angle": "90 deg" })),
     }
     .map_err(|e| e.to_string())?;
@@ -40,6 +59,7 @@ pub fn stand_up(app: &mut SolveApp) -> Result<(), String> {
 /// Dismiss the offer and keep the file as it opened ("Leave it"); the preference stays on.
 pub fn leave(app: &mut SolveApp) {
     app.stand_up = None;
+    app.stand_up_reason = false;
     app.stand_up_occurrence = None;
 }
 
@@ -57,6 +77,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 crate::i18n::tr_label("Files from many CAD programs have Y up, so they open lying on their back here (Z up)."),
                 ui_kit::Text::Report("why", false),
             );
+            if app.stand_up_reason {
+                ui_kit::text(ui, crate::i18n::tr_label("Exported by SolidWorks, which usually saves Y up"), ui_kit::Text::Report("reason", false));
+            }
             ui_kit::text(
                 ui,
                 crate::i18n::tr_label("Stand it up: a quarter turn about X, as one Move feature you can undo."),

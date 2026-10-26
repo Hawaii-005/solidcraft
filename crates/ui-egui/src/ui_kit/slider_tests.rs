@@ -130,3 +130,65 @@ fn formatted_slider_editor_fits_without_shifting_the_track_during_a_scale_drag()
     }
     assert!(widths.windows(2).all(|pair| pair[0] == pair[1]), "dragging must not move the input range: {widths:?}");
 }
+
+/// The value box of a slider takes typed numbers (the per-axis speeds among them): Tab order reaches it
+/// and Enter commits; a number past the range is held to the range.
+#[test]
+fn a_sliders_value_box_takes_typed_numbers_and_clamps_them_to_its_range() {
+    use crate::ui_kit::test_support::*;
+    for (typed, expected) in [("1.5", 1.5), ("9", 3.0), ("-4", 0.0), ("0", 0.0)] {
+        let ctx = crate::fonts::test_context();
+        let mut value = 1.0_f32;
+        let mut draw = |ui: &mut Ui| {
+            slider(ui, &mut value, 0.0..=3.0, Slider { step: Some(0.05), format: |v| format!("{v:.2}×"), ..Default::default() });
+        };
+        frame(&ctx, vec![], &mut draw);
+        let track = scenario::rect_of("dialog:slider_track:").unwrap_or_else(|| scenario::rects("dialog:slider").first().expect("the slider").1);
+        let at = egui::pos2(track.right() + 30.0, track.center().y);
+        frame(&ctx, pointer(at, true), &mut draw);
+        frame(&ctx, pointer(at, false), &mut draw);
+        frame(&ctx, vec![egui::Event::Text(typed.into())], &mut draw);
+        frame(&ctx, key(egui::Key::Enter), &mut draw);
+        frame(&ctx, vec![], &mut draw);
+        assert!((value - expected).abs() < 1e-3, "typed {typed}: {value}");
+    }
+}
+
+/// At the top of its range egui's own handle reaches the right edge of the rectangle the kit
+/// paints over it, so the mask has to pass that edge; flush with it, the handle's last column
+/// survives as a light sliver beside the value box (#5708).
+#[test]
+fn the_mask_passes_the_edge_of_egui_s_own_handle_at_the_top_of_the_range() {
+    let ctx = crate::fonts::test_context();
+    let t = Tokens::get();
+    let mut value: f64 = 2.0;
+    let mut output =
+        ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))), ..Default::default() }, |ui| {
+            scope(ui, |ui| {
+                slider(ui, &mut value, 0.0..=2.0, Slider { step: Some(0.05), ..Default::default() });
+            });
+        });
+    output.textures_delta.clear();
+    let handle = output
+        .shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Circle(c) if c.stroke.color != t.form_primary => Some(*c),
+            _ => None,
+        })
+        .expect("egui's own slider handle");
+    let mask = output
+        .shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Rect(r) if r.fill == t.dialog_body => Some(r.rect),
+            _ => None,
+        })
+        .expect("the rectangle the kit paints over egui's slider");
+    assert!(
+        mask.right() > handle.center.x + handle.radius,
+        "the mask ends at {} and egui's handle at {}: its last column would show",
+        mask.right(),
+        handle.center.x + handle.radius
+    );
+}

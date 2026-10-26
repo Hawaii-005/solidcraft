@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use super::acp::{self, Incoming};
-use super::backend::{ChatBackend, Event, PromptPart, StartContext};
+use super::backend::{ChatBackend, Event, PromptPart, StartContext, TestError};
 use super::process::{AgentProcess, FromAgent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,10 +46,13 @@ impl AcpBackend {
     pub fn start(argv: &[String], ctx: StartContext) -> Result<AcpBackend, String> {
         let wake = ctx.wake;
         let proc = AgentProcess::spawn(argv, &ctx.cwd, ENV_REMOVE, wake)?;
+        // An agent inside WSL is told the same folder and bridge as WSL shows them (#5546).
+        let (cwd, bridge) =
+            if acp::runs_in_wsl(argv) { (acp::wsl_path(&ctx.cwd), ctx.bridge.as_ref().map(acp::McpBridge::in_wsl)) } else { (ctx.cwd, ctx.bridge) };
         let mut b = AcpBackend {
             proc,
-            cwd: ctx.cwd,
-            bridge: ctx.bridge,
+            cwd,
+            bridge,
             next_id: 0,
             pending: HashMap::new(),
             session: None,
@@ -228,10 +231,10 @@ impl ChatBackend for AcpBackend {
 
 /// Test connection: start the agent, say hello, open a session without tools, end it. What it
 /// answered (its name and version), or what went wrong (it isn't signed in, it didn't answer).
-pub fn test_agent(argv: &[String], cwd: &std::path::Path) -> Result<String, String> {
-    let mut p = AgentProcess::spawn(argv, cwd, ENV_REMOVE, || {})?;
+pub fn test_agent(argv: &[String], cwd: &std::path::Path) -> Result<String, TestError> {
+    let mut p = AgentProcess::spawn(argv, cwd, ENV_REMOVE, || {}).map_err(TestError::Other)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let wait_for = |p: &AgentProcess, id: u64| -> Result<Value, String> {
+    let wait_for = |p: &AgentProcess, id: u64| -> Result<Value, TestError> {
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match p.from_agent.recv_timeout(left) {
@@ -241,24 +244,25 @@ pub fn test_agent(argv: &[String], cwd: &std::path::Path) -> Result<String, Stri
                     {
                         return result.map_err(|(code, m)| {
                             if code == acp::AUTH_REQUIRED || m.to_ascii_lowercase().contains("auth") {
-                                crate::i18n::tr("ui.agent_chat_state_auth").to_string()
+                                TestError::AuthRequired
                             } else {
-                                m
+                                TestError::Other(m)
                             }
                         });
                     }
                 }
                 Ok(FromAgent::Exited(tail)) => {
-                    return Err(tail.last().cloned().unwrap_or_else(|| crate::i18n::tr("ui.agent_chat_exited").to_string()));
+                    return Err(TestError::Other(tail.last().cloned().unwrap_or_else(|| crate::i18n::tr("ui.agent_chat_exited").to_string())));
                 }
-                Err(_) => return Err(crate::i18n::tr("ui.ai_no_answer").to_string()),
+                Err(_) => return Err(TestError::Other(crate::i18n::tr("ui.ai_no_answer").to_string())),
             }
         }
     };
     p.send(&acp::request(1, "initialize", acp::initialize_params(env!("CARGO_PKG_VERSION"))));
     let init = wait_for(&p, 1);
+    let session_cwd = if acp::runs_in_wsl(argv) { acp::wsl_path(cwd) } else { cwd.to_path_buf() };
     let result = init.and_then(|v| {
-        p.send(&acp::request(2, "session/new", acp::session_new_params(cwd, None)));
+        p.send(&acp::request(2, "session/new", acp::session_new_params(&session_cwd, None)));
         wait_for(&p, 2).map(|_| {
             let who = acp::agent_info(&v);
             crate::i18n::format("ui.ai_test_acp_ok", &[("agent", if who.is_empty() { "?" } else { &who })])

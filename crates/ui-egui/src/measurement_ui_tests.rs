@@ -14,7 +14,7 @@ fn result(h: &Harness) -> &Value {
 fn vertex_measurement(a: [f64; 3], b: [f64; 3]) -> Harness {
     let mut h = Harness::new();
     h.app.home.open = false;
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.app.ui.show_browser = false;
     h.app.run("solid.box", json!({"length":3,"width":4,"height":12,"corner":[-3,0,-12],"body_name":"Box"})).unwrap();
     h.app.session.selection = [a, b].into_iter().map(|p| Sel::Vertex { body: "Box".into(), point: p.into() }).collect();
@@ -42,16 +42,32 @@ fn component_rects() -> Vec<egui::Rect> {
 }
 
 #[test]
+fn measure_dialog_shows_the_obtuse_corner_of_selected_lines() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points": [[40, 0], [0, 0], [-24, 32]]})).unwrap();
+    h.app.session.selection = ["l1", "l2"].into_iter().map(|id| Sel::SketchCurve { id: id.into(), sketch: None }).collect();
+    h.app.start("inspect.measure");
+    for layout in ["floating", "compact"] {
+        h.call("ui.set", json!({"layout": layout}));
+        let texts = painted_text(&mut h);
+        assert!(texts.contains(&"126.870°".into()), "{layout}: {texts:?}");
+        assert!(!texts.contains(&"53.130°".into()), "the supplementary angle must not replace the corner: {texts:?}");
+    }
+}
+
+#[test]
 fn measurement_axis_distances_follow_the_upstream_centre_min_and_max_choices() {
     let mut h = Harness::new();
     h.app.home.open = false;
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.app.ui.show_browser = false;
     h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
     let mut items = Vec::new();
     for (center, radius) in [([0, 0], 3), ([30, 40], 5)] {
         let made = h.app.run("sketch.circle.center", json!({"center":center,"radius":radius})).unwrap();
-        items.push(Sel::SketchCurve { id: made["curves"][0].as_str().unwrap().into() });
+        items.push(Sel::SketchCurve { id: made["curves"][0].as_str().unwrap().into(), sketch: None });
     }
     h.app.session.selection = items;
     h.app.start("inspect.measure");
@@ -161,4 +177,74 @@ fn measurement_axis_distances_can_be_disabled_saved_and_restored_in_preferences(
     h.call("ui.prefs", json!({"measure_axis_distances":false}));
     h.call("ui.prefs", json!({"button":"cancel"}));
     assert!(h.app.preferences.measure_axis_distances, "Cancel restores the last Apply");
+}
+
+#[test]
+fn the_distance_row_has_a_copy_button_that_copies_the_shown_value() {
+    let mut h = vertex_measurement([0., 0., 0.], [3., 4., 0.]);
+    h.frames(4);
+    let want = crate::prefs::show_mm(&h.app, 5.0, 1);
+    assert!(crate::scenario::handle_at("measure:copy:distance").is_some(), "the Distance row publishes its copy button");
+    let at = crate::scenario::handle_at("measure:copy:distance").unwrap_or_default();
+    let (hover, _) = crate::control::ControlRequest::new("ui.move", json!({"x": f64::from(at.x), "y": f64::from(at.y)}));
+    crate::control::handle(&mut h.app, &h.ctx, &hover);
+    h.frames(2);
+    let (request, _reply) = crate::control::ControlRequest::new("ui.click", json!({"x": f64::from(at.x), "y": f64::from(at.y)}));
+    crate::control::handle(&mut h.app, &h.ctx, &request);
+    let mut copied = Vec::new();
+    for _ in 0..8 {
+        h.frame();
+        copied.extend(h.output.commands.iter().filter_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        }));
+    }
+    assert_eq!(copied, [want]);
+}
+
+/// STL outlines are real distances even though they are not B-rep operands.
+#[test]
+fn measure_imported_stl_edges_and_vertices_from_viewport_clicks() {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.set_origin_shown(false);
+    h.app.ui.show_browser = false;
+    let path = h.dir.join("measure.stl");
+    h.app.run("solid.box", json!({"length":20,"width":30,"height":10})).unwrap();
+    h.app.run("file.save_mesh", json!({"path":path})).unwrap();
+    h.app.run("file.new", json!({})).unwrap();
+    let imported = h.app.run("file.insert_mesh", json!({"path":path})).unwrap();
+    h.app.run("component.activate", json!({"component":"root"})).unwrap();
+    h.app.run("occurrence.copy", json!({"component":imported["component"],"translate":[40,0,0]})).unwrap();
+    h.call("ui.view", json!({"view":"iso"}));
+    h.call("ui.view", json!({"view":"fit"}));
+    h.frames(4);
+
+    for offset in [0., 40.] {
+        h.app.start("inspect.measure");
+        h.step(&json!({"click":{"world":[offset + 20.,0,5]}})).unwrap();
+        assert!(
+            matches!(h.app.dialog.as_ref().unwrap().inputs[0].items.as_slice(), [Sel::Edge { .. }]),
+            "must select the outline, not the whole STL face"
+        );
+        assert_eq!(result(&h)["items"][0]["type"], "edge");
+        assert!((result(&h)["items"][0]["length_mm"].as_f64().unwrap() - 10.).abs() < 1e-6);
+        let texts = painted_text(&mut h);
+        assert!(texts.iter().any(|text| text.contains("10.00 mm")), "{texts:?}");
+        h.step(&json!({"click":{"world":[offset,0,5]}})).unwrap();
+        assert!(h.app.dialog.as_ref().unwrap().inputs[0].items.iter().all(|s| matches!(s, Sel::Edge { .. })));
+        assert!((result(&h)["distance_mm"].as_f64().unwrap() - 20.).abs() < 1e-6);
+        assert!(result(&h)["angle_deg"].as_f64().unwrap().abs() < 1e-6);
+        h.call("ui.key", json!({"key":"Escape"}));
+        h.app.session.selection.clear();
+        h.app.start("inspect.measure");
+        for x in [offset, offset + 20.] {
+            h.step(&json!({"click":{"world":[x,0,10]}})).unwrap();
+        }
+        assert!(h.app.dialog.as_ref().unwrap().inputs[0].items.iter().all(|s| matches!(s, Sel::Vertex { .. })));
+        assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 2);
+        assert!((result(&h)["distance_mm"].as_f64().unwrap() - 20.).abs() < 1e-6);
+        h.call("ui.key", json!({"key":"Escape"}));
+        h.app.session.selection.clear();
+    }
 }

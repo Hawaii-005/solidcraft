@@ -26,6 +26,18 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("sketch?: id|name (default active); path?: file to write (else the DXF text is returned)"),
 ];
 
+/// The sketch import command for a drawing file name, regardless of extension case.
+pub fn drawing_import_command(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("dxf") {
+        Some("sketch.insert_dxf")
+    } else if ext.eq_ignore_ascii_case("svg") {
+        Some("sketch.insert_svg")
+    } else {
+        None
+    }
+}
+
 fn source_text(p: &Value, cmd: &str) -> Result<String> {
     if let Some(t) = str_(p, "text") {
         if t.len() > MAX_DRAWING_BYTES {
@@ -236,6 +248,20 @@ mod tests {
             let r = s.execute("sketch.insert_dxf", &json!({"text": gappy, "tolerance": tol})).unwrap();
             let ss = s.model.state().sketch(r["sketch"].as_u64().unwrap()).unwrap().clone();
             assert_eq!(ss.profiles.len(), n, "tolerance {tol}");
+            s.execute("sketch.finish", &json!({})).unwrap();
+        }
+    }
+
+    /// A degree-9 SPLINE (solidcraft#5269) with fewer control points than its degree needs still
+    /// comes in as one spline over all its points, which the sketch draws at the degree they allow.
+    #[test]
+    fn a_degree_nine_spline_with_few_control_points_comes_in_whole() {
+        let mut s = Session::default();
+        for n in 2..=10 {
+            let points: String = (0..n).map(|i| format!("10\n{i}\n20\n{}\n", i % 2)).collect();
+            let dxf = format!("0\nSECTION\n2\nENTITIES\n0\nSPLINE\n71\n9\n{points}0\nENDSEC\n0\nEOF\n");
+            let r = s.execute("sketch.insert_dxf", &json!({"text": dxf})).unwrap();
+            assert_eq!(r["curves"], 1, "{n} points: {r}");
             s.execute("sketch.finish", &json!({})).unwrap();
         }
     }

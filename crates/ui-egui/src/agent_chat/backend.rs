@@ -10,6 +10,22 @@ use serde_json::Value;
 
 pub use super::acp::{AuthMethod, PermissionOption, ToolStatus};
 
+/// A connection test keeps authentication failures distinct from transport or protocol errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestError {
+    AuthRequired,
+    Other(String),
+}
+
+impl TestError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::AuthRequired => crate::i18n::tr("ui.agent_chat_state_auth"),
+            Self::Other(message) => message,
+        }
+    }
+}
+
 /// One part of a message to the agent.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PromptPart {
@@ -34,6 +50,8 @@ pub enum PromptPart {
 pub enum Event {
     /// Whether the agent takes documents (PDFs) in a message; sent before [`Event::Ready`].
     Documents(bool),
+    /// Whether SolidCraft tools were offered by the backend.
+    ToolsAvailable(bool),
     /// Ready for a message. `agent`: its name and version; `images`: it takes pictures.
     Ready { agent: String, images: bool },
     /// Text it streams (`thought`: its reasoning, shown dimmed).
@@ -92,6 +110,8 @@ pub trait ChatBackend {
     fn set_model(&mut self, _model: &str) {}
     /// Switch to one of the modes it reported in [`Event::Modes`].
     fn set_mode(&mut self, _mode: &str) {}
+    /// An endpoint's new request timeout, in seconds, from the next request on.
+    fn set_request_timeout(&mut self, _secs: u64) {}
     /// Its process, for status and tests.
     fn pid(&self) -> Option<u32> {
         None

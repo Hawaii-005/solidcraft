@@ -61,8 +61,8 @@ pub struct Section {
 }
 
 /// Parameters and Configurations stay on every design tab they were on before the ribbon
-/// redesign (MODEL and SHEET METAL), on SKETCH while editing a sketch, and in MANAGE, their
-/// canonical home.
+/// redesign (MODEL and SHEET METAL), on SKETCH while editing a sketch, on WELDMENTS, and in
+/// MANAGE, their canonical home.
 const CONFIGURE: &[&str] = &["parameters.change", "config.table", "config.configure"];
 
 /// Commands that stay for agents, MCP and scripts but are not offered to people: the sketch solves
@@ -246,26 +246,103 @@ pub const SECTIONS: &[Section] = &[
     },
     // Sketch dimensions are driven by parameters, so they are one click away while sketching.
     Section { tab: "SKETCH", panel: "CONFIGURE", promoted: 2, ids: CONFIGURE },
-    Section { tab: "SKETCH", panel: "FINISH SKETCH", promoted: 1, ids: &["sketch.finish"] },
+    Section { tab: "SKETCH", panel: "FINISH SKETCH", promoted: 2, ids: &["sketch.finish", "sketch.cancel"] },
     // New Sketch leads the tab, as on MODEL: a sheet part starts from a sketch (#3250).
     Section { tab: "SHEET METAL", panel: "SKETCH", promoted: 1, ids: &["sketch.create"] },
     Section {
         tab: "SHEET METAL",
         panel: "CREATE",
         promoted: 4,
-        ids: &["sheet.flange", "sheet.hem", "sheet.fold", "sheet.perforate", "sheet.convert"],
+        ids: &["sheet.flange", "sheet.path_flange", "sheet.hem", "sheet.fold", "sheet.perforate", "sheet.convert"],
     },
     Section { tab: "SHEET METAL", panel: "FLAT", promoted: 3, ids: &["sheet.unfold", "sheet.refold", "sheet.flat_pattern"] },
     Section { tab: "SHEET METAL", panel: "OUTPUT", promoted: 2, ids: &["sheet.export_dxf", "sheet.export_bend_table"] },
     Section { tab: "SHEET METAL", panel: "RULES", promoted: 1, ids: &["sheet.manage_rules"] },
     Section { tab: "SHEET METAL", panel: "CONFIGURE", promoted: 2, ids: CONFIGURE },
-    Section { tab: "RENDER", panel: "SCENE", promoted: 2, ids: &["render.scene"] },
-    Section { tab: "RENDER", panel: "IMAGE", promoted: 1, ids: &["render.start"] },
+    // A frame starts from a sketch of its lines; its profile sizes are often parameters.
+    Section { tab: "WELDMENTS", panel: "SKETCH", promoted: 1, ids: &["sketch.create"] },
+    Section { tab: "WELDMENTS", panel: "CREATE", promoted: 1, ids: &["frame.member"] },
+    Section { tab: "WELDMENTS", panel: "CONFIGURE", promoted: 2, ids: CONFIGURE },
+    // One Render tab with task-ordered groups; only implemented registry commands.
+    // The shared ribbon owns pins, search, section menus and responsive overflow.
+    Section {
+        tab: "RENDER",
+        panel: "SCENE",
+        promoted: 2,
+        ids: &[
+            "render.preset.resolve",
+            "render.settings.get",
+            "render.scene",
+            "render.preset.apply",
+            "render.settings.set",
+            "render.shot.duplicate",
+            "render.shot.rename",
+            "render.shot.remove",
+        ],
+    },
+    Section {
+        tab: "RENDER",
+        panel: "APPEARANCE",
+        promoted: 3,
+        ids: &[
+            "render.library.appearance.apply",
+            "render.library.surface.bind",
+            "render.aging.describe",
+            "render.library.surface.prepare",
+            "render.library.surface.unbind",
+            "render.library.physical.prepare",
+        ],
+    },
+    Section { tab: "RENDER", panel: "LIGHTING", promoted: 2, ids: &["render.library.studio.prepare", "render.library.studio.apply"] },
+    Section {
+        tab: "RENDER",
+        panel: "ENVIRONMENT",
+        promoted: 2,
+        ids: &[
+            "render.library.environment.apply",
+            "render.stage.backdrop",
+            "render.stage.ground",
+            "render.stage.clear",
+            "render.hdr.inspect",
+            "render.settings.capture_hdr",
+        ],
+    },
+    Section { tab: "RENDER", panel: "CAMERA", promoted: 2, ids: &["render.camera.get", "render.camera.fit", "render.settings.apply"] },
+    Section {
+        tab: "RENDER",
+        panel: "IMAGE",
+        promoted: 3,
+        ids: &[
+            "render.start",
+            "render.preflight",
+            "render.effects.describe",
+            "render.cancel",
+            "render.export",
+            "render.result.regrade",
+            "render.quality.prepare",
+            "render.status",
+            "render.backends",
+        ],
+    },
 ];
 
 /// Compact source labels for painted big buttons only. Menus, search and tooltips
 /// retain the engine label. Route these through `tr_label`, like other UI labels.
 pub const RIBBON_LABELS: &[(&str, &str)] = &[
+    ("render.aging.describe", "Aging"),
+    ("render.effects.describe", "Effects"),
+    ("render.camera.fit", "Frame"),
+    ("render.camera.get", "Camera"),
+    ("render.preset.resolve", "Studios"),
+    ("render.settings.get", "Shots"),
+    ("render.library.appearance.apply", "Materials"),
+    ("render.library.surface.bind", "Surface Maps"),
+    ("render.library.studio.prepare", "Light Rigs"),
+    ("render.library.studio.apply", "Edit Lights"),
+    ("render.library.environment.apply", "HDR Library"),
+    ("render.stage.backdrop", "Backgrounds"),
+    ("render.settings.apply", "Saved Camera"),
+    ("render.preflight", "Check"),
     ("appearance.assign", "Appearance"),
     ("component.capture_position", "Capture Pos."),
     ("component.create", "New Comp."),
@@ -301,6 +378,8 @@ pub const RIBBON_LABELS: &[(&str, &str)] = &[
     ("sheet.export_dxf", "Export DXF"),
     ("sheet.flat_pattern", "Flat Pattern"),
     ("sheet.manage_rules", "Sheet Rules"),
+    ("sheet.path_flange", "Path"),
+    ("sketch.cancel", "Cancel"),
     ("sketch.circle.center", "Circle"),
     ("sketch.constraint.coincident", "Coincident"),
     ("sketch.constraint.horizontal_vertical", "Horiz./Vert."),
@@ -346,6 +425,7 @@ pub const PLACEMENTS: &[(&str, &str, &str, &str)] = &[
     ("SKETCH", "FINISH SKETCH", "SKETCH", "FINISH SKETCH"),
     ("SHEET METAL", "CREATE", "SHEET METAL", "CREATE"),
     ("SHEET METAL", "MODIFY", "SHEET METAL", "FLAT"),
+    ("WELDMENTS", "CREATE", "WELDMENTS", "CREATE"),
     ("PLASTIC", "CREATE", "MODEL", "CREATE"),
     ("PLASTIC", "SETUP", "MANAGE", "RULES"),
     ("MESH", "MODIFY", "INSERT", "FILES"),
@@ -414,6 +494,7 @@ pub fn feature_icon(k: &FeatureKind) -> Option<&'static str> {
         FeatureKind::SheetBase { .. } | FeatureKind::SheetContour { .. } | FeatureKind::SheetFlange { .. } => "flange",
         FeatureKind::SheetHem { .. } => "hem",
         FeatureKind::SheetFold { .. } => "fold",
+        FeatureKind::SheetPath { .. } => "path_flange",
         FeatureKind::SheetUnfold { refold: false, .. } => "unfold",
         FeatureKind::SheetUnfold { .. } => "refold",
         FeatureKind::SheetConvert { .. } => "convert_sheet",
@@ -428,19 +509,33 @@ pub fn feature_icon(k: &FeatureKind) -> Option<&'static str> {
 }
 
 /// Selected geometry identifies the active body; without a body selection use the last body
-/// of the active component, matching feature dialogs. Rules on unrelated bodies do not count.
-pub fn sheet_body(app: &crate::SolveApp) -> Option<String> {
+/// of the active component, matching feature dialogs.
+fn active_body<'a>(app: &'a crate::SolveApp, state: &'a solidcraft_engine::doc::ModelState) -> Option<&'a str> {
     use solidcraft_engine::Sel;
-    let state = app.session.model.state();
     let selected = app.session.selection.iter().find_map(|s| match s {
         Sel::Body { name } => Some(name.as_str()),
         Sel::Face { body, .. } | Sel::Edge { body, .. } => Some(body.as_str()),
         _ => None,
     });
-    let body = selected.or_else(|| {
+    selected.or_else(|| {
         state.bodies.iter().rev().find(|b| app.session.doc.model_body_component(b) == app.session.active_component).map(|b| b.name.as_str())
-    })?;
+    })
+}
+
+/// The active body when it is sheet metal. Rules on unrelated bodies do not count.
+pub fn sheet_body(app: &crate::SolveApp) -> Option<String> {
+    let state = app.session.model.state();
+    let body = active_body(app, &state)?;
     state.sheets.iter().find(|s| s.body == body).map(|s| s.body.clone())
+}
+
+/// The active body when a Frame Member feature made it.
+pub fn frame_body(app: &crate::SolveApp) -> Option<String> {
+    let state = app.session.model.state();
+    let name = active_body(app, &state)?;
+    let body = state.bodies.iter().find(|b| b.name == name)?;
+    let made_by = app.session.doc.feature(body.feature)?;
+    matches!(made_by.kind, FeatureKind::FrameMember { .. }).then(|| body.name.clone())
 }
 
 pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
@@ -452,21 +547,46 @@ pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
         tabs.push("SKETCH");
     }
     // Always reachable, as before the ribbon redesign: a sheet-metal part starts from an
-    // ordinary sketch or solid, so the tab cannot wait for a sheet body.
+    // ordinary sketch or solid, so the tab cannot wait for a sheet body. A frame starts
+    // from a sketch of its lines, so Weldments is always there too.
     tabs.push("SHEET METAL");
+    tabs.push("WELDMENTS");
     tabs
 }
 
-/// Select contextual tabs on entry (or a different sheet body), allowing the other tabs to
-/// remain usable for the rest of that context. Sketch takes precedence over sheet metal.
+/// Select contextual tabs on entry (or a different sheet body or frame member), allowing the
+/// other tabs to remain usable for the rest of that context. Sketch takes precedence over sheet
+/// metal, and sheet metal over weldments.
 pub fn sync_context(app: &mut crate::SolveApp) {
     if crate::render_workspace::active(app) {
         return;
     }
-    let context = app.session.active_sketch.map(|id| format!("sketch:{id}")).or_else(|| sheet_body(app).map(|body| format!("sheet:{body}")));
+    let context = app
+        .session
+        .active_sketch
+        .map(|id| format!("sketch:{id}"))
+        .or_else(|| sheet_body(app).map(|body| format!("sheet:{body}")))
+        .or_else(|| frame_body(app).map(|body| format!("frame:{body}")));
     if app.ui.ribbon_context != context {
+        let was_sketch = app.ui.ribbon_context.as_deref().is_some_and(|c| c.starts_with("sketch:"));
+        let back = if app.session.active_sketch.is_some() {
+            // Remember the tab the sketch was started from (#3250).
+            if !was_sketch && app.ui.tab != "SKETCH" {
+                app.ui.sketch_return_tab = Some(app.ui.tab.clone());
+            }
+            None
+        } else if was_sketch {
+            app.ui.sketch_return_tab.take()
+        } else {
+            None
+        };
         app.ui.tab = if app.session.active_sketch.is_some() {
             "SKETCH"
+        } else if let Some(back) = back.as_deref().filter(|t| *t != "SKETCH" && visible_tabs(app).contains(t)) {
+            // Finishing a sketch goes back to the tab it came from (#3250).
+            visible_tabs(app).into_iter().find(|t| t == &back).unwrap_or("MODEL")
+        } else if context.as_deref().is_some_and(|c| c.starts_with("frame:")) {
+            "WELDMENTS"
         } else if context.is_some() {
             "SHEET METAL"
         } else {
@@ -578,7 +698,8 @@ mod tests {
     #[test]
     fn promoted_long_labels_have_compact_ribbon_names() {
         let specs = solidcraft_engine::command_specs();
-        let english: std::collections::BTreeMap<String, String> = serde_json::from_str(include_str!("../../../assets/locales/en.json")).unwrap();
+        let english: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/locales/en.json"))).unwrap();
         for section in SECTIONS {
             let (commands, count) = layout(section.tab, section.panel, &specs).unwrap();
             for command in commands.iter().take(count) {
@@ -643,12 +764,25 @@ mod tests {
         }
     }
 
+    /// The ribbon redesign (#2176) removed the MESH and UTILITIES tabs. A command that still
+    /// declares one is advertised at a place the ribbon cannot show, because the generated command
+    /// inventory prints the placement a spec declares (#133).
+    #[test]
+    fn no_command_is_advertised_at_a_tab_the_ribbon_removed() {
+        for c in solidcraft_engine::command_specs() {
+            assert!(!matches!(c.tab, "MESH" | "UTILITIES"), "{} declares the removed {} tab", c.id, c.tab);
+        }
+        let spec = solidcraft_engine::find_command("file.save_mesh").expect("file.save_mesh is registered");
+        assert_eq!((spec.tab, spec.panel), ("INSERT", "FILES"), "Save As Mesh declares the panel that shows it");
+        assert_eq!(destination(spec), Some(("INSERT", "FILES")));
+    }
+
     #[test]
     fn contextual_tabs_follow_the_active_body_and_allow_other_tabs() {
         let mut h = crate::scenario::Harness::new();
         let mut fresh = TABS.to_vec();
-        fresh.push("SHEET METAL");
-        assert_eq!(visible_tabs(&h.app), fresh, "SHEET METAL is reachable before any sheet body exists");
+        fresh.extend(["SHEET METAL", "WELDMENTS"]);
+        assert_eq!(visible_tabs(&h.app), fresh, "SHEET METAL and WELDMENTS are reachable before any sheet body or member exists");
         h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
         assert_eq!(h.app.ui.tab, "SKETCH");
         h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]})).unwrap();
@@ -673,6 +807,50 @@ mod tests {
         h.app.run("select.set", json!({"items":[{"type":"body","name":"Sheet"}]})).unwrap();
         sync_context(&mut h.app);
         assert_eq!(h.app.ui.tab, "SHEET METAL");
+    }
+
+    /// Weldments is there in a fresh document (a frame starts from a sketch of its lines), holds
+    /// Frame Member, and selects itself while a member is the active body, as Sheet Metal does for
+    /// a sheet body, but keeps the ordinary tab look.
+    #[test]
+    fn weldments_tab_holds_frame_member_and_follows_a_member_body() {
+        let specs = solidcraft_engine::command_specs();
+        assert_eq!(panels("WELDMENTS"), ["SKETCH", "CREATE", "CONFIGURE"]);
+        let (create, n) = layout("WELDMENTS", "CREATE", &specs).unwrap();
+        assert_eq!(create.iter().take(n).map(|c| c.id).collect::<Vec<_>>(), ["frame.member"]);
+        assert!(!panel_ids("MODEL", &specs).contains(&"frame.member"), "Frame Member's home is Weldments");
+
+        let mut h = crate::scenario::Harness::new();
+        h.step(&json!({"click":{"handle":"tab:WELDMENTS"}})).unwrap();
+        h.frames(2);
+        assert_eq!(h.app.ui.tab, "WELDMENTS");
+        for id in ["sketch.create", "frame.member", "parameters.change"] {
+            assert!(crate::scenario::handle_at(&format!("button:{id}")).is_some(), "{id} is a button on the Weldments tab");
+        }
+        h.step(&json!({"click":{"handle":"button:frame.member"}})).unwrap();
+        assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::Frame(_))));
+        assert_eq!(h.app.ui.tab, "WELDMENTS", "Frame Member opens from the tab without leaving it");
+        h.step(&json!({"key":"Escape"})).unwrap();
+
+        h.app.run("sketch.create", json!({"plane":"XZ", "name":"Frame"})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[600,400]})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        h.app.run("solid.box", json!({"body_name":"Plate", "operation":"new", "length":100, "width":100, "height":10})).unwrap();
+        assert!(frame_body(&h.app).is_none(), "a plain solid is not a member");
+        h.app.ui.tab = "INSPECT".into();
+        let tube = json!({"kind":"rect_tube", "width":40, "height":40, "wall":3});
+        h.app.run("frame.member", json!({"sketch":"Frame", "profile":tube, "body_name":"Rail"})).unwrap();
+        assert_eq!(frame_body(&h.app).as_deref(), Some("Rail (4)"));
+        assert_eq!(h.app.ui.tab, "WELDMENTS", "a new member selects the tab");
+        assert!(!crate::toolbar::contextual_tab(&h.app, "WELDMENTS"), "selected on a member, it keeps the ordinary tab look");
+
+        h.app.run("select.set", json!({"items":[{"type":"body","name":"Plate"}]})).unwrap();
+        sync_context(&mut h.app);
+        assert!(frame_body(&h.app).is_none());
+        assert!(visible_tabs(&h.app).contains(&"WELDMENTS"), "the tab stays reachable off a member");
+        h.app.run("select.set", json!({"items":[{"type":"body","name":"Rail (2)"}]})).unwrap();
+        sync_context(&mut h.app);
+        assert_eq!(h.app.ui.tab, "WELDMENTS");
     }
 
     /// Parameters and Configurations are on the design tabs they were on before the redesign, and a
@@ -857,11 +1035,10 @@ mod tests {
 
     /// Every way into a sketch (New Sketch on the ribbon then a plane, a double-click in the
     /// timeline or the browser, Edit Sketch in the browser's menu) opens the SKETCH tab and looks
-    /// at the sketch; Finish Sketch (palette or ribbon) lands on MODEL with the earlier view back
+    /// at the sketch; Finish Sketch (palette or ribbon) lands on MODEL with the view left where it is
     /// and the sketch still listed, as before the ribbon redesign.
     #[test]
     fn entering_and_finishing_a_sketch_keeps_the_tab_view_and_history() {
-        let iso = json!({"camera": {"yaw_deg": -45, "pitch_deg": 35}});
         let top = json!({"camera": {"yaw_deg": 0, "pitch_deg": 90}});
         let expect = |h: &mut crate::scenario::Harness, e: &serde_json::Value, what: &str| {
             h.frames(3);
@@ -877,7 +1054,7 @@ mod tests {
         h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]})).unwrap();
         h.step(&json!({"click": {"handle": "sketch_palette:finish"}})).unwrap();
         expect(&mut h, &json!({"sketching": false, "errors": 0}), "Finish");
-        expect(&mut h, &iso, "Finish puts the view back");
+        expect(&mut h, &top, "Finish leaves the view where it is");
         assert_eq!(h.app.ui.tab, "MODEL");
         assert!(crate::scenario::handle_at("timeline:Sketch1").is_some() && crate::scenario::handle_at("row:Sketch1").is_some());
 
@@ -899,7 +1076,7 @@ mod tests {
             assert_eq!(h.app.ui.tab, "SKETCH", "{how}");
             h.step(&json!({"click": {"handle": "button:sketch.finish"}})).unwrap();
             expect(&mut h, &json!({"sketching": false}), how);
-            expect(&mut h, &iso, how);
+            expect(&mut h, &top, how);
             assert_eq!(h.app.ui.tab, "MODEL", "{how}");
         }
     }

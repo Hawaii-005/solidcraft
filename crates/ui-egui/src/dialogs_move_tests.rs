@@ -13,7 +13,7 @@ fn move_dialog(mode: usize) -> Dialog {
     let mut app = SolveApp::new(s, Services::default());
     app.start("solid.move");
     let mut d = app.dialog.clone().unwrap();
-    d.kind = kind(mode);
+    d.kind = kind(mode, &app.session.doc);
     d.inputs = inputs(mode);
     if let Some(inp) = d.inputs.first_mut() {
         inp.items = vec![Sel::Body { name: "Body1".into() }];
@@ -54,8 +54,105 @@ fn the_main_value_writes_through_to_the_command() {
     assert_eq!((x.as_str(), y.as_str(), z.as_str()), ("30 mm", "0 mm", "0 mm"), "the box edits X alone");
 }
 
-/// Free Move and Translate carry the triad. The other three have no manipulator yet, so their
-/// value box is the only way to drive them: it must still have somewhere to sit.
+/// #6822: Rotate must offer a draggable handle after the body and axis are picked.
+#[test]
+fn rotate_handle_updates_the_angle_without_moving_the_camera() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.preferences.nav = "openscad".into();
+    h.app.run("solid.box", json!({"length": 20, "width": 30, "height": 10})).unwrap();
+    h.step(&json!({"call": "ui.view", "params": {"view": "top"}})).unwrap();
+    h.app.cam.distance = 180.0;
+    h.app.start("solid.move");
+    {
+        let d = h.app.dialog.as_mut().unwrap();
+        d.kind = kind(ROTATE, &h.app.session.doc);
+        d.inputs = inputs(ROTATE);
+        d.inputs[0].items = vec![Sel::Body { name: "Body1".into() }];
+        d.inputs[1].items = vec![Sel::Axis { name: "Z".into() }];
+    }
+    h.frames(5);
+    let before = serde_json::to_value(&*h.app.session.doc).unwrap();
+    let camera = h.app.cam;
+    let start = h.at(&json!({"handle": "move_rotate"})).unwrap();
+    let centre = h.at(&json!({"world": [0, 0, 5]})).unwrap();
+    // A quarter turn clockwise in the top view is -90 degrees about +Z.
+    let end = [centre[0] - (start[1] - centre[1]), centre[1] + (start[0] - centre[0])];
+    h.step(&json!({"drag": [start, end], "steps": 12})).unwrap();
+    let d = h.app.dialog.as_ref().unwrap();
+    let p = params(&h.app, d).unwrap();
+    assert_eq!(p["angle"], "-90 deg");
+    assert_eq!(p["axis"], json!([0.0, 0.0, 1.0]));
+    assert_eq!(h.app.cam, camera, "the handle owns the drag");
+    assert_eq!(serde_json::to_value(&*h.app.session.doc).unwrap(), before, "a preview does not commit the move");
+    h.step(&json!({"key": "Enter"})).unwrap();
+    h.settle();
+    assert!(h.app.dialog.is_none());
+    let bounds = h.app.session.model.state().body("Body1").unwrap().mesh().bounds();
+    assert!((bounds.min - Vec3::new(0.0, -20.0, 0.0)).len() < 1e-6, "{bounds:?}");
+    assert!((bounds.max - Vec3::new(30.0, 0.0, 10.0)).len() < 1e-6, "{bounds:?}");
+    h.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(serde_json::to_value(&*h.app.session.doc).unwrap(), before);
+}
+
+#[test]
+fn rotate_handle_follows_an_offset_axis_and_preserves_full_turns() {
+    for (direction, initial, expected, free) in [(Vec3::new(1.0, 1.0, 1.0), "720 deg", 755.0, false), (-Vec3::Z, "", 37.3, true)] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length": 20, "width": 30, "height": 10})).unwrap();
+        let origin = Vec3::new(5.0, 7.0, 9.0);
+        let end = origin + direction;
+        h.app
+            .run(
+                "construct.axis.two_points",
+                json!({"a": {"point": [origin.x, origin.y, origin.z]}, "b": {"point": [end.x, end.y, end.z]}, "name": "TurnAxis"}),
+            )
+            .unwrap();
+        h.app.cam = h.app.cam.looking_from(direction);
+        h.app.cam.distance = 180.0;
+        h.app.start("solid.move");
+        {
+            let d = h.app.dialog.as_mut().unwrap();
+            d.kind = kind(ROTATE, &h.app.session.doc);
+            d.inputs = inputs(ROTATE);
+            d.inputs[0].items = vec![Sel::Body { name: "Body1".into() }];
+        }
+        h.frames(3);
+        assert!(crate::scenario::handle_at("move_rotate").is_none(), "an axis must be selected first");
+        {
+            let d = h.app.dialog.as_mut().unwrap();
+            d.inputs[1].items = vec![Sel::Axis { name: "TurnAxis".into() }];
+            if let Kind::Move { angle, .. } = &mut d.kind {
+                *angle = initial.into();
+            }
+        }
+        h.frames(3);
+        let before = serde_json::to_value(&*h.app.session.doc).unwrap();
+        let d = h.app.dialog.as_ref().unwrap();
+        let (centre, axis) = rotation_axis(&h.app, d).unwrap();
+        assert!((centre - origin).cross(direction).len() < 1e-9);
+        assert!((axis - direction.normalized().unwrap()).len() < 1e-9);
+        let proj = crate::viewport::projection(&h.app, h.app.viewport.rect.unwrap());
+        let radius = crate::gizmo::ring_radius(&proj, centre).unwrap();
+        let e1 = axis.any_perp();
+        let e2 = axis.cross(e1);
+        let th = 37.3_f64.to_radians();
+        let target = centre + (e1 * th.cos() + e2 * th.sin()) * radius;
+        h.step(&json!({"drag": [{"handle": "move_rotate"}, {"world": [target.x, target.y, target.z]}], "ctrl": free, "steps": 12})).unwrap();
+        let d = h.app.dialog.as_ref().unwrap();
+        let p = params(&h.app, d).unwrap();
+        let actual = ang(&h.app, p["angle"].as_str().unwrap()).unwrap();
+        assert!((actual.to_degrees() - expected).abs() < 0.11, "{p}");
+        let translation: [String; 3] = serde_json::from_value(p["translate"].clone()).unwrap();
+        let translation = translation.map(|v| len(&h.app, &v).unwrap());
+        let moved_origin = gizmo::apply(&gizmo::rotation(axis, actual), origin) + Vec3::new(translation[0], translation[1], translation[2]);
+        assert!((moved_origin - origin).len() < 1e-5, "the selected axis stays fixed");
+        h.step(&json!({"widget": "Cancel"})).unwrap();
+        assert_eq!(serde_json::to_value(&*h.app.session.doc).unwrap(), before);
+    }
+}
+
+/// Free Move and Translate carry the triad. The other modes still need a place for their value
+/// box before enough geometry is picked to draw a handle.
 #[test]
 fn every_move_type_has_somewhere_to_put_its_value_box() {
     let mut s = Session::default();
@@ -75,7 +172,7 @@ fn every_move_type_has_somewhere_to_put_its_value_box() {
 #[test]
 fn point_to_point_takes_the_origin_point() {
     let mut h = crate::scenario::Harness::new();
-    h.app.ui.show_origin = true;
+    h.app.set_origin_shown(true);
     h.app.run("solid.box", json!({"length": 20, "width": 20, "height": 20})).unwrap();
     h.app.run("solid.move", json!({"bodies": ["Body1"], "translate": ["30 mm", "20 mm", "0 mm"]})).unwrap();
     h.app.cam.distance = 200.0;
@@ -84,7 +181,7 @@ fn point_to_point_takes_the_origin_point() {
     h.app.start("solid.move");
     {
         let d = h.app.dialog.as_mut().unwrap();
-        d.kind = kind(POINT_TO_POINT);
+        d.kind = kind(POINT_TO_POINT, &h.app.session.doc);
         d.inputs = inputs(POINT_TO_POINT);
         d.inputs[0].items = vec![Sel::Body { name: "Body1".into() }];
         d.active = 1;
@@ -98,4 +195,181 @@ fn point_to_point_takes_the_origin_point() {
     assert_eq!(d.inputs[2].items, vec![Sel::Vertex { body: String::new(), point: Vec3::ZERO }], "the origin is the To point");
     let p = params(&h.app, &d).unwrap();
     assert_eq!(p["translate"], json!([mm(-hi.x), mm(-hi.y), mm(-hi.z)]), "the corner goes onto the origin");
+}
+
+/// #4776: the box shows the value of the handle dragged: the distance along the Y arrow after
+/// dragging it, the angle of a ring after turning it; typing then edits that value.
+#[test]
+fn the_box_shows_the_dragged_axis() {
+    let mut s = Session::default();
+    s.execute("solid.box", &json!({"length": 20, "width": 20, "height": 20})).unwrap();
+    let app = SolveApp::new(s, Services::default());
+    let mut d = move_dialog(FREE);
+    let g = |handle, change| crate::gizmo::Drag { handle, change, started: true, done: true };
+    drag(&app, &mut d, g(crate::gizmo::Handle::Axis(1), Change::Translate(Vec3::new(0.0, 5.0, 0.0))));
+    let (label, kind, value) = d.primary().unwrap();
+    assert_eq!((label, kind, value.as_str()), ("Y", ValueKind::Length, "5 mm"));
+    *value = "7 mm".into();
+    let Kind::Move { x, y, .. } = &d.kind else { panic!("not a move") };
+    assert_eq!((x.as_str(), y.as_str()), ("0 mm", "7 mm"), "typing edits Y");
+    drag(&app, &mut d, g(crate::gizmo::Handle::Ring(2), Change::Rotate { axis: 2, angle: 0.5 }));
+    assert_eq!(d.primary().map(|p| (p.0, p.1)), Some(("Z Angle", ValueKind::Angle)));
+    // Translate has no rings: a ring index past its values leaves the box on a distance.
+    let mut t = move_dialog(TRANSLATE);
+    drag(&app, &mut t, g(crate::gizmo::Handle::Axis(2), Change::Translate(Vec3::new(0.0, 0.0, 3.0))));
+    assert_eq!(t.primary().map(|p| p.0), Some("Z"));
+}
+
+/// #4776: Tab in the box goes to the next value (X, Y, Z, then the angles in Free Move) and
+/// Shift+Tab back, the keyboard staying in the box; Enter moves the body by what was typed.
+#[test]
+fn tab_in_the_box_goes_to_the_next_axis() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length": 20, "width": 20, "height": 20})).unwrap();
+    h.settle();
+    h.app.run("select.set", json!({"items": [Sel::Body { name: "Body1".into() }]})).unwrap();
+    h.app.start("solid.move");
+    h.frames(3);
+    assert_eq!(h.app.dialog.as_mut().and_then(|d| d.primary()).map(|p| p.0), Some("X"));
+    h.step(&json!({"key": "Tab"})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.dialog.as_mut().and_then(|d| d.primary()).map(|p| p.0), Some("Y"));
+    h.step(&json!({"key": "Tab"})).unwrap();
+    h.step(&json!({"key": "Tab", "shift": true})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.dialog.as_mut().and_then(|d| d.primary()).map(|p| p.0), Some("Y"), "Shift+Tab goes back");
+    h.step(&json!({"text": "12"})).unwrap();
+    h.frames(1);
+    h.step(&json!({"key": "Enter"})).unwrap();
+    h.settle();
+    let b = h.app.session.model.state().body("Body1").unwrap().mesh().bounds();
+    assert!((b.min.y - 12.0).abs() < 1e-6 && b.min.x.abs() < 1e-6, "moved along Y: {b:?}");
+}
+
+fn component_selection_fixture() -> crate::scenario::Harness {
+    let mut h = crate::scenario::Harness::new();
+    for (command, params) in [
+        ("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [-30, 0, 0], "body_name": "Outside"})),
+        ("component.create", json!({"name": "Part"})),
+        ("solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Inside"})),
+        ("component.create", json!({"name": "Child"})),
+        ("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [30, 0, 0], "body_name": "Nested"})),
+        ("component.activate", json!({"component": "root"})),
+        ("component.create", json!({"name": "Sibling"})),
+        ("solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [60, 0, 0], "body_name": "SiblingBody"})),
+        ("component.activate", json!({"component": "Part"})),
+    ] {
+        h.app.run(command, params).unwrap();
+    }
+    h.app.ui.show_browser = false;
+    h.app.ui.show_timeline = false;
+    h.app.set_origin_shown(false);
+    h.step(&json!({"call": "ui.view", "params": {"view": "top"}})).unwrap();
+    // Keep the selection rectangle to the right of the Move dialog.
+    h.step(&json!({"call": "ui.camera", "params": {"target": [0, 0, 0], "distance": 250}})).unwrap();
+    h
+}
+
+fn select_component_boxes(h: &mut crate::scenario::Harness, crossing: bool, add: bool) {
+    let ends = if crossing { [[75, -5, 0], [-35, 15, 0]] } else { [[-35, -5, 0], [75, 15, 0]] };
+    h.step(&json!({"drag": [{"world": ends[0]}, {"world": ends[1]}], "shift": add})).unwrap();
+}
+
+#[test]
+fn move_box_selection_stays_in_the_active_component_and_its_children() {
+    for crossing in [false, true] {
+        let mut h = component_selection_fixture();
+        h.app.start("solid.move");
+        h.settle();
+        for add in [false, true] {
+            select_component_boxes(&mut h, crossing, add);
+            let names = h.app.dialog.as_ref().unwrap().inputs[0].items.body_names();
+            assert_eq!(names, ["Inside", "Nested"], "crossing={crossing}, add={add}");
+        }
+    }
+}
+
+#[test]
+fn body_box_preselection_uses_component_scope_and_root_keeps_all_bodies() {
+    let mut h = component_selection_fixture();
+    select_component_boxes(&mut h, false, false);
+    assert_eq!(h.app.session.selection.body_names(), ["Inside", "Nested"]);
+    h.app.start("solid.move");
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.body_names(), ["Inside", "Nested"]);
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.app.run("component.activate", json!({"component": "root"})).unwrap();
+    h.app.run("select.clear", json!({})).unwrap();
+    h.app.start("solid.move");
+    h.settle();
+    select_component_boxes(&mut h, true, false);
+    assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.body_names(), ["Outside", "Inside", "SiblingBody", "Nested"]);
+}
+
+#[test]
+fn move_box_selection_uses_the_active_occurrence_path() {
+    let mut h = component_selection_fixture();
+    let part = h.app.session.active_component;
+    let second = h.app.run("occurrence.copy", json!({"component": part, "translate": [0, 30, 0]})).unwrap()["occurrence"].as_u64().unwrap();
+    h.app.run("component.activate", json!({"component": part, "occurrence": second, "path": [second]})).unwrap();
+    let mut expected = h.app.session.occurrence_bodies(&[second], true).unwrap();
+    expected.sort();
+    h.app.start("solid.move");
+    h.settle();
+    h.step(&json!({"drag": [{"world": [-35, -5, 0]}, {"world": [75, 45, 0]}]})).unwrap();
+    let mut names = h.app.dialog.as_ref().unwrap().inputs[0].items.body_names();
+    names.sort();
+    assert_eq!(names, expected, "only the active placement and its nested child are picked");
+}
+
+#[test]
+fn move_reference_box_selection_can_still_use_an_inactive_body() {
+    let mut h = component_selection_fixture();
+    h.app.start("solid.move");
+    {
+        let d = h.app.dialog.as_mut().unwrap();
+        d.kind = kind(ROTATE, &h.app.session.doc);
+        d.inputs = inputs(ROTATE);
+        d.inputs[0].items = vec![Sel::Body { name: "Inside".into() }];
+        d.active = 1;
+    }
+    h.settle();
+    h.step(&json!({"drag": [{"world": [-35, -5, 0]}, {"world": [-15, 15, 0]}]})).unwrap();
+    let axis = &h.app.dialog.as_ref().unwrap().inputs[1].items;
+    assert!(matches!(axis.as_slice(), [Sel::Edge { body, .. }] if body == "Outside"), "{axis:?}");
+}
+
+/// The triad and the command must agree even when Free Move precomputes a pivoted rotation.
+#[test]
+fn inch_move_lengths_agree_in_the_triad_and_every_numeric_move_route() {
+    for mode in [FREE, TRANSLATE, POINT_TO_POSITION] {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length":20,"width":20,"height":20})).unwrap();
+        s.execute("document.units", &json!({"units":"in"})).unwrap();
+        let mut app = SolveApp::new(s, Services::default());
+        let mut d = move_dialog(mode);
+        d.kind = kind(mode, &app.session.doc);
+        if let Kind::Move { x, y, z, rz, .. } = &mut d.kind {
+            *x = "0.25".into();
+            *y = "2 mm".into();
+            *z = "0".into();
+            if mode == FREE {
+                *rz = "90 deg".into();
+            }
+        }
+        if mode == POINT_TO_POSITION {
+            d.inputs[1].items = vec![Sel::Vertex { body: "Body1".into(), point: Vec3::new(10.0, 10.0, 10.0) }];
+        } else {
+            let center = triad(&app, &d).unwrap().center;
+            assert!(center.dist(Vec3::new(16.35, 12.0, 10.0)) < 1e-9, "{center:?}");
+        }
+        for (id, p) in crate::dialogs::apply_commands(&app, &d).unwrap() {
+            app.run(&id, p).unwrap();
+        }
+        let measured = app.session.execute("inspect.measure", &json!({})).unwrap();
+        let center: Vec<f64> = measured["bodies"][0]["center_of_mass"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        let expected = if mode == POINT_TO_POSITION { [6.35, 2.0, 0.0] } else { [16.35, 12.0, 10.0] };
+        for (got, expected) in center.into_iter().zip(expected) {
+            assert!((got - expected).abs() < 1e-6, "mode {mode}: {got}, expected {expected}");
+        }
+    }
 }

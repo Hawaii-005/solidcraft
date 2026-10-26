@@ -1,23 +1,10 @@
-//! Shared dock dragging, bounded anchors and tokenised surfaces for `ui_kit::Panel`,
-//! plus bounded floating windows for BOM, Messages and 3D mouse calibration.
+//! Dock dragging and bounded anchors. Outer hosts and surfaces live in `ui_kit::Container`.
 
-use egui::{Align2, Pos2, Ui, WidgetText, vec2};
+use egui::{Pos2, Ui};
 
 /// Width limits of a docked command dialog.
 pub const DIALOG_MIN_W: f32 = 260.0;
 pub const DIALOG_MAX_W: f32 = 380.0;
-/// Floating windows: prompts and panels, and those holding a table (Parameters, Keyboard
-/// Shortcuts).
-pub const WINDOW_MAX_W: f32 = 460.0;
-pub const WINDOW_WIDE_MAX_W: f32 = 760.0;
-
-/// How wide a window may get.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Width {
-    Normal,
-    Wide,
-}
-
 /// Which edge of the viewport a docked panel sits against. The Sketch Palette holds the right
 /// edge while a sketch is open, so a dialog started there takes the left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +14,14 @@ pub enum Side {
 }
 
 impl Side {
+    /// Command dialogs share a position on each side of the viewport.
+    pub fn dialog_offset_key(self) -> &'static str {
+        match self {
+            Side::Right => "sc_command_dialog_right",
+            Side::Left => "sc_command_dialog_left",
+        }
+    }
+
     /// The x of the viewport edge this side docks against.
     pub fn anchor_x(self, viewport: egui::Rect) -> f32 {
         match self {
@@ -36,33 +31,17 @@ impl Side {
     }
 }
 
-/// The window frame of a docked panel: the two corners away from its edge are rounded, and the
-/// shadow falls the same way, so a left dock mirrors a right one.
-pub fn dock_frame(ctx: &egui::Context, side: Side) -> egui::Frame {
-    let t = crate::theme::Tokens::get();
-    let (corner_radius, shadow_x) = match side {
-        Side::Right => (egui::CornerRadius { nw: t.radius_sm, sw: t.radius_sm, ne: 0, se: 0 }, -2),
-        Side::Left => (egui::CornerRadius { nw: 0, sw: 0, ne: t.radius_sm, se: t.radius_sm }, 2),
-    };
-    egui::Frame::window(&ctx.global_style())
-        .fill(t.dialog_bg)
-        .stroke(egui::Stroke::new(1.0, t.dialog_border))
-        .corner_radius(corner_radius)
-        .shadow(egui::Shadow { offset: [shadow_x, 2], blur: 8, spread: 0, color: egui::Color32::from_black_alpha(40) })
+/// How far a docked panel with this key was dragged.
+pub fn dock_offset(ctx: &egui::Context, key: &str) -> egui::Vec2 {
+    ctx.data(|d| d.get_temp::<egui::Vec2>(egui::Id::new(("sc_dock_offset", key)))).unwrap_or(egui::Vec2::ZERO)
 }
 
-/// How far the open docked dialog titled `title` was dragged from its docked place (#1335);
-/// zero for a dialog that was not dragged, or once another dialog opens.
-pub fn dock_offset(ctx: &egui::Context, title: &str) -> egui::Vec2 {
-    ctx.data(|d| d.get_temp::<(String, egui::Vec2)>(egui::Id::new("sc_dock_offset")))
-        .filter(|(t, _)| t == title)
-        .map(|(_, v)| v)
-        .unwrap_or(egui::Vec2::ZERO)
-}
-
-/// Forget a dragged dialog's place (it closed): the next one opens docked.
-pub fn reset_dock_offset(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.remove::<(String, egui::Vec2)>(egui::Id::new("sc_dock_offset")));
+/// A title drag owns the pointer even when it outruns the dialog's previous position.
+pub(crate) fn dock_dragging(ctx: &egui::Context) -> bool {
+    let frame = ctx.cumulative_frame_nr();
+    // The viewport can draw before the dialog, so retain the preceding frame's marker.
+    ctx.data(|d| d.get_temp::<u64>(egui::Id::new("sc_dock_drag_frame"))).is_some_and(|at| at >= frame.saturating_sub(1))
+        && ctx.input(|i| i.pointer.any_down())
 }
 
 /// A docked dialog's anchor moved by `offset`, kept so its docked corner stays in `vp` with
@@ -81,9 +60,13 @@ pub fn offset_anchor(docked: Pos2, offset: egui::Vec2, vp: egui::Rect, side: Sid
 /// Let `band` (a docked dialog's title band) drag the dialog: the drag adds to its offset
 /// `moved` (as last frame left it; `applied` of it is where the dialog is now, after keeping
 /// it on screen). Called before the band's buttons are added, so they keep their clicks.
-pub fn drag_dock(ui: &Ui, band: egui::Rect, title: &str, moved: egui::Vec2, applied: egui::Vec2) {
-    let response = ui.interact(band, ui.id().with("sc_dock_drag"), egui::Sense::drag());
+pub fn drag_dock(ui: &Ui, band: egui::Rect, key: &str, moved: egui::Vec2, applied: egui::Vec2) {
     crate::scenario::publish_handle("dialog:title", band.center());
+    let response = ui.interact(band, ui.id().with("sc_dock_drag"), egui::Sense::drag());
+    if response.dragged() {
+        let frame = ui.ctx().cumulative_frame_nr();
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("sc_dock_drag_frame"), frame));
+    }
     // The drag runs from where the press started, so no movement is lost while egui decides
     // it is a drag, nor on the frame it ends.
     let base = egui::Id::new("sc_dock_drag_base");
@@ -99,40 +82,13 @@ pub fn drag_dock(ui: &Ui, band: egui::Rect, title: &str, moved: egui::Vec2, appl
             (Some((start, from)), Some(now)) => start + (now - from),
             _ => applied + response.drag_delta(),
         };
-        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("sc_dock_offset"), (title.to_string(), to)));
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("sc_dock_offset", key)), to));
     } else if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     } else if moved != applied {
         // Kept on screen: remember where it is, not where it was dragged off to.
-        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("sc_dock_offset"), (title.to_string(), applied)));
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("sc_dock_offset", key)), applied));
     }
-}
-
-/// A floating window, centred on the screen unless the caller places it, shrink-wrapped to its
-/// content up to its width limit.
-pub fn window<'a>(ctx: &egui::Context, title: impl Into<WidgetText>, width: Width) -> egui::Window<'a> {
-    let max = match width {
-        Width::Normal => WINDOW_MAX_W,
-        Width::Wide => WINDOW_WIDE_MAX_W,
-    };
-    let c = ctx.content_rect().center();
-    egui::Window::new(title)
-        .enabled(!crate::issue_report::cad_input_blocked())
-        .collapsible(false)
-        .pivot(Align2::CENTER_CENTER)
-        .default_pos(c - vec2(0.0, 60.0))
-        .max_width(max)
-}
-
-/// Floating model controls share the report's read-only drawing boundary with windows.
-pub fn area(id: egui::Id) -> egui::Area {
-    egui::Area::new(id).enabled(!crate::issue_report::cad_input_blocked())
-}
-
-/// Shared rounded surface for floating shell cards.
-pub(crate) fn shell_card(fill: egui::Color32) -> egui::Frame {
-    let t = crate::theme::Tokens::get();
-    egui::Frame::NONE.fill(fill).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(t.radius_lg).shadow(t.shell_shadow())
 }
 
 #[cfg(test)]
@@ -197,8 +153,59 @@ mod tests {
             }
         }
     }
+
+    /// #5086: while a docked dialog's title is dragged, the pointer can outrun the dialog; the
+    /// model under it must not highlight until the drag ends.
+    #[test]
+    fn dragging_a_docked_dialog_blocks_viewport_hover() {
+        use crate::scenario::Harness;
+        use serde_json::json;
+
+        for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+            let mut h = Harness::new();
+            h.call("ui.set", json!({"layout": mode}));
+            h.call("ui.resize", json!({"width": 2400, "height": 900}));
+            h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).unwrap();
+            h.call("ui.view", json!({"view": "fit"}));
+            h.app.ui.pick_bodies = true;
+            let p = h.app.viewport.rect.unwrap().center();
+            h.call("ui.move", json!({"x": p.x, "y": p.y}));
+            assert!(h.app.viewport.hover.is_some(), "the uncovered model must highlight");
+            h.step(&json!({"start": "parameters.change"})).unwrap();
+            h.frames(6);
+            let title = crate::scenario::handle_at("dialog:title").unwrap();
+            assert!(!h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_params_dialog"))).unwrap().contains(p));
+            h.call("ui.move", json!({"x": title.x, "y": title.y}));
+            h.app.synthetic.push(egui::Event::PointerButton {
+                pos: title,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            });
+            h.frame();
+            h.app.synthetic.push(egui::Event::PointerMoved(p));
+            h.frame();
+            assert!(h.ctx.dragged_id().is_some(), "the title must own the drag");
+            assert!(!h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_params_dialog"))).unwrap().contains(p), "the pointer must outrun the dialog");
+            assert!(h.app.viewport.hover.is_none(), "dragging a dialog must block model highlights");
+            assert!(h.app.viewport.mouse.is_none(), "the viewport must not receive the drag pointer");
+            h.frames(2);
+            assert!(h.app.viewport.hover.is_none(), "a stationary drag must still block highlights");
+            h.app.synthetic.push(egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            });
+            h.frame();
+            h.app.params = None;
+            h.frames(2);
+            assert!(h.app.viewport.hover.is_some(), "hover must return after the dialog closes");
+        }
+    }
+
     /// #1335: a dialog keeps its size while its Select chip is hovered, and its title band
-    /// drags it; it opens docked again after it closes.
+    /// drags it; reopening keeps its position.
     #[test]
     fn a_docked_dialog_keeps_its_size_under_the_pointer_and_moves_by_its_title() {
         for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
@@ -228,29 +235,50 @@ mod tests {
             h.frames(4);
             let viewport = h.app.viewport.rect.unwrap();
             assert!(viewport.contains(h.app.viewport.dialog_rect.unwrap().min));
+            let last = h.app.viewport.dialog_rect.unwrap();
             h.step(&json!({"key":"Escape"})).unwrap();
             h.frames(2);
             assert!(h.app.dialog.is_none());
             h.step(&json!({"start":"sketch.create"})).unwrap();
             h.frames(6);
-            assert!((h.app.viewport.dialog_rect.unwrap().min - rest.min).length() < 0.01, "a new dialog opens docked");
+            assert!((h.app.viewport.dialog_rect.unwrap().min - last.min).length() < 0.01, "reopening keeps the dragged position");
         }
     }
-
-    /// Windows are made in this file only, so none can skip the width limits.
     #[test]
-    fn windows_come_from_ui_kit_panel() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut bad = Vec::new();
-        for e in std::fs::read_dir(&dir).unwrap() {
-            let p = e.unwrap().path();
-            if p.extension().is_some_and(|x| x == "rs") && p.file_name().is_some_and(|n| n != "frame.rs") {
-                let text = std::fs::read_to_string(&p).unwrap();
-                if text.contains("egui::Window::new(") {
-                    bad.push(p.display().to_string());
-                }
-            }
+    fn command_dialogs_keep_the_dragged_position_after_closing() {
+        use crate::scenario::Harness;
+        use serde_json::json;
+        for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+            let mut h = Harness::new();
+            h.call("ui.set", json!({"layout":mode}));
+            h.call("ui.resize", json!({"width":1400.0,"height":900.0}));
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[10,10]})).unwrap();
+            h.app.run("sketch.finish", json!({})).unwrap();
+            h.app.run("solid.extrude", json!({"distance":10})).unwrap();
+            h.step(&json!({"start":"solid.extrude"})).unwrap();
+            h.frames(6);
+            let rest = h.app.viewport.dialog_rect.unwrap();
+            let title = crate::scenario::handle_at("dialog:title").unwrap();
+            h.call("ui.drag", json!({"x0":title.x,"y0":title.y,"x1":title.x-300.0,"y1":title.y+60.0,"steps":8}));
+            h.frames(4);
+            let moved = h.app.viewport.dialog_rect.unwrap();
+            assert!((moved.min - rest.min - egui::vec2(-300.0, 60.0)).length() < 2.0);
+            h.step(&json!({"key":"Escape"})).unwrap();
+            h.frames(4);
+            assert!(h.app.dialog.is_none());
+            h.step(&json!({"start":"solid.fillet"})).unwrap();
+            h.frames(6);
+            let fillet = h.app.viewport.dialog_rect.unwrap();
+            assert!((fillet.right_top() - moved.right_top()).length() < 2.0, "Extrude: {moved:?}, Fillet: {fillet:?}");
+            // A smaller window keeps the kept place on screen.
+            h.step(&json!({"key":"Escape"})).unwrap();
+            h.frames(4);
+            h.call("ui.resize", json!({"width":700.0,"height":500.0}));
+            h.step(&json!({"start":"solid.fillet"})).unwrap();
+            h.frames(6);
+            let viewport = h.app.viewport.rect.unwrap();
+            assert!(viewport.contains(h.app.viewport.dialog_rect.unwrap().min), "{viewport:?}");
         }
-        assert!(bad.is_empty(), "use ui_kit::Panel instead of egui::Window::new in {bad:?}");
     }
 }
