@@ -176,6 +176,8 @@ pub(crate) fn remap_link(
             remap_link(b, ids, names, bodies, depth + 1);
         }
         LinkSource::Plane { name } => mapped_name(name, names),
+        // A construction axis, by name (#9324); the origin axes are no feature's.
+        LinkSource::Axis { name } if !matches!(name.as_str(), "X" | "Y" | "Z") => mapped_name(name, names),
         _ => {}
     }
 }
@@ -253,6 +255,12 @@ impl crate::Feature {
                 for e in sketch.text_exprs_mut() {
                     *e = clone_expression(e, parameters);
                 }
+                // An equation curve's variable is its own: a parameter of that name is not renamed in it.
+                for (variable, e) in sketch.equation_exprs_mut() {
+                    let others: BTreeMap<String, String> =
+                        parameters.iter().filter(|(old, _)| old.as_str() != variable).map(|(o, n)| (o.clone(), n.clone())).collect();
+                    *e = clone_expression(e, &others);
+                }
                 for link in &mut sketch.links {
                     remap_link(&mut link.source, ids, names, bodies, 0);
                     for n in link.face_name.iter_mut().chain(&mut link.edge_name) {
@@ -308,7 +316,7 @@ fn checked_plane(p: &PlaneRef, depth: usize) -> crate::Result<()> {
                 checked_geo(g, depth + 1)?;
             }
         }
-        PlaneRef::Midplane { a, b } | PlaneRef::TwoEdges { a, b } => {
+        PlaneRef::Midplane { a, b } | PlaneRef::TwoEdges { a, b } | PlaneRef::AxisPoint { axis: a, point: b } => {
             checked_geo(a, depth + 1)?;
             checked_geo(b, depth + 1)?;
         }
@@ -351,7 +359,9 @@ mod clone_tests {
         use serde_json::json;
 
         let names = BTreeMap::from([("Old".into(), "New".into()), ("New".into(), "Wrong".into())]);
-        let origin = json!({"type": "plane", "plane": {"type": "construction", "name": "Old"}});
+        // Construction plane references are keyed by id (#1134): a copy remap moves the id map,
+        // not this one; the axis and point names below are what a rename and a copy rewrite.
+        let origin = json!({"type": "plane", "plane": {"type": "construction", "feature": 7}});
         for kind in [
             json!({"type": "construction_axis", "def": {"type": "two_points", "a": {"type": "construct_point", "name": "Old"}, "b": {"type": "point", "p": [1, 2, 3]}}}),
             json!({"type": "construction_point", "def": {"type": "edge_and_plane", "edge": {"type": "axis", "name": "Old"}, "plane": origin}}),

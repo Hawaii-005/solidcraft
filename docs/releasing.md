@@ -71,10 +71,11 @@ deployment. The stable Flatpak repository is not automatically updated with nigh
    `Cargo.lock` (it changes only our own crates, never dependency versions, and needs no
    network). Inspect the diff: only `version = ` lines of workspace crates should change.
    SolidCraft does not currently implement `cargo xtask version set`.
-3. Fix the design format number: run `scripts/fold-format-pending.sh`. It moves the pending
-   format changes (`crates/doc/src/format/pending/*.rs`) into the next `crates/doc/src/format/v<N>/`
-   folder, so the release writes and reads that number for good, and does nothing when nothing
-   is pending. Commit the move with the version files. (CONTRIBUTING.md, "Changing the design
+3. Fix the file format numbers: run `scripts/fold-format-pending.sh`. It moves the pending
+   format changes of designs (`crates/doc/src/format/pending/*.rs`) and of drawings
+   (`crates/doc/src/drawing/format/pending/*.rs`) into each one's next `v<N>/` folder, so the
+   release writes and reads those numbers for good, and does nothing for a family with nothing
+   pending. Commit the move with the version files. (CONTRIBUTING.md, "Changing the design
    file format".)
 4. Run `cargo xtask ci` and the packaging checks in `.github/workflows/packaging-lint.yml`.
    Commit the version files through the normal review flow and land them on `main`.
@@ -154,8 +155,9 @@ change release infrastructure does not itself request publication of the applica
    other platforms; report any platform you could not exercise yourself.
 3. Review the generated notes. Add a concise description of features, fixes, breaking changes,
    and known limitations. Keep the installation instructions. The macOS app is Developer ID
-   signed and notarized only when the build summary says so; other packages are unsigned. Do not
-   claim otherwise. Resolve failed checks or missing artifacts before publication.
+   signed and notarized only when the build summary says so, and the Windows files are signed only
+   when it says which SignPath policy signed them (`test-signing` is a self-signed test certificate
+   that Windows does not trust); other packages are unsigned. Do not claim otherwise. Resolve failed checks or missing artifacts before publication.
 4. Publish the verified draft using `gh` or the equivalent GitHub release API. For example:
 
    ```sh
@@ -315,6 +317,29 @@ valid, because the signature carries a secure timestamp.
 Signing currently uses a maintainer's **personal** Developer ID, so downloads show that person's
 name, not an organisation's. Moving to an organisation account means replacing the certificate
 and the API key secrets (`APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`).
+
+## Windows signing (SignPath Foundation)
+
+When the `SIGNPATH_API_TOKEN` secret (the API token of the SignPath CI user) exists, the release
+workflow's Windows jobs Authenticode-sign through [SignPath Foundation](https://signpath.org)
+(organization `fa603ff4-c702-404b-8588-a524371c7a4e`, project `solidcraft`). Each architecture
+sends two signing requests: `solidcraft.exe`, `solidcraft-cli.exe` and `solvecraft-cli.exe` first,
+so the MSI, the portable zip and the plain `.exe` are made from signed binaries, then the MSI. Each
+request uploads the files as a workflow artifact, SignPath fetches and signs it, and the job checks
+that every file came back signed. Without the secret (forks) the jobs build unsigned as before.
+
+- **Policy:** `test-signing` (a self-signed test certificate) unless the dispatch input
+  `signpath_signing_policy` or the repository variable `SIGNPATH_SIGNING_POLICY` says otherwise.
+  Switch to the real certificate with `gh variable set SIGNPATH_SIGNING_POLICY -b release-signing
+  -R tangency-labs/solidcraft` once SignPath has issued it. Requests under `release-signing` wait
+  for approval in SignPath; the workflow waits up to an hour for each.
+- **Artifact configuration:** `packaging/windows/signpath-artifact-configuration.xml`. When it
+  changes, paste the new version into the SignPath project's artifact configuration when it lands.
+- **Test-sign without publishing:** `gh workflow run release.yml -R tangency-labs/solidcraft --ref
+  <branch> -f draft=false`, then check the Windows jobs' summaries and the `release-assets`
+  artifact.
+- SignPath only signs runs whose jobs all ran on GitHub-hosted runners, so keep the `version`,
+  `icons` and `windows` jobs off self-hosted runners.
 
 ## Homebrew tap
 

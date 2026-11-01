@@ -36,6 +36,7 @@ pub mod paste;
 #[cfg(not(target_arch = "wasm32"))]
 mod process;
 pub mod settings;
+pub mod summary;
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -64,6 +65,8 @@ const APPROVAL_TIMEOUT_MS: f64 = 240_000.0;
 const VIEW_IMAGE: (u32, u32) = (960, 600);
 /// A picture kept for the user to open later, at most this big.
 const MAX_PICTURE_BYTES: usize = 4 << 20;
+/// A tool call's arguments kept for its card, at most this big (as JSON text).
+const MAX_TOOL_INPUT: usize = 64 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -73,6 +76,9 @@ pub enum State {
     Busy,
     NeedsAuth,
     Exited,
+    /// The agent never got ready: none to start, it could not start, or it ended while starting.
+    /// Connect reads Retry.
+    Failed,
 }
 
 impl State {
@@ -84,6 +90,7 @@ impl State {
             State::Busy => "busy",
             State::NeedsAuth => "auth",
             State::Exited => "exited",
+            State::Failed => "failed",
         }
     }
     fn label(self) -> &'static str {
@@ -94,6 +101,7 @@ impl State {
             State::Busy => "ui.agent_chat_state_busy",
             State::NeedsAuth => "ui.agent_chat_state_auth",
             State::Exited => "ui.agent_chat_state_exited",
+            State::Failed => "ui.agent_chat_state_failed",
         })
     }
     fn running(self) -> bool {
@@ -212,6 +220,9 @@ pub enum Item {
         title: String,
         kind: String,
         status: Option<ToolStatus>,
+        /// The arguments it was called with, when the agent says (shown under Details, and read
+        /// for the card's summary, #1457).
+        input: Option<Value>,
         output: Option<String>,
     },
     Plan(Vec<(String, String)>),
@@ -309,6 +320,9 @@ impl Loading {
 pub struct AgentChat {
     /// The panel is shown (View menu, the application bar's chat button, Ctrl+Shift+A).
     pub open: bool,
+    /// Only while dispatching this conversation's own admitted tool request. Window state:
+    /// creating/opening a design may carry the conversation, but a person's tab switch may not.
+    pub(crate) following_document: bool,
     pub items: Vec<Item>,
     pub input: String,
     /// The viewer, open on one message's pictures.
@@ -388,6 +402,8 @@ pub struct AgentChat {
     /// The provider picked in the header when the models come from several providers (`None`: the
     /// current model's). It only narrows the model list; the agent keeps its model until one is chosen.
     pub model_provider: Option<String>,
+    pub config_options: Option<Vec<acp::ConfigOption>>,
+    pub config_pending: bool,
     /// An API endpoint's models, kept per endpoint (its base URL) for the next connection.
     models_cache: std::collections::HashMap<String, Vec<acp::ModelInfo>>,
     /// The running API agent's endpoint (empty for other agents).
@@ -406,11 +422,14 @@ pub struct AgentChat {
     /// Settings → AI: the Add agent dialog and connection tests.
     pub settings: settings::State,
     /// Latest authentication evidence from a connection test or a chat, per agent; never saved.
+    /// It belongs to the window, not to one tab's conversation.
     login_results: std::collections::HashMap<String, bool>,
     /// Desktop host hook: start the endpoint on demand.
     pub control_starter: Option<ControlStarter>,
     /// The picker is unfolded (it folds to one line once an agent is connected).
     picking: Option<bool>,
+    /// This launch connects the agent started last once the installed agents are known ([`begin`]).
+    connect_at_start: bool,
     #[cfg(not(target_arch = "wasm32"))]
     detection: Option<discover::Detection>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -428,10 +447,14 @@ impl AgentChat {
     pub(crate) fn swap_document(&mut self, other: &mut Self) {
         std::mem::swap(self, other);
         std::mem::swap(&mut self.open, &mut other.open);
+        std::mem::swap(&mut self.following_document, &mut other.following_document);
         std::mem::swap(&mut self.settings, &mut other.settings);
         std::mem::swap(&mut self.control_starter, &mut other.control_starter);
         std::mem::swap(&mut self.models_cache, &mut other.models_cache);
         std::mem::swap(&mut self.window_placed, &mut other.window_placed);
+        std::mem::swap(&mut self.connect_at_start, &mut other.connect_at_start);
+        // A sign-in proven in one tab holds for that agent in every tab (#9293).
+        std::mem::swap(&mut self.login_results, &mut other.login_results);
         #[cfg(not(target_arch = "wasm32"))]
         {
             std::mem::swap(&mut self.detection, &mut other.detection);
@@ -445,12 +468,41 @@ impl AgentChat {
 
     pub(crate) fn disconnect_document(&mut self, session: &mut solidcraft_engine::Session, wait: bool) {
         finish_turn(self, session);
+        self.clear_config();
         self.stop_backend(wait);
         if self.state.is_some() {
             self.state = Some(State::Off);
         }
     }
 
+    fn clear_config(&mut self) {
+        if self.config_options.take().is_some() {
+            self.models.clear();
+            self.model.clear();
+            self.modes.clear();
+            self.mode.clear();
+            self.model_provider = None;
+        }
+        self.config_pending = false;
+    }
+
+    fn apply_config_snapshot(&mut self, options: Vec<acp::ConfigOption>) {
+        self.config_options = Some(options.clone());
+        let model = options.iter().find(|o| o.category == "model");
+        self.models = model
+            .map(|o| {
+                o.options.iter().map(|x| acp::ModelInfo { id: x.value.clone(), name: x.name.clone(), description: x.description.clone() }).collect()
+            })
+            .unwrap_or_default();
+        let current = model.map_or_else(String::new, |o| o.current_value.clone());
+        if current != self.model {
+            self.model_provider = None;
+        }
+        self.model = current;
+        let mode = options.iter().find(|o| o.category == "mode");
+        self.modes = mode.map(|o| o.options.iter().map(|x| (x.value.clone(), x.name.clone())).collect()).unwrap_or_default();
+        self.mode = mode.map_or_else(String::new, |o| o.current_value.clone());
+    }
     /// Put a file on the next message with an id of its own; its name back.
     fn add_file(&mut self, file: attach::Attachment) -> String {
         let id = self.next_file_id();
@@ -501,6 +553,10 @@ impl AgentChat {
 
     pub fn state(&self) -> State {
         self.state.unwrap_or(State::Off)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_state(&mut self, state: State) {
+        self.state = Some(state);
     }
     fn push(&mut self, item: Item) {
         if self.items.len() >= MAX_ITEMS {
@@ -592,7 +648,8 @@ impl AgentChat {
                 self.state = Some(State::Ready);
                 self.picking = Some(false);
                 // Keep the mode across a new chat.
-                if let Some(m) = self.restore_mode.take()
+                if self.config_options.is_none()
+                    && let Some(m) = self.restore_mode.take()
                     && self.modes.iter().any(|(id, _)| *id == m)
                     && let Some(b) = self.backend.as_mut()
                 {
@@ -615,12 +672,14 @@ impl AgentChat {
                     self.push(Item::Agent { thought, text });
                 }
             }
-            Event::Tool { id, title, kind, status, output } => {
+            Event::Tool { id, title, kind, status, input, output } => {
                 if let Some(turn) = self.turn.as_mut() {
                     turn.tool_called = true;
                 }
+                // Arguments too large to show or read are left with the agent.
+                let input = input.filter(|v| serde_json::to_string(v).is_ok_and(|s| s.len() <= MAX_TOOL_INPUT));
                 let existing = self.items.iter_mut().rev().find(|i| matches!(i, Item::Tool { id: x, .. } if *x == id));
-                if let Some(Item::Tool { title: t, kind: k, status: s, output: o, .. }) = existing {
+                if let Some(Item::Tool { title: t, kind: k, status: s, input: i, output: o, .. }) = existing {
                     if let Some(v) = title {
                         *t = v;
                     }
@@ -630,11 +689,14 @@ impl AgentChat {
                     if status.is_some() {
                         *s = status;
                     }
+                    if input.is_some() {
+                        *i = input;
+                    }
                     if output.is_some() {
                         *o = output;
                     }
                 } else {
-                    self.push(Item::Tool { id, title: title.unwrap_or_default(), kind: kind.unwrap_or_default(), status, output });
+                    self.push(Item::Tool { id, title: title.unwrap_or_default(), kind: kind.unwrap_or_default(), status, input, output });
                 }
             }
             Event::Plan(entries) => {
@@ -648,24 +710,41 @@ impl AgentChat {
             }
             Event::Permission { key, title, options } => return Some(Outcome::Permission { key, title, options }),
             Event::Modes { current, available } => {
-                if !available.is_empty() {
+                if self.config_options.is_none() && !available.is_empty() {
                     self.modes = available;
                 }
-                self.mode = current;
+                if self.config_options.is_none() {
+                    self.mode = current;
+                }
             }
             Event::Models { current, available } => {
-                if !available.is_empty() {
+                if self.config_options.is_none() && !available.is_empty() {
                     if !self.running_endpoint.is_empty() {
                         self.models_cache.insert(self.running_endpoint.clone(), available.clone());
                     }
                     self.models = available;
                 }
-                if current != self.model {
-                    self.model_provider = None;
+                if self.config_options.is_none() {
+                    if current != self.model {
+                        self.model_provider = None;
+                    }
+                    self.model = current;
                 }
-                self.model = current;
+            }
+            Event::ConfigOptions(options) => {
+                self.apply_config_snapshot(options);
+            }
+            Event::ConfigOptionFinished { result, .. } => {
+                self.config_pending = false;
+                match result {
+                    Ok(options) => {
+                        self.apply_config_snapshot(options);
+                    }
+                    Err(message) => self.notice(message, true),
+                }
             }
             Event::AuthRequired { methods } => {
+                self.clear_config();
                 self.auth = methods;
                 self.state = Some(State::NeedsAuth);
                 self.picking = Some(false);
@@ -683,19 +762,26 @@ impl AgentChat {
                 if std::mem::take(&mut self.discard_end) {
                     return Some(Outcome::TurnEnd);
                 }
-                if !matches!(reason.as_str(), "" | "auth" | "error") {
-                    self.notice(format!("({reason})"), false);
+                match reason.as_str() {
+                    "" | "auth" | "error" => {}
+                    // Not a missing tool: the answer ran out of room, or the model declined (#9495).
+                    "max_tokens" => self.notice(tr("ui.agent_chat_reply_cut_off").to_string(), false),
+                    "refusal" => self.notice(tr("ui.agent_chat_reply_declined").to_string(), false),
+                    _ => self.notice(format!("({reason})"), false),
                 }
                 return Some(Outcome::TurnEnd);
             }
             Event::Error(e) => {
                 self.notice(e, true);
-                if !self.state().running() || self.state() == State::Starting {
-                    self.state = Some(State::Exited);
+                match self.state() {
+                    State::Starting | State::Failed => self.state = Some(State::Failed),
+                    s if !s.running() => self.state = Some(State::Exited),
+                    _ => {}
                 }
             }
             Event::Exited { tail } => {
-                self.state = Some(State::Exited);
+                self.clear_config();
+                self.state = Some(if matches!(self.state(), State::Starting | State::Failed) { State::Failed } else { State::Exited });
                 self.steering = false;
                 let last: Vec<String> = tail.into_iter().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
                 let detail = if last.is_empty() { String::new() } else { format!("\n{}", last.join("\n")) };
@@ -744,7 +830,7 @@ fn assistant_mark_for(state: State, login: &str, configured: bool, waiting: usiz
     if state == State::NeedsAuth {
         return AssistantMark::NeedsAuth;
     }
-    if state == State::Exited || stopped || failed {
+    if matches!(state, State::Exited | State::Failed) || stopped || failed {
         return AssistantMark::Stopped;
     }
     match state {
@@ -818,7 +904,11 @@ fn working_dir() -> std::path::PathBuf {
 pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
     disconnect(app);
     let Some(entry) = agents::current(app) else {
-        app.agent_chat.notice(tr("ui.agent_chat_none_found"), true);
+        let chat = &mut app.agent_chat;
+        chat.notice(panel::no_agents_message(), true);
+        chat.state = Some(State::Failed);
+        // The picker lists what to install (and, in the Flatpak, the permissions to grant).
+        chat.picking = Some(true);
         return;
     };
     // An API agent's key comes from the keychain for this connection only.
@@ -827,6 +917,7 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
             Some(Ok(k)) => k,
             Some(Err(e)) => {
                 app.agent_chat.notice(trf("ui.ai_keychain_error", &[("error", &e)]), true);
+                app.agent_chat.state = Some(State::Failed);
                 return;
             }
             None => None,
@@ -855,6 +946,11 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
     } else if cli.is_none() && !local_tools {
         chat.notice(tr("ui.agent_chat_no_cli"), true);
     }
+    // Found, but it failed when asked its version (#9034): say why and how to reinstall it before
+    // the system's own message arrives. It is still started, in case it only lacks `--version`.
+    if let Some(hint) = entry.problem_hint() {
+        chat.notice(hint, true);
+    }
     let bridge = cli.zip(chat.tools_port).map(|(cli, port)| acp::McpBridge { cli, port });
     chat.tools_available = Some(bridge.is_some());
     let wake = ctx.clone();
@@ -874,6 +970,7 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
                         key,
                         http,
                         request_timeout_s: entry.request_timeout_s,
+                        reasoning_effort: entry.reasoning_effort.clone(),
                     },
                     start,
                 )
@@ -884,6 +981,7 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
     };
     match started {
         Ok(b) => {
+            app.preferences.agent_last = entry.id.clone();
             chat.backend = Some(b);
             chat.argv = entry.argv.clone();
             chat.running_id = entry.id.clone();
@@ -904,13 +1002,55 @@ pub fn connect(app: &mut SolveApp, ctx: &egui::Context) {
         }
         Err(e) => {
             chat.notice(trf("ui.agent_chat_failed_start", &[("error", &e)]), true);
-            chat.state = Some(State::Exited);
+            chat.state = Some(State::Failed);
         }
     }
 }
 
+/// The launch, once the window is up (the desktop host; not for runs driven over `--control`):
+/// Settings → AI can open the panel and connect the agent started last (#7009).
+pub fn begin(app: &mut SolveApp) {
+    if !shown(app) {
+        return;
+    }
+    if app.preferences.agent_chat_open_at_start {
+        app.agent_chat.open = true;
+    }
+    app.agent_chat.connect_at_start = app.preferences.agent_connect_at_start;
+}
+
+/// Connect at start, once the installed agents are known (the one started last may be one of
+/// them). A missing agent is not swapped for another: the chat says so and shows Connection
+/// failed, whose Retry starts the agent the switcher shows. Nothing waits on it: discovery and
+/// the agent run in the background, and an agent connected by hand meanwhile stays.
+#[cfg(not(target_arch = "wasm32"))]
+fn connect_at_start(app: &mut SolveApp, ctx: &egui::Context) {
+    if !app.agent_chat.connect_at_start {
+        return;
+    }
+    if app.agent_chat.detection.is_none() {
+        refresh(app, ctx);
+        return;
+    }
+    app.agent_chat.connect_at_start = false;
+    if app.agent_chat.state.is_some() || !app.preferences.agent_connect_at_start {
+        return;
+    }
+    let last = app.preferences.agent_last.clone();
+    if !last.is_empty() {
+        if !agents::entries(app).iter().any(|e| e.id == last) {
+            app.agent_chat.notice(trf("ui.agent_chat_last_missing", &[("agent", &last)]), true);
+            app.agent_chat.state = Some(State::Failed);
+            return;
+        }
+        app.agent_chat.agent_id = Some(last);
+    }
+    connect(app, ctx);
+}
+
 /// Stop the agent (and everything it started); the conversation stays.
 pub fn disconnect(app: &mut SolveApp) {
+    crate::edit_in_place::forget_after_turn(app);
     app.agent_chat.disconnect_document(&mut app.session, false);
 }
 
@@ -918,6 +1058,66 @@ pub fn disconnect(app: &mut SolveApp) {
 pub fn shutdown(app: &mut SolveApp) {
     app.agent_chat.disconnect_document(&mut app.session, true);
     crate::documents::disconnect_background_chats(app, true);
+}
+
+/// Mark the origin only for this synchronous dispatch. Deferred work carries the same trusted
+/// turn flag and enters here when it applies; JSON parameters cannot opt into continuation.
+pub(crate) fn with_tool_request<T>(
+    app: &mut SolveApp,
+    active: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    run: impl FnOnce(&mut SolveApp) -> T,
+) -> T {
+    let own = active.is_some_and(|active| {
+        active.load(std::sync::atomic::Ordering::Relaxed) && app.agent_chat.turn.as_ref().is_some_and(|turn| Arc::ptr_eq(active, &turn.active))
+    });
+    // A batch may replace the design and then roll back to its checkpoint. Keep the turn's
+    // original undo boundary when that happens, including edits made before the batch.
+    let before = app.agent_chat.turn.as_ref().filter(|_| own).map(|t| (app.session.doc.clone(), t.start_doc.clone(), t.start_undo));
+    let previous = std::mem::replace(&mut app.agent_chat.following_document, own);
+    let result = run(app);
+    app.agent_chat.following_document = previous;
+    if let Some((doc, start_doc, start_undo)) = before
+        && Arc::ptr_eq(&doc, &app.session.doc)
+        && let Some(turn) = app.agent_chat.turn.as_mut()
+        && active.is_some_and(|active| Arc::ptr_eq(active, &turn.active))
+    {
+        turn.start_doc = start_doc;
+        turn.start_undo = start_undo;
+    }
+    result
+}
+
+/// The agent's replacement succeeded. Keep its backend, transcript, queue, limits and validity
+/// flag; subsequent edits undo in this design and picked geometry belongs to the old one.
+pub(crate) fn continue_in_document(app: &mut SolveApp) {
+    if let Some(turn) = app.agent_chat.turn.as_mut() {
+        turn.start_doc = app.session.doc.clone();
+        turn.start_undo = app.session.undo.len();
+    }
+    app.agent_chat.picked.clear();
+    app.agent_chat.picked_context = Context::default();
+    app.agent_chat.selected_count = None;
+}
+
+/// A newly opened tab has no conversation to displace. Move the initiating chat into it,
+/// grouping the previous design's completed edits before its session is parked.
+pub(crate) fn follow_new_tab(app: &mut SolveApp, switch: impl FnOnce(&mut SolveApp)) {
+    if !app.agent_chat.following_document {
+        switch(app);
+        return;
+    }
+    if let Some(turn) = app.agent_chat.turn.as_ref() {
+        let steps =
+            merge_undo(&mut app.session.undo, &turn.start_doc, turn.start_undo, &trf("ui.agent_chat_undo_label", &[("message", &turn.label)]));
+        if steps > 0 {
+            app.agent_chat.push(Item::Changes { steps, doc: app.session.doc.clone(), undone: false });
+        }
+    }
+    let mut chat = AgentChat::default();
+    app.agent_chat.swap_document(&mut chat);
+    switch(app);
+    app.agent_chat.swap_document(&mut chat);
+    continue_in_document(app);
 }
 
 /// A tab switch stops this turn before its session leaves the app. Keep the backend's own
@@ -1162,6 +1362,7 @@ pub fn new_chat(app: &mut SolveApp) {
             b.new_session();
         }
     }
+    chat.clear_config();
 }
 
 /// Whether New chat would throw something away that the user may want (so it asks first).
@@ -1355,6 +1556,7 @@ pub(crate) fn attach_dropped(app: &mut SolveApp, paths: impl Iterator<Item = std
 pub fn cancel(app: &mut SolveApp) {
     app.agent_chat.steering = false;
     app.agent_chat.stopped = true;
+    crate::edit_in_place::forget_after_turn(app);
     interrupt(app);
 }
 
@@ -1668,6 +1870,8 @@ pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
     }
     // AI features turned off: nothing keeps running, nothing is looked for.
     if !shown(app) {
+        // Turned back on later, AI features don't connect as if SolidCraft were starting.
+        app.agent_chat.connect_at_start = false;
         crate::documents::disconnect_background_chats(app, false);
         if app.agent_chat.backend.is_some() || app.agent_chat.open {
             disconnect(app);
@@ -1679,6 +1883,13 @@ pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
     let events = app.agent_chat.backend.as_mut().map(|b| b.poll()).unwrap_or_default();
     for e in events {
         let ready = matches!(e, Event::Ready { .. });
+        let configured = matches!(e, Event::ConfigOptionFinished { .. });
+        let confirmed_model = match &e {
+            Event::ConfigOptionFinished { id, result: Ok(options) } => {
+                options.iter().find(|o| o.category == "model").filter(|o| o.id == *id).map(|o| o.current_value.clone())
+            }
+            _ => None,
+        };
         match app.agent_chat.on_event(e) {
             Some(Outcome::TurnEnd) => {
                 end_turn(app);
@@ -1692,15 +1903,34 @@ pub fn poll(app: &mut SolveApp, ctx: &egui::Context) {
             Some(Outcome::Permission { key, title, options }) => on_permission(app, key, title, options),
             None => {}
         }
+        if let Some(model) = confirmed_model {
+            app.preferences.agent_models.insert(app.agent_chat.running_id.clone(), model.clone());
+            if let Some(a) = app.preferences.agents.iter_mut().find(|a| a.id == app.agent_chat.running_id && a.kind == agents::Kind::Api) {
+                a.model = model;
+            }
+        }
         if ready {
             apply_saved_model(app);
         }
-        if ready && let Some((text, image, at, files)) = app.agent_chat.queued.take() {
-            start_turn(app, text, image, at, files);
+        if (ready || configured) && !app.agent_chat.config_pending {
+            if app.agent_chat.config_options.is_some()
+                && let Some(mode) = app.agent_chat.restore_mode.take()
+                && mode != app.agent_chat.mode
+            {
+                set_mode(app, &mode);
+            }
+            if !app.agent_chat.config_pending
+                && let Some((text, image, at, files)) = app.agent_chat.queued.take()
+            {
+                start_turn(app, text, image, at, files);
+            }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    settings::poll_capabilities(app, ctx);
+    {
+        settings::poll_capabilities(app, ctx);
+        connect_at_start(app, ctx);
+    }
     pump_tools(app);
     if !app.agent_chat.held.is_empty() || app.agent_chat.state() == State::Busy {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -1725,6 +1955,14 @@ pub fn refresh(app: &mut SolveApp, ctx: &egui::Context) {
 /// Choose the model for this chat (the header's model picker): the agent switches to it, and it is
 /// remembered for this agent; an API endpoint's agent also keeps it as its default model.
 pub fn set_model(app: &mut SolveApp, model: &str) {
+    if let Some(options) = app.agent_chat.config_options.as_ref() {
+        let Some(option) = options.iter().find(|x| x.category == "model") else {
+            return;
+        };
+        let id = option.id.clone();
+        set_config_option(app, &id, model);
+        return;
+    }
     if !app.agent_chat.models.iter().any(|m| m.id == model) {
         return;
     }
@@ -1833,6 +2071,14 @@ pub fn set_model_provider(app: &mut SolveApp, provider: &str) {
 
 /// Switch the agent to one of its own modes (the header's mode picker).
 pub fn set_mode(app: &mut SolveApp, mode: &str) {
+    if let Some(options) = app.agent_chat.config_options.as_ref() {
+        let Some(option) = options.iter().find(|x| x.category == "mode") else {
+            return;
+        };
+        let id = option.id.clone();
+        set_config_option(app, &id, mode);
+        return;
+    }
     if app.agent_chat.modes.iter().any(|(id, _)| id == mode)
         && let Some(b) = app.agent_chat.backend.as_mut()
     {
@@ -1841,7 +2087,25 @@ pub fn set_mode(app: &mut SolveApp, mode: &str) {
     }
 }
 
-/// `ui.agent_chat` on the control channel (tests and screenshots): `enabled`, `command`, `open`,
+/// Change a reported modern ACP configuration option; only acknowledged snapshots change state.
+pub fn set_config_option(app: &mut SolveApp, id: &str, value: &str) {
+    let Some(option) = app.agent_chat.config_options.as_ref().and_then(|xs| xs.iter().find(|x| x.id == id)) else {
+        return;
+    };
+    if app.agent_chat.config_pending
+        || !matches!(app.agent_chat.state(), State::Ready | State::Busy)
+        || !option.options.iter().any(|x| x.value == value)
+    {
+        return;
+    }
+    if let Some(b) = app.agent_chat.backend.as_mut() {
+        b.set_config_option(id, value);
+        app.agent_chat.config_pending = true;
+    }
+}
+
+/// `ui.agent_chat` on the control channel (tests and screenshots): `enabled`, `command`,
+/// `connect_at_start` and `open_at_start` (the launch preferences), `open`,
 /// `side`, `minimized`, `width`, `refresh`, `connect`, `stop`, `attach` (a file's path, for the
 /// next message), `remove_file` (index), `send`, `attach_view`, `attach_selection`, `pick`,
 /// `permission` (an option id, or `"cancel"`), `approve` (`true`/`false`, the oldest held
@@ -1852,6 +2116,12 @@ pub fn control(app: &mut SolveApp, ctx: &egui::Context, p: &Value) -> Result<Val
     }
     if let Some(b) = p.get("toolbar_button").and_then(Value::as_bool) {
         app.preferences.ai_toolbar_button = b;
+    }
+    if let Some(b) = p.get("connect_at_start").and_then(Value::as_bool) {
+        app.preferences.agent_connect_at_start = b;
+    }
+    if let Some(b) = p.get("open_at_start").and_then(Value::as_bool) {
+        app.preferences.agent_chat_open_at_start = b;
     }
     if let Some(m) = p.get("permissions") {
         let Some(mode) = m.as_str().and_then(agents::Mode::parse) else { return Err("permissions must be ask, edits or all".into()) };
@@ -1909,6 +2179,13 @@ pub fn control(app: &mut SolveApp, ctx: &egui::Context, p: &Value) -> Result<Val
             None => app.agent_chat.settings.add = None,
         }
     }
+    // The same dialog on an agent you added (by id), filled with what it holds; its key stays hidden.
+    if let Some(id) = p.get("edit_dialog") {
+        let id = id.as_str().ok_or("edit_dialog must be the id of an agent you added")?;
+        if !settings::open_edit(app, id) {
+            return Err(format!("edit_dialog: no added agent `{id}`"));
+        }
+    }
     if let Some(id) = p.get("default_agent").and_then(Value::as_str) {
         app.preferences.agent_default = id.to_string();
     }
@@ -1920,6 +2197,11 @@ pub fn control(app: &mut SolveApp, ctx: &egui::Context, p: &Value) -> Result<Val
     }
     if let Some(m) = p.get("model").and_then(Value::as_str) {
         set_model(app, m);
+    }
+    if let Some(option) = p.get("config_option") {
+        let id = option.get("id").and_then(Value::as_str).ok_or("config_option.id must be a string")?;
+        let value = option.get("value").and_then(Value::as_str).ok_or("config_option.value must be a string")?;
+        set_config_option(app, id, value);
     }
     if !shown(app) {
         return Ok(status(app));
@@ -2018,8 +2300,8 @@ pub fn status(app: &SolveApp) -> Value {
         .map(|i| match i {
             Item::User { text, image, pictures, context, files } => json!({"user": text, "image": image, "pictures": pictures.len(), "files": files, "context": context.items.iter().map(|i| json!({"label": i.label, "detail": i.detail})).collect::<Vec<_>>(), "context_omitted": context.omitted}),
             Item::Agent { thought, text } => json!({"agent": text, "thought": thought}),
-            Item::Tool { id, title, kind, status, output } => {
-                json!({"tool": id, "title": title, "kind": kind, "status": status.map(|s| format!("{s:?}")), "output": output})
+            Item::Tool { id, title, kind, status, input, output } => {
+                json!({"tool": id, "title": title, "kind": kind, "status": status.map(|s| format!("{s:?}")), "input": input, "output": output})
             }
             Item::Plan(p) => json!({"plan": p}),
             Item::Permission { title, options, answer, .. } => {
@@ -2033,7 +2315,7 @@ pub fn status(app: &SolveApp) -> Value {
     #[cfg(not(target_arch = "wasm32"))]
     let detection = c.detection.as_ref().map(|d| {
         json!({
-            "found": d.found.iter().map(|f| json!({"id": f.id, "name": f.name, "argv": f.argv, "version": f.version, "login": f.login.id()})).collect::<Vec<_>>(),
+            "found": d.found.iter().map(|f| json!({"id": f.id, "name": f.name, "argv": f.argv, "version": f.version, "login": f.login.id(), "problem": f.problem})).collect::<Vec<_>>(),
             "missing": d.missing.iter().map(|m| json!({"id": m.id, "install": m.install})).collect::<Vec<_>>(),
             "ms": d.took_ms,
         })
@@ -2043,9 +2325,14 @@ pub fn status(app: &SolveApp) -> Value {
     let pid = c.backend.as_ref().and_then(|b| b.pid());
     json!({
         "features": app.preferences.ai_features,
+        "configOptions": c.config_options,
+        "configPending": c.config_pending,
         "toolbarButton": app.preferences.ai_toolbar_button,
+        "connectAtStart": app.preferences.agent_connect_at_start,
+        "openAtStart": app.preferences.agent_chat_open_at_start,
+        "lastAgent": app.preferences.agent_last,
         "permissions": app.preferences.ai_permissions.id(),
-        "agents": agents::entries(app).iter().map(|e| json!({"id": e.id, "name": e.name, "kind": e.kind.id(), "found": e.found, "version": e.version, "login": e.login, "request_timeout_s": e.kind.is_api().then_some(e.request_timeout_s)})).collect::<Vec<_>>(),
+        "agents": agents::entries(app).iter().map(|e| json!({"id": e.id, "name": e.name, "kind": e.kind.id(), "found": e.found, "version": e.version, "login": e.login, "problem": e.problem, "request_timeout_s": e.kind.is_api().then_some(e.request_timeout_s)})).collect::<Vec<_>>(),
         "currentAgent": agents::current(app).map(|e| e.id),
         "models": c.models.iter().map(|m| json!({"id": m.id, "name": m.name, "description": m.description})).collect::<Vec<_>>(),
         "model": c.model,
