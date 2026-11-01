@@ -155,8 +155,7 @@ debug = "line-tables-only"
 # Android: blocking SAF picks park `android_main`, so lifecycle callbacks must not wait for it
 # (adds `set_nonblocking_callbacks`, used by apps/solidcraft-android/src/saf_bridge.rs).
 android-activity = { path = "vendor/android-activity" }
-# Android: pen hover (a stylus in the air) is a pointer move, and a palm resting on the glass
-# while the pen draws is not a second finger.
+# Android (pen hover, palm rejection) + Wayland trackpad pinch/rotation gestures.
 winit = { path = "vendor/winit" }
 truck-geometry = { path = "vendor/truck-geometry" }
 truck-shapeops = { path = "vendor/truck-shapeops" }
@@ -166,10 +165,6 @@ matext4cgmath = { path = "vendor/matext4cgmath" }
 
 # Keep OpenGL pipelines, resolve textures and CAD callbacks at the same safe sample count.
 egui-wgpu = { path = "vendor/egui-wgpu" }
-
-# Deliver trackpad pinch and rotation gestures on Wayland (zwp_pointer_gestures_v1), which
-# winit 0.30 never binds and eframe 0.36 still requires winit 0.30.
-winit = { path = "vendor/winit" }
 
 # macOS: dropping the accessibility adapter leaves AppKit's key-value observers intact (#7535).
 accesskit_macos = { path = "vendor/accesskit_macos" }

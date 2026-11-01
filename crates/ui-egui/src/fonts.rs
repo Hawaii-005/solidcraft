@@ -933,6 +933,7 @@ fn draws_simplified_chinese(bytes: &[u8]) -> bool {
 /// Japanese CJK font drew the Chinese UI alone and its simplified characters showed as boxes).
 #[cfg(not(target_arch = "wasm32"))]
 fn chinese_font_dirs() -> Vec<std::path::PathBuf> {
+    #[allow(unused_mut)]
     let mut dirs = Vec::new();
     #[cfg(target_os = "windows")]
     {
