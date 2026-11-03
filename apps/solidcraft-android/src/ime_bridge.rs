@@ -49,6 +49,17 @@ pub mod ime {
         /// from the old one would delete characters from the wrong field.
         pub fn reset(&mut self) {
             self.delivered.clear();
+            self.clear();
+        }
+
+        /// Clear the native soft-keyboard EditText buffer via JNI.
+        pub fn clear(&self) {
+            let _ = self.vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+                let activity_raw = self.app.activity_as_ptr() as jni::sys::jobject;
+                let activity = unsafe { env.as_cast_raw::<JObject>(&activity_raw)? };
+                env.call_method(&*activity, jni_str!("imeClear"), jni_sig!("()V"), &[])?;
+                Ok(())
+            });
         }
 
         /// Translate every keyboard event the Activity has queued since the last frame into the egui
@@ -60,8 +71,12 @@ pub mod ime {
             loop {
                 match self.next_event() {
                     Ok(Some(event)) => {
-                        for event in translate(&event, &mut self.delivered) {
+                        let (events, needs_clear) = translate(&event, &mut self.delivered);
+                        for event in events {
                             raw.events.push(event);
+                        }
+                        if needs_clear {
+                            self.clear();
                         }
                     }
                     Ok(None) => break,
@@ -132,32 +147,22 @@ pub mod ime {
 
     /// Decode one queued event. The first character tags it and the rest is the payload:
     /// `r` the whole IME buffer after a change, `a` an editor action (Done/Go/Search).
-    ///
-    /// `delivered` is what egui already shows from the IME, so a buffer snapshot becomes the
-    /// delete-then-commit pair egui applies:
-    ///
-    /// - an append (`q` -> `qw`) is a commit of the added tail;
-    /// - a backspace (`qw` -> `q`) is `DeleteSurrounding` of the dropped tail;
-    /// - an autocorrect (`qwe` -> `que`) is a delete of the old tail plus a commit of the new one.
-    ///
-    /// No `Preedit` is ever emitted on purpose: egui's `TextEdit` deletes a pre-edit by the range it
-    /// remembers and silently drops a `DeleteSurrounding` while a composition is open, which is
-    /// exactly the state a command field is in after the first character — so ⌫ did nothing.
-    fn translate(event: &str, delivered: &mut String) -> Vec<egui::Event> {
+    /// Returns `(events, needs_clear)`.
+    fn translate(event: &str, delivered: &mut String) -> (Vec<egui::Event>, bool) {
         let mut chars = event.chars();
         let Some(tag) = chars.next() else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
         let payload = chars.as_str();
         match tag {
             'r' => {
                 if payload == delivered {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
                 // Enter arrives as a newline in the buffer; egui ignores `Commit("\n")`.
                 if payload.contains('\n') || payload.contains('\r') {
                     delivered.clear();
-                    return vec![enter_key()];
+                    return (vec![enter_key()], true);
                 }
                 let old = std::mem::take(delivered);
                 let prefix = common_prefix(&old, payload);
@@ -180,45 +185,45 @@ pub mod ime {
                     added.chars().count(),
                     removed
                 );
-                events
+                (events, false)
             }
             // An editor action (Done/Go/Search/Send) confirms the field. IME_ACTION_NONE (0)
             // carries no meaning.
             'a' => match payload.trim().parse::<i32>() {
                 Ok(action) if action != 0 => {
                     delivered.clear();
-                    vec![enter_key()]
+                    (vec![enter_key()], true)
                 }
-                _ => Vec::new(),
+                _ => (Vec::new(), false),
             },
             // Older Activities (pre-snapshot) send pre-edit/commit/delete events one by one. Keep
             // them working rather than going silent on an app/Activity version mismatch.
             'c' if !payload.is_empty() => {
                 if payload == "\n" || payload == "\r" || payload == "\r\n" {
                     delivered.clear();
-                    return vec![enter_key()];
+                    return (vec![enter_key()], true);
                 }
                 delivered.push_str(payload);
-                vec![egui::Event::Ime(egui::ImeEvent::Commit(payload.to_owned()))]
+                (vec![egui::Event::Ime(egui::ImeEvent::Commit(payload.to_owned()))], false)
             }
             'd' => {
                 let Some((before, after)) = payload.split_once(',') else {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 };
                 let before_chars = before.trim().parse().unwrap_or(0);
                 let after_chars = after.trim().parse().unwrap_or(0);
                 if before_chars + after_chars == 0 {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
                 for _ in 0..before_chars {
                     delivered.pop();
                 }
-                vec![egui::Event::Ime(egui::ImeEvent::DeleteSurrounding {
+                (vec![egui::Event::Ime(egui::ImeEvent::DeleteSurrounding {
                     before_chars,
                     after_chars,
-                })]
+                })], false)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), false),
         }
     }
 
@@ -239,16 +244,16 @@ pub mod ime {
         #[test]
         fn an_append_is_only_the_added_tail() {
             let mut delivered = String::new();
-            assert_eq!(committed(&translate("rq", &mut delivered)), "q");
-            assert_eq!(committed(&translate("rqw", &mut delivered)), "w");
-            assert_eq!(committed(&translate("rqwe", &mut delivered)), "e");
-            assert!(translate("rqwe", &mut delivered).is_empty(), "unchanged snapshot is silent");
+            assert_eq!(committed(&translate("rq", &mut delivered).0), "q");
+            assert_eq!(committed(&translate("rqw", &mut delivered).0), "w");
+            assert_eq!(committed(&translate("rqwe", &mut delivered).0), "e");
+            assert!(translate("rqwe", &mut delivered).0.is_empty(), "unchanged snapshot is silent");
         }
 
         #[test]
         fn a_backspace_deletes_the_dropped_tail() {
             let mut delivered = "qwe".to_owned();
-            let events = translate("rqw", &mut delivered);
+            let (events, _) = translate("rqw", &mut delivered);
             assert_eq!(events.len(), 1);
             match &events[0] {
                 egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars, after_chars }) => {
@@ -262,7 +267,7 @@ pub mod ime {
         #[test]
         fn an_autocorrect_replaces_the_tail() {
             let mut delivered = "qwe".to_owned();
-            let events = translate("rque", &mut delivered);
+            let (events, _) = translate("rque", &mut delivered);
             assert_eq!(committed(&events), "que");
             assert!(matches!(
                 events[0],
@@ -276,19 +281,20 @@ pub mod ime {
         #[test]
         fn a_newline_is_enter_and_clears_the_buffer() {
             let mut delivered = "sketch".to_owned();
-            let events = translate("rsketch\n", &mut delivered);
+            let (events, needs_clear) = translate("rsketch\n", &mut delivered);
             assert!(matches!(
                 events.as_slice(),
                 [egui::Event::Key { key: egui::Key::Enter, .. }]
             ));
             assert!(delivered.is_empty());
+            assert!(needs_clear);
         }
 
         #[test]
         fn accented_characters_take_the_right_byte_prefix() {
             let mut delivered = String::new();
-            assert_eq!(committed(&translate("rração", &mut delivered)), "ração");
-            assert_eq!(committed(&translate("rraçõ", &mut delivered)), "");
+            assert_eq!(committed(&translate("rração", &mut delivered).0), "ração");
+            assert_eq!(committed(&translate("rraçõ", &mut delivered).0), "");
             assert_eq!(delivered, "raçõ");
         }
     }

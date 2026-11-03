@@ -26,7 +26,7 @@ use solidcraft_ui_egui::{Services, SolveApp};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const ANDROID_SHELL_MARKER: &str = "SOLIDCRAFT_ANDROID_SHELL_V8_UPSTREAM_0_29_0";
+const ANDROID_SHELL_MARKER: &str = "SOLIDCRAFT_ANDROID_SHELL_V9_UPSTREAM_0_40_0";
 
 /// Depth/stencil the egui pass allocates; the viewport callback is built for the same formats.
 const DEPTH_BITS: u8 = 24;

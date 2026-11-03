@@ -395,6 +395,21 @@ public final class SolidCraftActivity extends NativeActivity {
         });
     }
 
+    /** Clear the soft keyboard buffer. Called by the Rust shell via JNI. */
+    public void imeClear() {
+        final EditText view = imeView;
+        if (view == null) {
+            return;
+        }
+        runOnUiThread(() -> {
+            try {
+                view.setText("");
+            } catch (Throwable error) {
+                Log.w(TAG, "Could not clear the soft keyboard buffer", error);
+            }
+        });
+    }
+
     /**
      * Hand the Rust shell at most one queued keyboard event per call. The first character tags the
      * event ("c" commit, "p" pre-edit, "f" finish, "d" delete-with-counts, "a" editor action) and

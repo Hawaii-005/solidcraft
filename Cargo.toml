@@ -154,7 +154,6 @@ codegen-units = 16
 # binary). See docs/crash-reports.md.
 debug = "line-tables-only"
 
-<<<<<<< HEAD
 # Vendored crates with SolidCraft fixes (see vendor/README.md and ATTRIBUTION.md).
 [patch.crates-io]
 # Android: blocking SAF picks park `android_main`, so lifecycle callbacks must not wait for it
