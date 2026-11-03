@@ -3,7 +3,8 @@
 //! profile.
 
 use serde_json::{Value, json};
-use solidcraft_geom::Vec2;
+use solidcore_record::Vec2;
+use solidcraft_geom::prelude::*;
 use solidcraft_sketch::{CurveKind, Sketch};
 
 use crate::Session;
@@ -27,6 +28,44 @@ fn new_sketch() -> Session {
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY"}));
     s
+}
+
+#[test]
+fn a_short_horizontal_reference_holds_through_dimension_edits_drag_and_reopen() {
+    let mut s = new_sketch();
+    let id = s.active_sketch.unwrap();
+    // A saved infinite line may have very close defining points (#11001).
+    let sk = s.doc_mut().sketch_mut(id).unwrap();
+    let end = sk.add_point(Vec2::new(6.36e-8, 0.0), Some("axis.end")).unwrap();
+    let arm_end = sk.add_point(Vec2::new(12.0, 10.0), Some("arm.end")).unwrap();
+    let axis = sk.add_line_pts(0, end, Some("axis")).unwrap();
+    sk.curves[axis].infinite = true;
+    sk.curves[axis].construction = true;
+    sk.add_line_pts(0, arm_end, Some("arm")).unwrap();
+    sk.add_constraint(solidcraft_sketch::ConstraintKind::Horizontal { l: axis }, None).unwrap();
+    s.refresh();
+
+    let check = |s: &Session, degrees: f64| {
+        let state = s.model.state();
+        let solved = state.sketch(id).unwrap();
+        assert!(solved.report.ok(), "{:?}", solved.report);
+        let axis = solved.sketch.points[end].pos.normalized().unwrap();
+        let arm = solved.sketch.points[arm_end].pos.normalized().unwrap();
+        assert!(axis.dist(Vec2::X) < 1e-6, "the horizontal reference rotated: {axis:?}");
+        assert!((arm.y.atan2(arm.x) - degrees.to_radians()).abs() < 1e-6, "the free line has the wrong angle: {arm:?}");
+    };
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["axis", "arm"], "type": "angle", "value": "30 deg"}));
+    check(&s, 30.0);
+    run(&mut s, "parameters.change", json!({"name": out["param"], "expression": "15 deg"}));
+    check(&s, 15.0);
+    let at = sketch(&s).points[arm_end].pos;
+    run(&mut s, "sketch.drag", json!({"entity": "arm.end", "from": [at.x, at.y], "to": [14, 10]}));
+    run(&mut s, "sketch.drag_end", json!({}));
+    check(&s, 15.0);
+    let doc = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    *s.doc_mut() = doc;
+    s.refresh();
+    check(&s, 15.0);
 }
 
 fn profiles(s: &Session) -> usize {
