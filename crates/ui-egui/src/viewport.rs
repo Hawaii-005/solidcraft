@@ -164,6 +164,8 @@ pub struct ViewportState {
     /// Where the lone finger of this gesture landed. One finger only orbits once it has moved past
     /// a small dead zone, so a pinch's second finger can land before the first one turns the view.
     pub(crate) touch_landing: Option<Pos2>,
+    /// Latched once one finger moves past the dead zone (TOUCH_ARM), kept true until touch ends.
+    pub(crate) touch_armed: bool,
     /// This gesture has had two fingers: its release is not a click — a pinch must not pick.
     pub(crate) touch_multi: bool,
     /// When a touch event last arrived (`egui` time). A gesture that goes quiet for longer than
@@ -13163,5 +13165,281 @@ mod feature_highlight_tests {
         assert!(faces.iter().any(|p| p.x > 20.0), "the tab lights its own faces: {parts:?}");
         // The plate's walls bulge past y = ±8; nothing of the tab does.
         assert!(faces.iter().all(|p| p.y.abs() <= 8.0 + 1e-6), "{parts:?}");
+    }
+}
+
+#[cfg(test)]
+mod touch_issue_reproduction_tests {
+    use super::*;
+    use crate::scenario::Harness;
+    use egui::{pos2, vec2, TouchDeviceId, TouchId, TouchPhase};
+
+    /// 1) dedo A Start, 1 frame, dedo B Start (frames diferentes), mover os dois juntos:
+    /// esperado = pan, yaw/pitch inalterados; e pinça simétrica = zoom sem deslocar target.
+    #[test]
+    fn test_touch_problem_1_two_fingers_staggered_start_pans_and_pinch_zooms() {
+        let mut h = Harness::new();
+        h.settle();
+        let initial_cam = h.app.cam;
+
+        let finger_a = TouchId(101);
+        let finger_b = TouchId(102);
+        let pos_a = pos2(700.0, 500.0);
+        let pos_b = pos2(900.0, 500.0);
+
+        // Frame 1: Finger A lands (Start)
+        h.frame_with(vec![
+            egui::Event::PointerMoved(pos_a),
+            egui::Event::PointerButton {
+                pos: pos_a,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_a,
+                phase: TouchPhase::Start,
+                pos: pos_a,
+                force: None,
+            },
+        ]);
+
+        // Frame 2: Finger B lands on a later frame
+        h.frame_with(vec![egui::Event::Touch {
+            device_id: TouchDeviceId(0),
+            id: finger_b,
+            phase: TouchPhase::Start,
+            pos: pos_b,
+            force: None,
+        }]);
+
+        // Frame 3: Both fingers move together to the right by 50pt
+        let pan_delta = vec2(50.0, 0.0);
+        let events = vec![
+            egui::Event::PointerMoved(pos_a + pan_delta),
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_a,
+                phase: TouchPhase::Move,
+                pos: pos_a + pan_delta,
+                force: None,
+            },
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_b,
+                phase: TouchPhase::Move,
+                pos: pos_b + pan_delta,
+                force: None,
+            },
+        ];
+        h.frame_with(events);
+
+            // Expected: Yaw and pitch must NOT change (must not orbit). Camera target must move (pan).
+        assert_eq!(h.app.cam.yaw, initial_cam.yaw, "yaw changed: two-finger gesture orbited instead of panning!");
+        assert_eq!(h.app.cam.pitch, initial_cam.pitch, "pitch changed: two-finger gesture orbited instead of panning!");
+        assert_ne!(h.app.cam.target, initial_cam.target, "camera target did not pan!");
+    }
+
+    /// 2) um dedo orbita, volta ao ponto de pouso e passa dele: a vista continua girando.
+    #[test]
+    fn test_touch_problem_2_dead_zone_not_locked_stops_orbit() {
+        let mut h = Harness::new();
+        h.settle();
+        let finger = TouchId(201);
+        let landing = pos2(800.0, 500.0);
+
+        // Frame 1: Finger touches landing point
+        h.frame_with(vec![
+            egui::Event::PointerMoved(landing),
+            egui::Event::PointerButton {
+                pos: landing,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger,
+                phase: TouchPhase::Start,
+                pos: landing,
+                force: None,
+            },
+        ]);
+
+        // Frame 2: Finger moves 40pt to arm orbit (> TOUCH_ARM of 12)
+        h.frame_with(vec![
+            egui::Event::PointerMoved(landing + vec2(40.0, 0.0)),
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger,
+                phase: TouchPhase::Move,
+                pos: landing + vec2(40.0, 0.0),
+                force: None,
+            },
+        ]);
+
+        // Frame 3: Finger moves back near landing (at +5pt from landing, within 12pt dead zone)
+        h.frame_with(vec![
+            egui::Event::PointerMoved(landing + vec2(5.0, 0.0)),
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger,
+                phase: TouchPhase::Move,
+                pos: landing + vec2(5.0, 0.0),
+                force: None,
+            },
+        ]);
+        let cam_near_landing = h.app.cam;
+
+        // Frame 4: Finger moves across landing to -5pt (moved 10pt leftwards, still within 12pt of landing)
+        h.frame_with(vec![
+            egui::Event::PointerMoved(landing - vec2(5.0, 0.0)),
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger,
+                phase: TouchPhase::Move,
+                pos: landing - vec2(5.0, 0.0),
+                force: None,
+            },
+        ]);
+        let cam_across_landing = h.app.cam;
+
+        // Expected: Camera must continue rotating as it moves across the landing point!
+        assert_ne!(
+            (cam_across_landing.yaw, cam_across_landing.pitch),
+            (cam_near_landing.yaw, cam_near_landing.pitch),
+            "camera stopped rotating when passing through landing point!"
+        );
+    }
+
+    /// 3) pinça, soltar um dedo, mover o outro: a câmera não muda.
+    #[test]
+    fn test_touch_problem_3_remaining_finger_after_pinch_orbits() {
+        let mut h = Harness::new();
+        h.settle();
+        let finger_a = TouchId(301);
+        let finger_b = TouchId(302);
+        let pos_a = pos2(700.0, 500.0);
+        let pos_b = pos2(900.0, 500.0);
+
+        // Frame 1: Two fingers touch
+        h.frame_with(vec![
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_a,
+                phase: TouchPhase::Start,
+                pos: pos_a,
+                force: None,
+            },
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_b,
+                phase: TouchPhase::Start,
+                pos: pos_b,
+                force: None,
+            },
+        ]);
+
+        // Frame 2: Fingers move (pinch/pan)
+        h.frame_with(vec![
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_a,
+                phase: TouchPhase::Move,
+                pos: pos_a + vec2(-15.0, 0.0),
+                force: None,
+            },
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_b,
+                phase: TouchPhase::Move,
+                pos: pos_b + vec2(15.0, 0.0),
+                force: None,
+            },
+        ]);
+
+        // Frame 3: Finger B lifts (End)
+        h.frame_with(vec![egui::Event::Touch {
+            device_id: TouchDeviceId(0),
+            id: finger_b,
+            phase: TouchPhase::End,
+            pos: pos_b + vec2(15.0, 0.0),
+            force: None,
+        }]);
+        let cam_after_lift = h.app.cam;
+
+        // Frame 4: Remaining finger A moves (also simulated as primary pointer down/moved)
+        h.frame_with(vec![
+            egui::Event::PointerMoved(pos_a + vec2(-45.0, 0.0)),
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger_a,
+                phase: TouchPhase::Move,
+                pos: pos_a + vec2(-45.0, 0.0),
+                force: None,
+            },
+        ]);
+
+        // Expected: Remaining finger must NOT cause camera to orbit or move
+        assert_eq!(
+            (h.app.cam.yaw, h.app.cam.pitch),
+            (cam_after_lift.yaw, cam_after_lift.pitch),
+            "camera orbited when remaining finger moved after pinch!"
+        );
+        assert_eq!(h.app.cam.target, cam_after_lift.target, "camera target moved after pinch!");
+    }
+
+    /// 4) um toque curto numa face, sem ferramenta, seleciona a face.
+    #[test]
+    fn test_touch_problem_4_short_tap_selects_face() {
+        let mut h = Harness::new();
+        h.call("engine.execute", json!({"command": "solid.box", "params": {"length": 40, "width": 40, "height": 40}}));
+        h.settle();
+        h.frames(5);
+
+        // Center of the screen hits the box
+        let center = pos2(800.0, 500.0);
+        let finger = TouchId(401);
+
+        // Short tap: Start then End at the exact same position (with primary pointer translated by egui-winit)
+        h.frame_with(vec![
+            egui::Event::PointerMoved(center),
+            egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger,
+                phase: TouchPhase::Start,
+                pos: center,
+                force: None,
+            },
+        ]);
+
+        h.frame_with(vec![
+            egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Touch {
+                device_id: TouchDeviceId(0),
+                id: finger,
+                phase: TouchPhase::End,
+                pos: center,
+                force: None,
+            },
+        ]);
+
+        // Expected: The face under the tap should be selected!
+        assert!(
+            !h.app.session.selection.is_empty(),
+            "short tap did not select the face under the finger (selection is empty)!"
+        );
     }
 }

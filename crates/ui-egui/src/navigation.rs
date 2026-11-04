@@ -662,7 +662,9 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     }
     if app.viewport.touch.is_empty() {
         app.viewport.touch_landing = None;
+        app.viewport.touch_armed = false;
         app.viewport.touch_span = None;
+        app.viewport.touch_centroid = None;
     }
     // Self-healing: a pen's palm rejection drops the finger events it ignores, so a finger can be
     // left in the list with nothing down and the view would keep panning under the pen.
@@ -675,26 +677,40 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     {
         app.viewport.touch.clear();
         app.viewport.touch_landing = None;
+        app.viewport.touch_armed = false;
         app.viewport.touch_span = None;
+        app.viewport.touch_centroid = None;
     }
     // One finger orbits only after a short dead zone: landing two fingers for a pinch must not spin
-    // the model on the way in (the first finger always lands first).
-    let armed = match (app.viewport.touch.len(), app.viewport.touch_landing) {
-        (1, Some(land)) => (app.viewport.touch[0].1 - land).length() > TOUCH_ARM,
+    // the model on the way in (the first finger always lands first). Once armed, stay armed.
+    // If the gesture has already involved multiple fingers (touch_multi), a remaining single finger does not orbit.
+    let armed = match (app.viewport.touch.len(), app.viewport.touch_landing, app.viewport.touch_multi) {
+        (1, _, true) => false,
+        (1, Some(land), false) => {
+            if !app.viewport.touch_armed && (app.viewport.touch[0].1 - land).length() > TOUCH_ARM {
+                app.viewport.touch_armed = true;
+            }
+            app.viewport.touch_armed
+        }
         _ => true,
     };
-    let delta = if armed { delta } else { egui::Vec2::ZERO };
+    let one_finger_armed = app.viewport.touch.len() == 1 && armed;
+    let mut delta = if armed { delta } else { egui::Vec2::ZERO };
     let two_fingers = app.viewport.touch.len() >= 2;
-    for (id, phase, pos) in ui.input(|i| {
-        i.events
-            .iter()
-            .filter_map(|e| match e {
-                egui::Event::Touch { id, phase, pos, .. } => Some((*id, *phase, *pos)),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    }) {
-        log::debug!("touch event id={id:?} phase={phase:?} pos=({:.1},{:.1})", pos.x, pos.y);
+    // Two-finger centroid pan: track midpoint displacement when exactly 2 fingers are touching
+    if app.viewport.touch.len() == 2 {
+        let current_centroid = pos2(
+            (app.viewport.touch[0].1.x + app.viewport.touch[1].1.x) * 0.5,
+            (app.viewport.touch[0].1.y + app.viewport.touch[1].1.y) * 0.5,
+        );
+        if let Some(prev) = app.viewport.touch_centroid {
+            delta = current_centroid - prev;
+        } else {
+            delta = egui::Vec2::ZERO;
+        }
+        app.viewport.touch_centroid = Some(current_centroid);
+    } else {
+        app.viewport.touch_centroid = None;
     }
     // Pinch: egui's multi-touch state when it has one, otherwise the fingers' spread directly.
     let (zoom, anchor_at, fingers) = match ui.input(|i| i.multi_touch()) {
@@ -746,7 +762,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     // Body-free wheel/drag navigation is meaningless under two fingers: the fingers own the view.
     let touch_nav = if two_fingers {
         Some(NavMode::Pan)
-    } else if app.viewport.touch.len() == 1 && app.tool.is_none() && app.dialog.is_none() && inside {
+    } else if one_finger_armed && app.tool.is_none() && app.dialog.is_none() && inside {
         Some(NavMode::Orbit)
     } else {
         None
@@ -863,6 +879,12 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     } else if !primary_down && !primary_released {
         app.viewport.primary_nav = None;
     }
+    // Two-finger touch overrides primary navigation to Pan while fingers are down
+    if two_fingers && (primary_down || !app.viewport.touch.is_empty()) {
+        app.viewport.primary_nav = Some(NavMode::Pan);
+    } else if one_finger_armed && (primary_down || !app.viewport.touch.is_empty()) {
+        app.viewport.primary_nav = Some(NavMode::Orbit);
+    }
     // Hold Space for a momentary pan: the hand tool of design apps. It overrides whatever the
     // left button would otherwise do - selecting, dragging geometry, the preset's binding or the
     // navigation bar's fixed mode - and lasts only while the key is held. Space still types in a
@@ -898,7 +920,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     // An orbit started on the viewport owns its button until release, including over a
     // floating shell card that disables the underlying egui response.
     let captured_orbit = app.viewport.orbit_from.is_some() && button.is_some();
-    let dragging = resp.dragged() || (inside && button.is_some()) || captured_orbit;
+    let dragging = resp.dragged() || (inside && button.is_some()) || captured_orbit || (two_fingers && inside) || (one_finger_armed && inside);
     // Without orbit (a flat page), bindings that orbit do nothing.
     let allowed = |m: NavMode| caps.orbit || m != NavMode::Orbit;
     let motion = modifier_motion(app, ui, inside, hover, mods, picking).filter(|(m, _)| allowed(*m));
@@ -910,7 +932,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
                     Some(b) => crate::prefs::nav_mode(app, b, mods),
                     // A press held still that opened Select Other stays its own: egui calls it a
                     // drag after 0.8 s, and moving to a row must not turn the view under the list.
-                    None if primary_down && !crate::select_other::is_open(app) => primary_nav,
+                    None if (primary_down || two_fingers || one_finger_armed) && !crate::select_other::is_open(app) => primary_nav,
                     None => None,
                 }
             } else {
