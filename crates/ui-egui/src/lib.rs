@@ -291,6 +291,8 @@ pub mod stand_up;
 mod status_bar;
 #[cfg(test)]
 mod sweep_dialog_tests;
+#[cfg(test)]
+mod touch_sketch_tests;
 pub(crate) mod test_boat;
 pub mod theme;
 pub mod theme_files;

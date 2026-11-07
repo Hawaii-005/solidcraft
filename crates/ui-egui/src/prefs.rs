@@ -1565,6 +1565,8 @@ preference_settings! {
     /// release and end there (#7247); clicks still draw a chain. Off (the default): a drag is a
     /// click that moved on the way, placing a point where it is let go (#2448).
     line_drag_draws_one: bool = false, PAGE_SKETCH => check_id("prefs.line_drag_draws_one");
+    /// When sketching on touch / tablet devices, stage the second point and confirm with check button.
+    touch_sketch_confirm: bool = cfg!(target_os = "android"), PAGE_SKETCH => check_id("prefs.touch_sketch_confirm");
     /// In the Line tool, leaving the chain's last point and resting back on it switches to a
     /// tangent arc, and the same again back to lines (#9489). Off (the default): resting there
     /// does nothing, and tangent arcs are the Arc tool's.

@@ -51,6 +51,8 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             ));
         let line_drag = setting::line_drag_draws_one(app, ui).on_hover_text(app.tr("prefs.line_drag_draws_one_note"));
         crate::scenario::publish_target("prefs:line_drag_draws_one", line_drag.rect);
+        let touch_confirm = setting::touch_sketch_confirm(app, ui);
+        crate::scenario::publish_target("prefs:touch_sketch_confirm", touch_confirm.rect);
         let line_arc = setting::line_hover_tangent_arc(app, ui).on_hover_text(app.tr("prefs.line_hover_tangent_arc_note"));
         crate::scenario::publish_target("prefs:line_hover_tangent_arc", line_arc.rect);
         ui_kit::settings_block_hint(ui, app.tr("prefs.hold_stop_snapping"), app.tr("prefs.snap_drawing_note"), t.space_24 * 8.0 + t.space_8, |ui| {

@@ -104,6 +104,48 @@ pub struct Tool {
     /// The construction line tools' Construction/Normal switch (#10258): a segment with a length
     /// becomes a normal sketch line. Each start of a tool begins at Construction.
     pub normal: bool,
+    /// Touch confirmation mode (#touch-sketch): stages the final point and waits for confirmation.
+    pub awaiting_confirmation: bool,
+    pub staged_point: Option<(Vec2, Option<String>)>,
+    /// Number of confirmed segments in an active line/spline chain.
+    pub confirmed_segments: usize,
+    /// Origin coordinate of the chain's first point for closed profile detection.
+    pub chain_origin: Option<Vec2>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolSnapshot {
+    pub pts: Vec<(Vec2, Option<String>)>,
+    pub lined: Vec<(Vec2, Vec<crate::sketch_tools::Lined>)>,
+    pub chain: crate::sketch_line_arc::LineChain,
+    pub awaiting_confirmation: bool,
+    pub staged_point: Option<(Vec2, Option<String>)>,
+    pub confirmed_segments: usize,
+    pub chain_origin: Option<Vec2>,
+}
+
+impl Tool {
+    pub fn snapshot(&self) -> ToolSnapshot {
+        ToolSnapshot {
+            pts: self.pts.clone(),
+            lined: self.lined.clone(),
+            chain: self.chain.clone(),
+            awaiting_confirmation: self.awaiting_confirmation,
+            staged_point: self.staged_point.clone(),
+            confirmed_segments: self.confirmed_segments,
+            chain_origin: self.chain_origin,
+        }
+    }
+
+    pub fn restore_snapshot(&mut self, snap: ToolSnapshot) {
+        self.pts = snap.pts;
+        self.lined = snap.lined;
+        self.chain = snap.chain;
+        self.awaiting_confirmation = snap.awaiting_confirmation;
+        self.staged_point = snap.staged_point;
+        self.confirmed_segments = snap.confirmed_segments;
+        self.chain_origin = snap.chain_origin;
+    }
 }
 
 impl Tool {
@@ -158,6 +200,10 @@ impl Tool {
             lined: Vec::new(),
             chain: Default::default(),
             normal: false,
+            awaiting_confirmation: false,
+            staged_point: None,
+            confirmed_segments: 0,
+            chain_origin: None,
         })
     }
 }
@@ -290,19 +336,21 @@ pub fn on_click(app: &mut SolveApp, proj: &Proj, pos: Pos2, shift: bool) {
     }
     match tool.kind {
         Kind::Draw(n) => {
-            if let Some(p) = sketch_point_at(app, proj, pos) {
-                // Typed values win over the cursor; lines snap to horizontal/vertical.
-                let p = crate::sketch_dims::placed(app, &tool, &p);
-                // A repeated initial point supplies no extent. Keep waiting rather than
-                // attempting a degenerate shape; explicit typed values still validate.
-                if n != 1 && tool.pts.len() == 1 && tool.pts.first().is_some_and(|first| first.0 == p.0) && !tool.dims.iter().any(|b| b.locked) {
-                    app.tool = Some(tool);
-                    return;
-                }
+            let Some(p) = sketch_point_at(app, proj, pos) else {
                 app.tool = Some(tool);
-                place(app, p);
+                return;
+            };
+            // Typed values win over the cursor; lines snap to horizontal/vertical.
+            let p = crate::sketch_dims::placed(app, &tool, &p);
+            // A repeated initial point supplies no extent. Keep waiting rather than
+            // attempting a degenerate shape; explicit typed values still validate.
+            if n != 1 && tool.pts.len() == 1 && tool.pts.first().is_some_and(|first| first.0 == p.0) && !tool.dims.iter().any(|b| b.locked) {
+                app.tool = Some(tool);
                 return;
             }
+            app.tool = Some(tool);
+            place(app, p);
+            return;
         }
         Kind::HorizontalVertical => {
             let hits = pick(app, proj, pos);
@@ -528,15 +576,33 @@ pub fn place(app: &mut SolveApp, p: (Vec2, Option<String>)) {
         app.tool = Some(tool);
         return;
     }
+    if tool.awaiting_confirmation {
+        // A new touch/tap while already awaiting confirmation repositions the staged final point
+        tool.pts.pop();
+        tool.lined.pop();
+        tool.staged_point = None;
+    }
     tool.lined.push((p.0, crate::sketch_tools::lined_at(p.0)));
+    let p_clone = p.clone();
     tool.pts.push(p);
     let before = crate::sketch_tools::point_ids(app);
     if tool.cmd == "sketch.line" {
         // A new chain's first point: nothing drawn yet to go on tangent from.
         if tool.pts.len() == 1 {
             tool.chain = Default::default();
+            if tool.confirmed_segments == 0 {
+                tool.chain_origin = Some(p_clone.0);
+            }
         }
         if tool.pts.len() >= 2 {
+            let touch_mode = is_touch_input(app);
+            if touch_mode {
+                // In touch mode, stage the second point and await confirmation
+                tool.awaiting_confirmation = true;
+                tool.staged_point = tool.pts.last().cloned();
+                app.tool = Some(tool);
+                return;
+            }
             let (a, b) = (tool.pts[tool.pts.len() - 2].clone(), tool.pts[tool.pts.len() - 1].clone());
             let angled = crate::sketch_dims::has_locked(&tool, "Angle");
             let dimensioned = tool.dims.iter().any(|dimension| dimension.locked);
@@ -562,6 +628,7 @@ pub fn place(app: &mut SolveApp, p: (Vec2, Option<String>)) {
                     // The chain needs only its current endpoint, even after many segments.
                     tool.pts = vec![tool.pts[last].clone()];
                     tool.chain.placed(id, a.clone());
+                    tool.confirmed_segments += 1;
                 }
                 crate::sketch_dims::reset(&mut tool);
             } else {
@@ -570,21 +637,346 @@ pub fn place(app: &mut SolveApp, p: (Vec2, Option<String>)) {
             }
         }
     } else if n > 0 && tool.pts.len() >= n {
+        let touch_mode = is_touch_input(app);
+        if touch_mode {
+            // Stage the point and wait for touch checkmark / Enter confirmation
+            tool.awaiting_confirmation = true;
+            tool.staged_point = tool.pts.last().cloned();
+            // Awaiting confirmation keeps the staged shape ready to confirm
+            app.tool = Some(tool);
+            return;
+        } else {
+            match run_shape(app, &tool) {
+                Ok(_) => {
+                    let placed: Vec<Vec2> = tool.pts.iter().map(|p| p.0).collect();
+                    crate::sketch_tools::constrain_lined(app, &mut tool, &placed, &before);
+                    tool.pts.clear();
+                    tool.awaiting_confirmation = false;
+                    tool.staged_point = None;
+                    crate::sketch_dims::reset(&mut tool);
+                }
+                Err(error) => {
+                    app.set_status(error, true);
+                    tool.pts.pop();
+                    tool.lined.pop();
+                    tool.awaiting_confirmation = false;
+                    tool.staged_point = None;
+                }
+            }
+        }
+    }
+    app.tool = Some(tool);
+}
+
+/// Duration in seconds after a touch/pen event during which inputs are considered touch/pen.
+pub const TOUCH_CONFIRM_WINDOW_S: f64 = 1.0;
+
+/// Whether the user is currently sketching using touch or pen input.
+pub fn is_touch_input(app: &SolveApp) -> bool {
+    if !app.preferences.touch_sketch_confirm {
+        return false;
+    }
+    // If active touch points exist, it is definitively touch/pen
+    if !app.viewport.touch.is_empty() {
+        return true;
+    }
+    // If a touch/pen event was received within the active window
+    if let Some(t) = app.viewport.last_touch_event_at {
+        if app.viewport.frame_time >= t && (app.viewport.frame_time - t) < TOUCH_CONFIRM_WINDOW_S {
+            return true;
+        }
+    }
+    false
+}
+
+/// Button size for touch confirm / cancel in dp.
+pub const TOUCH_CONFIRM_BTN_SIZE: f32 = 48.0;
+
+/// Compute the layout bounding boxes for touch confirmation (✓) and cancellation (✕) buttons.
+pub fn touch_confirm_button_layout(screen_pos: egui::Pos2, viewport_rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let btn_size = TOUCH_CONFIRM_BTN_SIZE;
+    const SPACING: f32 = 12.0;
+    let mut center = screen_pos + egui::vec2(0.0, 40.0);
+    let total_width = btn_size * 2.0 + SPACING;
+    let total_height = btn_size;
+
+    center.x = center.x.clamp(viewport_rect.left() + total_width * 0.5 + 8.0, viewport_rect.right() - total_width * 0.5 - 8.0);
+    center.y = center.y.clamp(viewport_rect.top() + total_height * 0.5 + 8.0, viewport_rect.bottom() - total_height * 0.5 - 8.0);
+
+    let confirm_rect = egui::Rect::from_center_size(center - egui::vec2(btn_size * 0.5 + SPACING * 0.5, 0.0), egui::vec2(btn_size, btn_size));
+    let cancel_rect = egui::Rect::from_center_size(center + egui::vec2(btn_size * 0.5 + SPACING * 0.5, 0.0), egui::vec2(btn_size, btn_size));
+    (confirm_rect, cancel_rect)
+}
+
+pub fn conclude_rect(app: &SolveApp) -> Option<egui::Rect> {
+    let tool = app.tool.as_ref()?;
+    if tool.cmd != "sketch.line" || tool.confirmed_segments == 0 {
+        return None;
+    }
+    let proj = crate::viewport::display_proj(app);
+    let btn_width = 96.0;
+    let btn_height = 40.0;
+    // Bottom footer with >= 48 dp safe margin from the status bar / bottom
+    let center = egui::pos2(proj.rect.center().x, proj.rect.bottom() - 56.0);
+    let rect = egui::Rect::from_center_size(center, egui::vec2(btn_width, btn_height));
+    Some(rect)
+}
+
+pub fn touch_confirm_rects(app: &SolveApp) -> Vec<egui::Rect> {
+    let Some(tool) = app.tool.as_ref() else { return Vec::new() };
+    if !tool.awaiting_confirmation {
+        return Vec::new();
+    }
+    let Some(sid) = app.session.active_sketch else { return Vec::new() };
+    let st = crate::open_meshing::session_world(&app.session);
+    let Some(ss) = st.sketch(sid) else { return Vec::new() };
+    let proj = crate::viewport::display_proj(app);
+
+    let screen_pos = tool
+        .staged_point
+        .as_ref()
+        .and_then(|p| proj.to_screen(ss.plane.to_world(p.0)))
+        .unwrap_or_else(|| proj.rect.center());
+
+    let (confirm_rect, cancel_rect) = touch_confirm_button_layout(screen_pos, proj.rect);
+    vec![confirm_rect, cancel_rect]
+}
+/// Conclude an active line/spline chain: if there is a staged segment, confirm it first,
+/// then end the tool/chain.
+pub fn conclude_chain(app: &mut SolveApp) -> bool {
+    let Some(tool) = app.tool.as_ref() else { return false };
+    if tool.cmd != "sketch.line" || tool.confirmed_segments == 0 {
+        return false;
+    }
+    if tool.awaiting_confirmation {
+        confirm_staged(app);
+    }
+    if let Some(t) = app.tool.as_mut() {
+        t.pts.clear();
+        t.picks.clear();
+        t.awaiting_confirmation = false;
+        t.staged_point = None;
+        crate::sketch_dims::reset(t);
+    }
+    true
+}
+
+pub fn show_touch_confirm(app: &mut SolveApp, ui: &mut egui::Ui, proj: &Proj) {
+    let Some(tool) = app.tool.as_ref() else { return };
+    if !tool.awaiting_confirmation {
+        return;
+    }
+    let Some(sid) = app.session.active_sketch else { return };
+    let st = crate::open_meshing::session_world(&app.session);
+    let Some(ss) = st.sketch(sid) else { return };
+
+    // Position the floating buttons near the staged point (or viewport center if offscreen)
+    let screen_pos = tool
+        .staged_point
+        .as_ref()
+        .and_then(|p| proj.to_screen(ss.plane.to_world(p.0)))
+        .unwrap_or_else(|| proj.rect.center());
+
+    let (confirm_rect, cancel_rect) = touch_confirm_button_layout(screen_pos, proj.rect);
+
+    let confirm_id = egui::Id::new("sc_touch_sketch_confirm");
+    let cancel_id = egui::Id::new("sc_touch_sketch_cancel");
+
+    crate::scenario::publish_target("sc_touch_sketch_confirm", confirm_rect);
+    crate::scenario::publish_target("sc_touch_sketch_cancel", cancel_rect);
+
+    let bounds = confirm_rect.union(cancel_rect);
+    let mut confirm_clicked = false;
+    let mut cancel_clicked = false;
+
+    egui::Area::new(egui::Id::new("touch_confirm_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(bounds.min)
+        .show(ui.ctx(), |ui| {
+            let confirm_resp = ui.interact(confirm_rect, confirm_id, egui::Sense::click());
+            let cancel_resp = ui.interact(cancel_rect, cancel_id, egui::Sense::click());
+
+            // Paint buttons
+            let btn_size = TOUCH_CONFIRM_BTN_SIZE;
+            let painter = ui.painter();
+            let tk = crate::theme::Tokens::view();
+            
+            // Confirm button (Green/Accent circle with checkmark)
+            let confirm_bg = if confirm_resp.is_pointer_button_down_on() {
+                tk.accent.gamma_multiply(0.8)
+            } else if confirm_resp.hovered() {
+                tk.accent
+            } else {
+                tk.accent.gamma_multiply(0.9)
+            };
+            painter.circle_filled(confirm_rect.center(), btn_size * 0.5, confirm_bg);
+            painter.text(
+                confirm_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "✓",
+                egui::FontId::proportional(22.0),
+                egui::Color32::WHITE,
+            );
+
+            // Cancel button (Muted red/grey circle with cross)
+            let cancel_bg = if cancel_resp.is_pointer_button_down_on() {
+                egui::Color32::from_rgb(180, 50, 50)
+            } else if cancel_resp.hovered() {
+                egui::Color32::from_rgb(200, 60, 60)
+            } else {
+                egui::Color32::from_rgb(140, 60, 60)
+            };
+            painter.circle_filled(cancel_rect.center(), btn_size * 0.5, cancel_bg);
+            painter.text(
+                cancel_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "✕",
+                egui::FontId::proportional(20.0),
+                egui::Color32::WHITE,
+            );
+
+            if confirm_resp.clicked() {
+                confirm_clicked = true;
+            } else if cancel_resp.clicked() {
+                cancel_clicked = true;
+            }
+        });
+
+    // Handle clicks
+    if confirm_clicked {
+        confirm_staged(app);
+    } else if cancel_clicked {
+        cancel_staged(app);
+    }
+}
+
+pub fn show_touch_conclude(app: &mut SolveApp, ui: &mut egui::Ui, _proj: &Proj) {
+    let Some(rect) = conclude_rect(app) else { return };
+    crate::scenario::publish_target("sc_touch_sketch_conclude", rect);
+
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new("touch_conclude_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ui.ctx(), |ui| {
+            let resp = ui.interact(rect, egui::Id::new("sc_touch_sketch_conclude"), egui::Sense::click());
+            let painter = ui.painter();
+            let t = crate::theme::Tokens::get();
+            let bg = if resp.is_pointer_button_down_on() {
+                t.hover
+            } else if resp.hovered() {
+                t.hover
+            } else {
+                t.overlay
+            };
+            painter.rect_filled(rect, t.radius_sm, bg);
+            painter.rect_stroke(rect, t.radius_sm, egui::Stroke::new(1.0, t.file_border), egui::StrokeKind::Inside);
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Concluir",
+                egui::FontId::proportional(15.0),
+                t.text,
+            );
+
+            if resp.clicked() {
+                clicked = true;
+            }
+        });
+
+    if clicked {
+        conclude_chain(app);
+    }
+}
+pub fn confirm_staged(app: &mut SolveApp) -> bool {
+    let Some(mut tool) = app.tool.take() else { return false };
+    if !tool.awaiting_confirmation {
+        app.tool = Some(tool);
+        return false;
+    }
+    let before = crate::sketch_tools::point_ids(app);
+    let Kind::Draw(n) = tool.kind else {
+        app.tool = Some(tool);
+        return false;
+    };
+    if tool.cmd == "sketch.line" && tool.pts.len() >= 2 {
+        let (a, b) = (tool.pts[tool.pts.len() - 2].clone(), tool.pts[tool.pts.len() - 1].clone());
+        let angled = crate::sketch_dims::has_locked(&tool, "Angle");
+        let dimensioned = tool.dims.iter().any(|dimension| dimension.locked);
+        if let Ok(v) = draw(app, &tool, json!({"points": [arg(&a), arg(&b)], "infer": !angled})) {
+            let curves: Vec<String> = v["curves"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
+            if let Some(id) = curves.first() {
+                if angled {
+                    crate::inference::clear();
+                    tool.lined.clear();
+                } else {
+                    let history = dimensioned.then(|| std::mem::take(&mut app.session.undo));
+                    crate::inference::commit(app, id, b.0);
+                    crate::sketch_tools::constrain_lined(app, &mut tool, &[a.0, b.0], &before);
+                    if let Some(history) = history {
+                        app.session.undo = history;
+                    }
+                }
+                let last = tool.pts.len() - 1;
+                tool.pts[last].1 = Some(format!("{id}.end"));
+                tool.pts = vec![tool.pts[last].clone()];
+                tool.chain.placed(id, a.clone());
+                tool.confirmed_segments += 1;
+            }
+            crate::sketch_dims::reset(&mut tool);
+            tool.awaiting_confirmation = false;
+            tool.staged_point = None;
+            app.tool = Some(tool);
+            true
+        } else {
+            tool.pts.pop();
+            tool.lined.pop();
+            tool.awaiting_confirmation = false;
+            tool.staged_point = None;
+            app.tool = Some(tool);
+            false
+        }
+    } else if n > 0 && tool.pts.len() >= n {
         match run_shape(app, &tool) {
             Ok(_) => {
                 let placed: Vec<Vec2> = tool.pts.iter().map(|p| p.0).collect();
                 crate::sketch_tools::constrain_lined(app, &mut tool, &placed, &before);
                 tool.pts.clear();
+                tool.awaiting_confirmation = false;
+                tool.staged_point = None;
                 crate::sketch_dims::reset(&mut tool);
+                app.tool = Some(tool);
+                true
             }
             Err(error) => {
                 app.set_status(error, true);
                 tool.pts.pop();
                 tool.lined.pop();
+                tool.awaiting_confirmation = false;
+                tool.staged_point = None;
+                app.tool = Some(tool);
+                false
             }
         }
+    } else {
+        app.tool = Some(tool);
+        false
     }
+}
+
+/// Cancel / discard the staged point in the active drawing tool (Touch cross or Esc).
+pub fn cancel_staged(app: &mut SolveApp) -> bool {
+    let Some(mut tool) = app.tool.take() else { return false };
+    if !tool.awaiting_confirmation {
+        app.tool = Some(tool);
+        return false;
+    }
+    tool.pts.pop();
+    tool.lined.pop();
+    tool.awaiting_confirmation = false;
+    tool.staged_point = None;
     app.tool = Some(tool);
+    true
 }
 
 /// Geometry and typed constraints are committed atomically, as one undo step. With "Dimension
@@ -886,6 +1278,9 @@ pub fn undo_spline_point(app: &mut SolveApp) -> bool {
 
 /// Right click / Esc: end the current chain (line) or cancel the tool.
 pub fn finish(app: &mut SolveApp) {
+    if cancel_staged(app) {
+        return;
+    }
     crate::dim_view::cancel();
     if crate::sketch3d::finish(app) {
         return;
@@ -1206,7 +1601,8 @@ pub fn preview(app: &SolveApp, t: &Tool, painter: &egui::Painter, proj: &Proj) {
             }
         }
     }
-    let Some(hover) = t.hover.as_ref() else { return };
+    let hover_or_staged = t.staged_point.as_ref().or(t.hover.as_ref());
+    let Some(hover) = hover_or_staged else { return };
     let h = crate::sketch_dims::shown(app, t, hover);
     if let Some(corners) = polygon_outline(t, h, crate::sketch_dims::locked_value(app, t, "Sides").unwrap_or(6.0)) {
         let outline: Vec<_> = corners.iter().map(|c| ss.plane.to_world(*c)).collect();
@@ -1227,7 +1623,11 @@ pub fn preview(app: &SolveApp, t: &Tool, painter: &egui::Painter, proj: &Proj) {
         paint_preview_curve(curve, &ss.plane, painter, proj, stroke, crate::sketch_palette::mode(app));
         return;
     }
-    let pts: Vec<Vec2> = t.pts.iter().map(|p| p.0).collect();
+    let pts: Vec<Vec2> = if t.awaiting_confirmation && t.pts.len() >= 2 {
+        t.pts[..t.pts.len() - 1].iter().map(|p| p.0).collect()
+    } else {
+        t.pts.iter().map(|p| p.0).collect()
+    };
     let line = |a: Vec2, b: Vec2| {
         paint_sketch_path(&[ss.plane.to_world(a), ss.plane.to_world(b)], crate::sketch_palette::mode(app), painter, proj, stroke);
     };

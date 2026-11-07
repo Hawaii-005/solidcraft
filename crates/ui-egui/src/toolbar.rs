@@ -3477,6 +3477,9 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                 }
             }
             Key::F6 => app.animate_view("fit"),
+            Key::Enter if app.tool.as_ref().is_some_and(|t| t.awaiting_confirmation) => {
+                crate::tools::confirm_staged(app);
+            }
             Key::Backspace if crate::tools::undo_spline_point(app) => {}
             Key::Delete | Key::Backspace => {
                 if !crate::timeline_left::delete_selected_folders(app) {

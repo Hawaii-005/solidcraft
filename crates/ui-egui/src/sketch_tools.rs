@@ -894,6 +894,10 @@ pub fn tool_for(id: &str) -> Option<Tool> {
         lined: Vec::new(),
         chain: Default::default(),
         normal: false,
+        awaiting_confirmation: false,
+        staged_point: None,
+        confirmed_segments: 0,
+        chain_origin: None,
     })
 }
 

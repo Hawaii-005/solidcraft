@@ -159,6 +159,7 @@ pub struct ViewportState {
     /// Fingers on the screen this frame (touch screens): one finger orbits, two pan and pinch.
     pub touch: Vec<(egui::TouchId, Pos2)>,
     /// The two-finger gesture's centre and finger spread last frame, for pan and pinch.
+    #[allow(dead_code)]
     pub(crate) touch_centroid: Option<Pos2>,
     pub(crate) touch_span: Option<f32>,
     /// Where the lone finger of this gesture landed. One finger only orbits once it has moved past
@@ -168,7 +169,13 @@ pub struct ViewportState {
     pub(crate) touch_multi: bool,
     /// When a touch event last arrived (`egui` time). A gesture that goes quiet for longer than
     /// [`TOUCH_STALE`] is over: its end was dropped (a palm ignored under the pen, a cancel).
-    pub(crate) touch_seen_at: f64,
+    pub touch_seen_at: f64,
+    /// When a touch / pen event was last received, to distinguish real touch input from desktop mouse input.
+    pub last_touch_event_at: Option<f64>,
+    /// Frame time when the viewport was last processed.
+    pub frame_time: f64,
+    /// Snapshot of the tool state before the current touch gesture began (to restore upon multi-touch pinch).
+    pub(crate) touch_tool_snapshot: Option<crate::tools::ToolSnapshot>,
     /// Button-free gesture and its last owned pointer position, kept through pauses.
     pub(crate) modifier_nav: Option<(NavMode, Pos2)>,
     /// What a click would pick now (after the active command's filter).
@@ -316,7 +323,7 @@ impl ViewportState {
     }
 }
 
-fn display_proj(app: &SolveApp) -> Proj {
+pub(crate) fn display_proj(app: &SolveApp) -> Proj {
     projection(app, app.viewport.rect.unwrap_or_else(|| Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))))
 }
 
@@ -4632,7 +4639,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     // even over the shape's own dimension box, which rides along beside the pointer.
     app.viewport.draw_drag_handled = false;
     if let Some(from) = app.viewport.draw_drag {
-        let at = ui.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p) && !crate::shell::covered(app, *p));
+        let at = ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos())).filter(|p| rect.contains(*p) && !crate::shell::covered(app, *p));
         if resp.drag_stopped() || !primary_down {
             app.viewport.draw_drag = None;
             if let Some(p) = at
@@ -4656,7 +4663,9 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                     crate::tools::on_click(app, &proj, p, mods.shift);
                 }
                 // A line dragged out is that one line: no chain goes on from its end (#7247).
+                // But in touch confirmation mode, wait for confirmation before clearing.
                 if p.distance(from) >= DRAW_DRAG_MIN
+                    && !crate::tools::is_touch_input(app)
                     && let Some(t) = app.tool.as_mut().filter(|t| t.cmd == "sketch.line")
                 {
                     t.pts.clear();
@@ -4789,7 +4798,9 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         {
             dialog.restore_value_focus = true;
         }
-        if resp.clicked() && !held && !reference_pick && !joint_handle_pointer && !app.viewport.draw_drag_handled {
+        let pinch_active = app.viewport.touch_multi || app.viewport.touch.len() >= 2;
+        let covered = crate::shell::covered(app, p);
+        if resp.clicked() && !held && !reference_pick && !joint_handle_pointer && !app.viewport.draw_drag_handled && !pinch_active && !covered {
             if crate::browser_canvas::click(app, &proj, p) {
                 // Calibrate Canvas: the click sets Point A or B on the image (#9108).
             } else if app.tool.is_some() {
@@ -5227,6 +5238,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::select_other::show(app, ui.ctx());
     axis_view(app, ui, rect);
     crate::view_angles::show(app, ui, rect);
+    crate::tools::show_touch_confirm(app, ui, &proj);
+    crate::tools::show_touch_conclude(app, ui, &proj);
     crate::navigation_bar_view::show(app, ui, rect);
     crate::viewport_status::show(app, ui.ctx(), rect);
     crate::viewport_status_fixture::show(app, ui.ctx(), rect);

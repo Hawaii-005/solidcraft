@@ -53,8 +53,8 @@ pub fn boxes_for(cmd: &str, n: usize) -> Vec<DimBox> {
             0 | 1,
         ) => vec![b("Length", Length)],
         ("sketch.line" | "sketch.line.midpoint", n) if n >= 1 => vec![b("Length", Length), b("Angle", Angle)],
-        ("sketch.rectangle.two_point" | "sketch.rectangle.center", 1) => vec![b("Width", Length), b("Height", Length)],
-        ("sketch.rectangle.rounded", 1) => vec![b("Width", Length), b("Height", Length), b("Radius", Length)],
+        ("sketch.rectangle.two_point" | "sketch.rectangle.center", 1 | 2) => vec![b("Width", Length), b("Height", Length)],
+        ("sketch.rectangle.rounded", 1 | 2) => vec![b("Width", Length), b("Height", Length), b("Radius", Length)],
         ("sketch.circle.center", 1) => vec![b("Diameter", Length)],
         // The two points are a diameter's ends (#3278).
         ("sketch.circle.two_point", 1) => vec![b("Diameter", Length)],
@@ -300,7 +300,7 @@ fn live(app: &SolveApp, t: &Tool, e: Vec2, px: f64) -> Vec<(f64, Vec2)> {
         // so its length is the whole line: twice the distance from the midpoint to the cursor.
         ("sketch.line.midpoint", 1) => line_boxes(a * 2.0 - e, e, px, off),
         ("sketch.slot.center_point", 1) => vec![(2.0 * (e - a).len(), (a + e) * 0.5 + dir_or_x(e - a).perp() * off)],
-        ("sketch.rectangle.two_point", 1) => {
+        ("sketch.rectangle.two_point", 1 | 2) => {
             let (sx, sy) = (sign(e.x - a.x), sign(e.y - a.y));
             vec![
                 ((e.x - a.x).abs(), Vec2::new((a.x + e.x) * 0.5, a.y - sy * off)),
@@ -422,7 +422,10 @@ pub fn sync(t: &mut Tool) {
         t.dims_stage = t.pts.len();
         // A finger picks the next point; it does not want the keyboard over the drawing area.
         // Before the first click, the box waits for a digit: letters stay tool shortcuts.
-        t.dims_focus = !t.dims.is_empty() && !crate::touch::touch_ui() && !(construction && t.pts.is_empty());
+        t.dims_focus = !t.dims.is_empty()
+            && !crate::touch::touch_ui()
+            && !t.awaiting_confirmation
+            && !(construction && t.pts.is_empty());
     }
 }
 
@@ -577,7 +580,7 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
     let e = shown(app, t, hover.as_ref()?);
     let px = 2.0 * app.cam.half_height() / f64::from(proj.rect.height().max(1.0));
     let lv = live(app, t, e, px);
-    let focus = std::mem::take(&mut t.dims_focus);
+    let focus = std::mem::take(&mut t.dims_focus) && !t.awaiting_confirmation;
     // Egui processes ordinary Tab navigation before these floating text edits are drawn.
     // Remember the box that owned the keyboard and restore a focus within this tool after
     // drawing, so the last dimension wraps to the first rather than reaching the panels.
@@ -663,7 +666,11 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
                     if focus && i == 0 {
                         r.request_focus();
                     }
-                    any_focused |= r.has_focus() || r.lost_focus();
+                    if !t.awaiting_confirmation {
+                        any_focused |= r.has_focus() || r.lost_focus();
+                    } else {
+                        any_focused |= r.has_focus();
+                    }
                 });
             },
         );
@@ -685,8 +692,9 @@ fn boxes(app: &SolveApp, ui: &mut egui::Ui, proj: &Proj, t: &mut Tool) -> Option
     }
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     // A box waiting before the first click only places on Enter once it has the keyboard.
+    // When awaiting touch confirmation without any focused input, Enter confirms the staged shape via global shortcut.
     let nothing = ui.ctx().memory(|m| m.focused().is_none()) && !(construction && t.pts.is_empty());
-    (enter && (any_focused || nothing)).then_some(e)
+    (enter && (any_focused || (nothing && !t.awaiting_confirmation))).then_some(e)
 }
 
 /// Stack the polygon inputs beside its screen bounds. Try each side before falling back to

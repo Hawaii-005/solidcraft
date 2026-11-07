@@ -627,6 +627,9 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
             .collect()
     });
     let seen_touch = !touches.is_empty();
+    if seen_touch {
+        app.viewport.last_touch_event_at = Some(ui.input(|i| i.time));
+    }
     for (id, phase, pos) in touches {
         match phase {
             egui::TouchPhase::Start => {
@@ -644,7 +647,12 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
                 // repeat of the same touch, not a new one.
                 match app.viewport.touch.iter_mut().find(|(t, _)| *t == id) {
                     Some(slot) => slot.1 = pos,
-                    None => app.viewport.touch.push((id, pos)),
+                    None => {
+                        if app.viewport.touch.is_empty() {
+                            app.viewport.touch_tool_snapshot = app.tool.as_ref().map(|t| t.snapshot());
+                        }
+                        app.viewport.touch.push((id, pos));
+                    }
                 }
             }
             // Only a touch whose start was taken in is tracked: a move from a finger that began on
@@ -663,10 +671,12 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     if app.viewport.touch.is_empty() {
         app.viewport.touch_landing = None;
         app.viewport.touch_span = None;
+        app.viewport.touch_tool_snapshot = None;
     }
     // Self-healing: a pen's palm rejection drops the finger events it ignores, so a finger can be
     // left in the list with nothing down and the view would keep panning under the pen.
     let now = ui.input(|i| i.time);
+    app.viewport.frame_time = now;
     if seen_touch {
         app.viewport.touch_seen_at = now;
     }
@@ -676,6 +686,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
         app.viewport.touch.clear();
         app.viewport.touch_landing = None;
         app.viewport.touch_span = None;
+        app.viewport.touch_tool_snapshot = None;
     }
     // One finger orbits only after a short dead zone: landing two fingers for a pinch must not spin
     // the model on the way in (the first finger always lands first).
@@ -685,6 +696,16 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     };
     let delta = if armed { delta } else { egui::Vec2::ZERO };
     let two_fingers = app.viewport.touch.len() >= 2;
+    // If multi-touch gesture begins, restore the sketch tool state from the snapshot taken on 1st touch
+    if two_fingers {
+        if let Some(snap) = app.viewport.touch_tool_snapshot.take() {
+            if let Some(t) = app.tool.as_mut() {
+                t.restore_snapshot(snap);
+                crate::sketch_dims::reset(t);
+            }
+        }
+        app.viewport.draw_drag = None;
+    }
     for (id, phase, pos) in ui.input(|i| {
         i.events
             .iter()
@@ -1025,7 +1046,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     }
     // The gesture is over once nothing is down and the release frame has passed: from the next
     // gesture on, its release can be a pick again.
-    if app.viewport.touch.is_empty() && !ui.input(|i| i.pointer.any_released()) {
+    if app.viewport.touch.is_empty() && !ui.input(|i| i.pointer.any_released()) && !ui.input(|i| i.pointer.any_down()) {
         app.viewport.touch_multi = false;
     }
     CameraInput { hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, inside, axes, pinch, pan, primary_nav, mode }
@@ -1312,7 +1333,7 @@ const PINCH_GAIN: f64 = 3.0;
 
 /// How far (points) a lone finger must travel before it starts orbiting the view. Below it the
 /// gesture is still a tap, or the first finger of a pinch waiting for the second to land.
-const TOUCH_ARM: f32 = 12.0;
+pub const TOUCH_ARM: f32 = 12.0;
 
 /// How long (seconds) a touch gesture can go without a single event before it is taken as over:
 /// a finger's end that the palm rejection dropped would otherwise keep panning the view.
